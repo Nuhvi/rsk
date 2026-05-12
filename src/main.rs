@@ -215,7 +215,7 @@ async fn collect_bridge_events(
                 .and_then(|t0| {
                     topics
                         .iter()
-                        .find(|(_, sig)| sig.as_ref() == t0)
+                        .find(|(_, sig)| &sig[..] == t0)
                         .map(|(lbl, _)| *lbl)
                 })
                 .unwrap_or("unknown");
@@ -237,6 +237,24 @@ async fn collect_bridge_events(
     }
 
     Ok(events)
+}
+
+// ── Bitcoin SPV check via Esplora ──────────────────────────────────────────────
+
+/// Check whether a Bitcoin transaction is confirmed in a block using an Esplora
+/// server.  Returns `true` if the transaction has at least one confirmation.
+async fn check_btc_tx_confirmed(tx_hash_hex: &str) -> Result<bool, String> {
+    let esplora_url =
+        std::env::var("ESPLORA_URL").unwrap_or_else(|_| "https://blockstream.info/api".to_string());
+    let client = esplora_client::Builder::new(&esplora_url)
+        .build_async()
+        .map_err(|e| e.to_string())?;
+    let txid: bitcoin::Txid = tx_hash_hex.trim_start_matches("0x").parse().unwrap();
+    let status = client
+        .get_tx_status(&txid)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(status.block_height.is_some())
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -297,14 +315,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 // Stop at the first block that actually has bridge events
                 // break;
 
-                // Stop as soon as we find pegout confirmation
-                if events
+                // Check Bitcoin confirmation via Electrum for each pegout event
+                for ev in events
                     .iter()
-                    .any(|e| e.label == "pegout_transaction_created")
+                    .filter(|e| e.label == "pegout_transaction_created")
                 {
-                    // TODO: Check Bitcoin SPV to confirm whether or not the transaction was
-                    // confirmed.
-                    break;
+                    let btc_tx_hash = ev.topics.get(1).cloned().unwrap_or_default();
+                    println!("  BTC tx hash: {btc_tx_hash}");
+                    let confirmed = check_btc_tx_confirmed(&btc_tx_hash).await.unwrap_or(false);
+                    if confirmed {
+                        println!("  ✓ confirmed on Bitcoin");
+                        return Ok(());
+                    } else {
+                        println!("  ✗ not yet confirmed (mempool or not found)");
+                    }
                 }
             }
             Err(e) => {
