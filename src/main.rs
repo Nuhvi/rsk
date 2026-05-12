@@ -3,7 +3,8 @@ use std::error::Error;
 use tiny_keccak::{Hasher, Keccak};
 
 pub const BRIDGE_ADDRESS: &str = "0x0000000000000000000000000000000001000006";
-const START_BLOCK: u64 = 8_821_856;
+const LATEST_KNOWN_CHECKPOINT: u64 = 8_821_856;
+const CHECKPOINT_MIN_BTC_CONFIRMATIONS: u32 = 6;
 
 // ── Keccak helpers ────────────────────────────────────────────────────────────
 
@@ -87,18 +88,7 @@ async fn rpc_call(
     Ok(resp["result"].take())
 }
 
-async fn fetch_block_bloom(
-    client: &reqwest::Client,
-    url: &str,
-    block_num: u64,
-) -> Result<[u8; 256], Box<dyn Error>> {
-    let block = rpc_call(
-        client,
-        url,
-        "eth_getBlockByNumber",
-        json!([format!("{:#x}", block_num), false]),
-    )
-    .await?;
+fn fetch_block_bloom(block: &Value) -> Result<[u8; 256], Box<dyn Error>> {
     let hex = block["logsBloom"]
         .as_str()
         .ok_or("missing logsBloom")?
@@ -146,17 +136,10 @@ impl std::fmt::Display for BridgeEvent {
 async fn collect_bridge_events(
     client: &reqwest::Client,
     url: &str,
+    block: &Value,
     block_num: u64,
     topics: &[(&str, [u8; 32])],
 ) -> Result<Vec<BridgeEvent>, Box<dyn Error>> {
-    let block = rpc_call(
-        client,
-        url,
-        "eth_getBlockByNumber",
-        json!([format!("{:#x}", block_num), true]),
-    )
-    .await?;
-
     let txs = match block["transactions"].as_array() {
         Some(t) => t,
         None => return Ok(vec![]),
@@ -250,11 +233,12 @@ async fn check_btc_tx_confirmed(tx_hash_hex: &str) -> Result<bool, String> {
         .build_async()
         .map_err(|e| e.to_string())?;
     let txid: bitcoin::Txid = tx_hash_hex.trim_start_matches("0x").parse().unwrap();
-    let status = client
-        .get_tx_status(&txid)
-        .await
+    let (status, tip) = tokio::try_join!(client.get_tx_status(&txid), client.get_height(),)
         .map_err(|e| e.to_string())?;
-    Ok(status.block_height.is_some())
+    let Some(tx_height) = status.block_height else {
+        return Ok(false);
+    };
+    Ok(tip >= tx_height && tip - tx_height + 1 >= CHECKPOINT_MIN_BTC_CONFIRMATIONS)
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -272,62 +256,55 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let latest_hex = rpc_call(&client, &rpc_url, "eth_blockNumber", Value::Null).await?;
     let latest = parse_hex_to_u64(latest_hex.as_str().unwrap_or("0x0"))?;
     println!("Latest block : {latest}");
-    println!("Scanning from: {START_BLOCK}");
+    println!("Scanning from: {LATEST_KNOWN_CHECKPOINT}");
     println!("{}", "─".repeat(60));
 
-    let mut block = START_BLOCK;
+    let mut block = LATEST_KNOWN_CHECKPOINT;
 
     while block <= latest {
-        // ── Bloom pre-filter ──────────────────────────────────────────────
-        let bloom = match fetch_block_bloom(&client, &rpc_url, block).await {
+        let header = match rpc_call(
+            &client,
+            &rpc_url,
+            "eth_getBlockByNumber",
+            json!([format!("{:#x}", block), true]),
+        )
+        .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("header fetch error at {block}: {e}");
+                block += 1;
+                continue;
+            }
+        };
+
+        let bloom = match fetch_block_bloom(&header) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("bloom fetch error at {block}: {e}");
+                eprintln!("bloom extract error at {block}: {e}");
                 block += 1;
                 continue;
             }
         };
 
         if !bloom_has_any_bridge_event(&bloom, &bridge_bytes, &topics) {
-            println!("Block {block:>9}  bloom→skip");
             block += 1;
             continue;
         }
 
-        // ── Full inspection ───────────────────────────────────────────────
-        println!("Block {block:>9}  bloom→possible, inspecting …");
-
-        match collect_bridge_events(&client, &rpc_url, block, &topics).await {
-            Ok(events) if events.is_empty() => {
-                println!("  (false positive)");
-            }
+        match collect_bridge_events(&client, &rpc_url, &header, block, &topics).await {
+            Ok(events) if events.is_empty() => {}
             Ok(events) => {
-                println!(
-                    "\n╔══ {} bridge event(s) in block {} ══",
-                    events.len(),
-                    block
-                );
-                for (i, ev) in events.iter().enumerate() {
-                    println!("╠─ event #{}", i + 1);
-                    println!("{ev}");
-                }
-                println!("╚{}", "═".repeat(50));
-                // Stop at the first block that actually has bridge events
-                // break;
-
-                // Check Bitcoin confirmation via Electrum for each pegout event
                 for ev in events
                     .iter()
                     .filter(|e| e.label == "pegout_transaction_created")
                 {
                     let btc_tx_hash = ev.topics.get(1).cloned().unwrap_or_default();
-                    println!("  BTC tx hash: {btc_tx_hash}");
                     let confirmed = check_btc_tx_confirmed(&btc_tx_hash).await.unwrap_or(false);
                     if confirmed {
-                        println!("  ✓ confirmed on Bitcoin");
+                        println!("Checkpoint found at RSK block {block}");
+                        println!("{:#}", header);
                         return Ok(());
-                    } else {
-                        println!("  ✗ not yet confirmed (mempool or not found)");
                     }
                 }
             }
