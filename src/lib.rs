@@ -68,6 +68,12 @@ impl IndexedBlockStore {
             .insert(block.get_hash(), (block, total_difficulty));
     }
 
+    pub fn save_block_with_total_difficulty_calculation(&mut self, block: Block) {
+        let parent_total_difficulty = self.get_total_difficulty_for_hash(&block.get_parent_hash());
+        let total_difficulty = parent_total_difficulty + block.get_cumulative_difficulty();
+        self.save_block(block, total_difficulty);
+    }
+
     pub fn get_block_by_hash(&self, hash: &str) -> Option<&Block> {
         self.blocks.get(hash).map(|(b, _)| b)
     }
@@ -183,5 +189,175 @@ mod tests {
         }
 
         println!("Test Passed: All cumulative difficulties match across branches.");
+    }
+
+    #[tokio::test]
+    async fn real_blocks_indexed_store_with_uncles() {
+        let rpc_url =
+            std::env::var("RSK_RPC").unwrap_or_else(|_| "https://public-node.rsk.co".to_string());
+        let client = reqwest::Client::new();
+
+        async fn rpc_call(
+            client: &reqwest::Client,
+            url: &str,
+            method: &str,
+            params: serde_json::Value,
+        ) -> serde_json::Value {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params,
+            });
+            let mut resp: serde_json::Value = client
+                .post(url)
+                .json(&body)
+                .send()
+                .await
+                .expect("RPC request failed")
+                .json()
+                .await
+                .expect("JSON parse failed");
+            resp["result"].take()
+        }
+
+        fn parse_difficulty(value: &serde_json::Value) -> BigUint {
+            let hex = value.as_str().unwrap_or("0x0").trim_start_matches("0x");
+            BigUint::parse_bytes(hex.as_bytes(), 16).unwrap_or_default()
+        }
+
+        fn parse_hex_u64(value: &serde_json::Value) -> u64 {
+            let hex = value.as_str().unwrap_or("0x0").trim_start_matches("0x");
+            u64::from_str_radix(hex, 16).unwrap_or(0)
+        }
+
+        fn display_eh(val: &BigUint) -> String {
+            let one_eh = BigUint::from(10u64).pow(18);
+            let whole = val / &one_eh;
+            let rem = val % &one_eh;
+            let dec = rem * BigUint::from(1000u32) / &one_eh;
+            let d: u64 = dec.iter_u64_digits().next().unwrap_or(0);
+            format!("{whole}.{d:03} EH")
+        }
+
+        fn fetch_uncles<'a>(
+            client: &'a reqwest::Client,
+            rpc_url: &'a str,
+            hex: &'a str,
+        ) -> impl std::future::Future<Output = Vec<BlockHeader>> + 'a {
+            async move {
+                let count = rpc_call(
+                    client,
+                    rpc_url,
+                    "eth_getUncleCountByBlockNumber",
+                    serde_json::json!([hex]),
+                )
+                .await;
+                let n = parse_hex_u64(&count) as usize;
+                let mut uncles = Vec::with_capacity(n);
+                for i in 0..n {
+                    let u = rpc_call(
+                        client,
+                        rpc_url,
+                        "eth_getUncleByBlockNumberAndIndex",
+                        serde_json::json!([hex, format!("{i:#x}")]),
+                    )
+                    .await;
+                    uncles.push(BlockHeader {
+                        hash: u["hash"].as_str().unwrap_or("").to_string(),
+                        parent_hash: u["parentHash"].as_str().unwrap_or("").to_string(),
+                        difficulty: parse_difficulty(&u["difficulty"]),
+                        number: parse_hex_u64(&u["number"]),
+                    });
+                }
+                uncles
+            }
+        }
+
+        let hex_8375 = "0x86c29f";
+        let hex_8376 = "0x86c2a0";
+        let hex_8377 = "0x86c2a1";
+
+        let raw_8375 = rpc_call(
+            &client,
+            &rpc_url,
+            "eth_getBlockByNumber",
+            serde_json::json!([hex_8375, false]),
+        )
+        .await;
+
+        let raw_8376 = rpc_call(
+            &client,
+            &rpc_url,
+            "eth_getBlockByNumber",
+            serde_json::json!([hex_8376, false]),
+        )
+        .await;
+
+        let raw_8377 = rpc_call(
+            &client,
+            &rpc_url,
+            "eth_getBlockByNumber",
+            serde_json::json!([hex_8377, false]),
+        )
+        .await;
+
+        let uncles_8376 = fetch_uncles(&client, &rpc_url, hex_8376).await;
+        let uncles_8377 = fetch_uncles(&client, &rpc_url, hex_8377).await;
+
+        // Starting TD comes from the RPC (block 8_833_375)
+        // The explorer shows it as ≈54,543,886,113.12 EH at time of viewing
+        let td_8375 = parse_difficulty(&raw_8375["totalDifficulty"]);
+
+        let block_8376 = Block {
+            header: BlockHeader {
+                hash: raw_8376["hash"].as_str().unwrap_or("").to_string(),
+                parent_hash: raw_8376["parentHash"].as_str().unwrap_or("").to_string(),
+                difficulty: parse_difficulty(&raw_8376["difficulty"]),
+                number: parse_hex_u64(&raw_8376["number"]),
+            },
+            uncle_list: uncles_8376,
+        };
+
+        let block_8377 = Block {
+            header: BlockHeader {
+                hash: raw_8377["hash"].as_str().unwrap_or("").to_string(),
+                parent_hash: raw_8377["parentHash"].as_str().unwrap_or("").to_string(),
+                difficulty: parse_difficulty(&raw_8377["difficulty"]),
+                number: parse_hex_u64(&raw_8377["number"]),
+            },
+            uncle_list: uncles_8377,
+        };
+
+        let expected_td = parse_difficulty(&raw_8377["totalDifficulty"]);
+
+        let mut store = IndexedBlockStore::new();
+
+        store.save_block(
+            Block {
+                header: BlockHeader {
+                    hash: block_8376.header.parent_hash.clone(),
+                    parent_hash: String::new(),
+                    difficulty: BigUint::from(0u32),
+                    number: 8_833_375,
+                },
+                uncle_list: vec![],
+            },
+            td_8375,
+        );
+
+        store.save_block_with_total_difficulty_calculation(block_8376);
+        let hash_8377 = block_8377.get_hash();
+        store.save_block_with_total_difficulty_calculation(block_8377);
+
+        let stored_td = store.get_total_difficulty_for_hash(&hash_8377);
+
+        println!("block 8_833_377 total difficulty:");
+        println!("  stored:   {}", display_eh(&stored_td));
+        println!("  RPC:      {}", display_eh(&expected_td));
+        println!();
+        println!("(explorer showed ≈54,543,940,517.27 EH at time of viewing)");
+
+        assert_eq!(stored_td, expected_td);
     }
 }
