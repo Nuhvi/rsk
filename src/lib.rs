@@ -4,6 +4,12 @@ use std::collections::HashMap;
 
 // --- RSK Core Logic Simulation ---
 
+/// checkpoint hard coded in the PowPeg HSM as reported by [https://dev.rootstock.io/concepts/powpeg/hsm-firmware-attestation/]
+const _POWPEG_CHECKPOINT: (usize, &str) = (
+    4575000,
+    "0x099657039569a2a5d9759d6e5fd5636a253b8c518daf26858ec5c5de0f66e8c7",
+);
+
 #[derive(Clone, Debug)]
 pub struct BlockHeader {
     pub hash: String,
