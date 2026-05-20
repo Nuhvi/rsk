@@ -2,9 +2,12 @@
 use num_bigint::BigUint;
 use std::collections::HashMap;
 
+pub(crate) mod constants;
+pub mod validator;
+
 // --- RSK Core Logic Simulation ---
 
-/// checkpoint hard coded in the PowPeg HSM as reported by [https://dev.rootstock.io/concepts/powpeg/hsm-firmware-attestation/]
+/// checkpoint hard coded in the PowPeg HSM as reported by <https://dev.rootstock.io/concepts/powpeg/hsm-firmware-attestation/>
 const _POWPEG_CHECKPOINT: (usize, &str) = (
     4575000,
     "0x099657039569a2a5d9759d6e5fd5636a253b8c518daf26858ec5c5de0f66e8c7",
@@ -16,6 +19,7 @@ pub struct BlockHeader {
     pub parent_hash: String,
     pub difficulty: BigUint,
     pub number: u64,
+    pub timestamp: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -32,6 +36,7 @@ impl Block {
                 parent_hash,
                 difficulty: BigUint::from(difficulty),
                 number,
+                timestamp: 0,
             },
             uncle_list: vec![],
         }
@@ -123,6 +128,7 @@ mod tests {
                     parent_hash: prev_hash.clone(),
                     difficulty: BigUint::from(2u32),
                     number: i as u64,
+                    timestamp: 0,
                 });
             }
 
@@ -274,6 +280,7 @@ mod tests {
                         parent_hash: u["parentHash"].as_str().unwrap_or("").to_string(),
                         difficulty: parse_difficulty(&u["difficulty"]),
                         number: parse_hex_u64(&u["number"]),
+                        timestamp: 0,
                     });
                 }
                 uncles
@@ -321,6 +328,7 @@ mod tests {
                 parent_hash: raw_8376["parentHash"].as_str().unwrap_or("").to_string(),
                 difficulty: parse_difficulty(&raw_8376["difficulty"]),
                 number: parse_hex_u64(&raw_8376["number"]),
+                timestamp: 0,
             },
             uncle_list: uncles_8376,
         };
@@ -331,6 +339,7 @@ mod tests {
                 parent_hash: raw_8377["parentHash"].as_str().unwrap_or("").to_string(),
                 difficulty: parse_difficulty(&raw_8377["difficulty"]),
                 number: parse_hex_u64(&raw_8377["number"]),
+                timestamp: 0,
             },
             uncle_list: uncles_8377,
         };
@@ -346,6 +355,7 @@ mod tests {
                     parent_hash: String::new(),
                     difficulty: BigUint::from(0u32),
                     number: 8_833_375,
+                    timestamp: 0,
                 },
                 uncle_list: vec![],
             },
