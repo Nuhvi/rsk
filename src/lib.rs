@@ -27,7 +27,6 @@ pub struct RskBlock {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CheckForkArgs {
-    pub pegout_id: String,
     pub operator_id: String,
     pub init_block_time: u64,
     pub init_block_number: u64,
@@ -39,7 +38,6 @@ pub struct CheckForkArgs {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BridgeEvent {
     pub utxo_id: String,
-    pub pegout_id: String,
     pub operator_id: String,
 }
 
@@ -52,7 +50,6 @@ pub struct BridgeEvent {
 #[allow(dead_code)]
 pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
     let CheckForkArgs {
-        pegout_id,
         operator_id,
         init_block_time,
         init_block_number,
@@ -77,13 +74,7 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
     //
 
     let first_block = &block_list[0];
-    validate_first_block(
-        first_block,
-        init_block_time,
-        init_block_number,
-        pegout_id,
-        operator_id,
-    )?;
+    validate_first_block(first_block, init_block_time, init_block_number, operator_id)?;
     validate_block_hash(&first_block.header)?;
 
     let mut cumulative_effort = accumulate_effort(U256::zero(), first_block)?;
@@ -144,7 +135,6 @@ fn validate_first_block(
     block: &RskBlock,
     init_block_time: u64,
     init_block_number: u64,
-    pegout_id: &str,
     operator_id: &str,
 ) -> Result<(), &'static str> {
     if block.header.timestamp < init_block_time {
@@ -157,21 +147,16 @@ fn validate_first_block(
 
     validate_enough_effort_superblock(block, "first")?;
 
-    validate_bridge_event(block.bridge_event.as_ref(), pegout_id, operator_id)?;
+    validate_bridge_event(block.bridge_event.as_ref(), operator_id)?;
 
     Ok(())
 }
 
 fn validate_bridge_event(
     bridge_event: Option<&BridgeEvent>,
-    pegout_id: &str,
     operator_id: &str,
 ) -> Result<(), &'static str> {
     let bridge_event = bridge_event.ok_or("First block is missing BridgeEvent")?;
-
-    if bridge_event.pegout_id != pegout_id {
-        return Err("BridgeEvent does not match pegoutID");
-    }
 
     if bridge_event.operator_id != operator_id {
         return Err("BridgeEvent does not match operatorID");

@@ -257,7 +257,6 @@ fn fails_when_event_found_in_second_block() {
     let mut second_block = create_child_block(&first_block);
     second_block.bridge_event = Some(BridgeEvent {
         utxo_id: "utxo_2".to_string(),
-        pegout_id: "pegout_2".to_string(),
         operator_id: "operator_2".to_string(),
     });
 
@@ -270,26 +269,6 @@ fn fails_when_event_found_in_second_block() {
         result,
         Err("Only the first block should contain a BridgeEvent"),
         "Expected to fail if an event is found in second block"
-    );
-}
-
-#[test]
-fn fails_when_event_has_unexpected_pegout_id() {
-    let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-
-    let second_block = create_child_block(&first_block);
-
-    let block_list = vec![first_block, second_block];
-
-    let args = CheckForkArgsBuilder::new(block_list)
-        .event_pegout_id("fake_pegout".to_string())
-        .build();
-
-    let result = check_fork(&args);
-    assert_eq!(
-        result,
-        Err("BridgeEvent does not match pegoutID"),
-        "Expected to fail if the event has a different pegout_id"
     );
 }
 
@@ -573,7 +552,6 @@ fn create_base_block(number: u64, bridge_event: bool, parent: Option<H256>) -> R
         // this will be removed
         bridge_event: bridge_event.then(|| BridgeEvent {
             utxo_id: format!("utxo_{number}"),
-            pegout_id: format!("pegout_{number}"),
             operator_id: format!("operator_{number}"),
         }),
         uncles: vec![],
@@ -658,7 +636,6 @@ fn assert_minichain_hashes_are_valid_from_fixture(path: &str) {
 
 #[derive(Default)]
 struct CheckForkArgsBuilder {
-    pegout_id: Option<String>,
     operator_id: Option<String>,
     init_block_time: Option<u64>,
     init_block_number: Option<u64>,
@@ -673,11 +650,6 @@ impl CheckForkArgsBuilder {
             block_list,
             ..Default::default()
         }
-    }
-
-    fn event_pegout_id(mut self, pegout_id: String) -> Self {
-        self.pegout_id = Some(pegout_id);
-        self
     }
 
     fn event_operator_id(mut self, operator_id: String) -> Self {
@@ -707,9 +679,6 @@ impl CheckForkArgsBuilder {
 
     fn build(self) -> CheckForkArgs {
         CheckForkArgs {
-            pegout_id: self
-                .pegout_id
-                .unwrap_or_else(|| format!("pegout_{DEFAULT_INIT_BLOCK_NUMBER}")),
             operator_id: self
                 .operator_id
                 .unwrap_or_else(|| format!("operator_{DEFAULT_INIT_BLOCK_NUMBER}")),

@@ -276,7 +276,6 @@ impl TesterRskBlock {
 //             if i == 0 {
 //                 input_block.bridge_event = Some(BridgeEvent {
 //                     utxo_id: "FAKE_UTXO_ID".to_string(),         // tmp
-//                     pegout_id: "FAKE_PEGOUT_ID".to_string(),     // tmp
 //                     operator_id: "FAKE_OPERATOR_ID".to_string(), // tmp
 //                 });
 //             }
