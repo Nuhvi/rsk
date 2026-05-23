@@ -29,7 +29,6 @@ pub struct RskBlock {
 pub struct CheckForkArgs {
     pub init_block_time: u64,
     pub init_block_number: u64,
-    pub required_num_blocks: u32,
     pub block_list: Vec<RskBlock>,
 }
 
@@ -49,19 +48,12 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
     let CheckForkArgs {
         init_block_time,
         init_block_number,
-        required_num_blocks,
         block_list,
     } = args;
 
     // extract values directly to avoid dereferencing later
     let init_block_time = *init_block_time;
     let init_block_number = *init_block_number;
-    let required_num_blocks = *required_num_blocks;
-
-    //
-    // 1. basic validations: validate list size
-    //
-    validate_block_list(required_num_blocks, block_list)?;
 
     //
     // 2. validate first block
@@ -104,21 +96,6 @@ fn accumulate_effort(cumulative_effort: U256, block: &RskBlock) -> Result<U256, 
     cumulative_effort
         .checked_add(effort)
         .ok_or("Overflow occurred adding block's PoW")
-}
-
-fn validate_block_list(
-    required_num_blocks: u32,
-    block_list: &[RskBlock],
-) -> Result<(), &'static str> {
-    if required_num_blocks < 1 {
-        return Err("Invalid number of required blocks");
-    }
-
-    if block_list.len() < required_num_blocks as usize {
-        return Err("Insufficient number of blocks");
-    }
-
-    Ok(())
 }
 
 fn validate_first_block(

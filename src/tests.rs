@@ -15,7 +15,6 @@ use crate::{BridgeEvent, CheckForkArgs, RskBlock, SUPERBLOCK_TIMES_DIFFICULTY, c
 const DEFAULT_DIFFICULTY: u128 = 5_904_436_352_267_687_415_636;
 const DEFAULT_TIMESTAMP: u64 = 1000;
 const DEFAULT_INIT_BLOCK_NUMBER: u64 = 100;
-const DEFAULT_REQ_NUMBER_OF_BLOCKS: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct TestCaseBlockHashValidation {
@@ -75,46 +74,6 @@ fn succeeds_with_two_blocks_and_one_uncle_when_all_conditions_met() {
         result,
         Ok(actual_effort),
         "Expected to succeed for valid input"
-    );
-}
-
-#[test]
-fn fails_when_required_block_number_is_invalid() {
-    let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-
-    let second_block = create_child_block(&first_block);
-
-    let block_list = vec![first_block, second_block];
-
-    let args = CheckForkArgsBuilder::new(block_list)
-        .required_num_blocks(0)
-        .build();
-
-    let result = check_fork(&args);
-    assert_eq!(
-        result,
-        Err("Invalid number of required blocks"),
-        "Expected to fail if requested number of blocks are invalid"
-    );
-}
-
-#[test]
-fn fails_when_provided_blocks_are_less_than_required() {
-    let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-
-    let second_block = create_child_block(&first_block);
-
-    let block_list = vec![first_block, second_block];
-
-    let args = CheckForkArgsBuilder::new(block_list)
-        .required_num_blocks(3)
-        .build();
-
-    let result = check_fork(&args);
-    assert_eq!(
-        result,
-        Err("Insufficient number of blocks"),
-        "Expected to fail if provided blocks are less than requested"
     );
 }
 
@@ -562,7 +521,6 @@ fn assert_minichain_hashes_are_valid_from_fixture(path: &str) {
 struct CheckForkArgsBuilder {
     init_block_time: Option<u64>,
     init_block_number: Option<u64>,
-    required_num_blocks: Option<u32>,
     block_list: Vec<RskBlock>,
 }
 
@@ -584,18 +542,10 @@ impl CheckForkArgsBuilder {
         self
     }
 
-    fn required_num_blocks(mut self, required_num_blocks: u32) -> Self {
-        self.required_num_blocks = Some(required_num_blocks);
-        self
-    }
-
     fn build(self) -> CheckForkArgs {
         CheckForkArgs {
             init_block_time: self.init_block_time.unwrap_or(DEFAULT_TIMESTAMP),
             init_block_number: self.init_block_number.unwrap_or(DEFAULT_INIT_BLOCK_NUMBER),
-            required_num_blocks: self
-                .required_num_blocks
-                .unwrap_or(DEFAULT_REQ_NUMBER_OF_BLOCKS),
             block_list: self.block_list,
         }
     }
