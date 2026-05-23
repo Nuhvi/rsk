@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tester::TesterRskBlockHeader;
 
 use crate::block_header::{RskBlockHeader, encode_list};
-use crate::{BridgeEvent, CheckForkArgs, RskBlock, SUPERBLOCK_TIMES_DIFFICULTY, check_fork};
+use crate::{CheckForkArgs, RskBlock, SUPERBLOCK_TIMES_DIFFICULTY, check_fork};
 
 const DEFAULT_DIFFICULTY: u128 = 5_904_436_352_267_687_415_636;
 const DEFAULT_TIMESTAMP: u64 = 1000;
@@ -152,27 +152,6 @@ fn fails_when_consecutive_blocks_are_not_parent_child() {
         result,
         Err("Invalid parent linkage between blocks"),
         "Expected to fail if consecutive blocks are not parent-child"
-    );
-}
-
-#[test]
-fn fails_when_event_found_in_second_block() {
-    let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-
-    let mut second_block = create_child_block(&first_block);
-    second_block.bridge_event = Some(BridgeEvent {
-        utxo_id: "utxo_2".to_string(),
-    });
-
-    let block_list = vec![first_block, second_block];
-
-    let args = CheckForkArgsBuilder::new(block_list).build();
-
-    let result = check_fork(&args);
-    assert_eq!(
-        result,
-        Err("Only the first block should contain a BridgeEvent"),
-        "Expected to fail if an event is found in second block"
     );
 }
 
@@ -418,7 +397,7 @@ fn fails_if_extension_data_is_precompressed_v1() {
     );
 }
 
-fn create_base_block(number: u64, bridge_event: bool, parent: Option<H256>) -> RskBlock {
+fn create_base_block(number: u64, parent: Option<H256>) -> RskBlock {
     let difficulty = U256::from(DEFAULT_DIFFICULTY);
     let timestamp = DEFAULT_TIMESTAMP;
     let mut header = RskBlockHeader {
@@ -433,10 +412,6 @@ fn create_base_block(number: u64, bridge_event: bool, parent: Option<H256>) -> R
         .expect("could not calculate block hash");
 
     RskBlock {
-        // this will be removed
-        bridge_event: bridge_event.then(|| BridgeEvent {
-            utxo_id: format!("utxo_{number}"),
-        }),
         uncles: vec![],
         pow: calculate_superblock_effort(U256::from(DEFAULT_DIFFICULTY)),
         header,
@@ -444,11 +419,11 @@ fn create_base_block(number: u64, bridge_event: bool, parent: Option<H256>) -> R
 }
 
 fn create_first_block(number: u64) -> RskBlock {
-    create_base_block(number, true, None)
+    create_base_block(number, None)
 }
 
 fn create_child_block(parent: &RskBlock) -> RskBlock {
-    let mut child = create_base_block(parent.header.number + 1, false, Some(parent.header.hash));
+    let mut child = create_base_block(parent.header.number + 1, Some(parent.header.hash));
     child.header.timestamp = parent.header.timestamp + 100;
     child.header.difficulty = build_valid_consecutive_difficulty(parent);
     child.pow = calculate_superblock_effort(child.header.difficulty);
@@ -461,7 +436,7 @@ fn create_child_block(parent: &RskBlock) -> RskBlock {
 }
 
 fn create_uncle(brother: &RskBlock) -> RskBlock {
-    let mut uncle = create_base_block(brother.header.number, false, Some(brother.header.parent));
+    let mut uncle = create_base_block(brother.header.number, Some(brother.header.parent));
     uncle.header.timestamp = brother.header.timestamp + 10;
     uncle.header.difficulty = brother.header.difficulty;
     uncle.pow = calculate_superblock_effort(uncle.header.difficulty);

@@ -6,12 +6,12 @@ use std::error::Error;
 use std::str::FromStr;
 use std::string::ToString;
 
+use crate::RskBlock;
 use crate::block_header::{
     RskBlockHeader, deserialize_hex_bytes, deserialize_hex_bytes_20, deserialize_hex_h256,
     deserialize_hex_u64, deserialize_hex_u256, deserialize_hex_u256_option,
     deserialize_vec_hex_h256,
 };
-use crate::{BridgeEvent, RskBlock};
 use bitcoin::blockdata::block::Header;
 use bitcoin::consensus::encode::deserialize as btc_deserialize;
 use primitive_types::{H256, U256};
@@ -113,7 +113,6 @@ impl From<&TesterRskBlockHeader> for RskBlockHeader {
 pub struct TesterRskBlock {
     #[serde(flatten)]
     header: TesterRskBlockHeader,
-    bridge_event: Option<BridgeEvent>,
     #[serde(skip)]
     uncles: Vec<TesterRskBlock>, // this field should be filled later
 }
@@ -128,7 +127,6 @@ where
 impl From<&TesterRskBlock> for RskBlock {
     fn from(tester_block: &TesterRskBlock) -> Self {
         RskBlock {
-            bridge_event: tester_block.bridge_event.clone(),
             uncles: tester_block.uncles.iter().map(RskBlock::from).collect(),
             pow: tester_block.pow().expect("pow is not valid"),
             header: RskBlockHeader::from(&tester_block.header),
@@ -169,18 +167,12 @@ impl TesterRskBlock {
 //     start_block_number: u64,
 //     num_of_blocks: u32,
 //     log_super_block: bool,
-//     has_bridge_event: bool,
 // ) -> Result<Vec<RskBlock>, Box<dyn Error>> {
 //     let client = Client::new();
 //     let mut blocks = vec![];
 //
 //     for i in 0..num_of_blocks {
 //         fetch_block_by_num(start_block_number, log_super_block, &client, &mut blocks, i).await?;
-//     }
-//
-//     if has_bridge_event {
-//         let result: Vec<RskBlock> = add_bridge_event(&blocks);
-//         return Ok(result);
 //     }
 //
 //     let mut blocks_with_uncles = Vec::new();
@@ -265,22 +257,6 @@ impl TesterRskBlock {
 //         blocks.push(block);
 //     }
 //     Ok(())
-// }
-//
-// fn add_bridge_event(blocks: &[TesterRskBlock]) -> Vec<RskBlock> {
-//     blocks
-//         .iter()
-//         .enumerate()
-//         .map(|(i, b)| {
-//             let mut input_block = RskBlock::from(b);
-//             if i == 0 {
-//                 input_block.bridge_event = Some(BridgeEvent {
-//                     utxo_id: "FAKE_UTXO_ID".to_string(),         // tmp
-//                 });
-//             }
-//             input_block
-//         })
-//         .collect()
 // }
 //
 // fn log_if_superblock(block: &TesterRskBlock) -> Result<(), Box<dyn Error>> {

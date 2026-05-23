@@ -19,7 +19,6 @@ pub const SUPERBLOCK_TIMES_DIFFICULTY: u8 = 20;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RskBlock {
-    pub bridge_event: Option<BridgeEvent>,
     pub uncles: Vec<RskBlock>,
     pub pow: H256, // used to accumulate effort (from check_fork_accumulator)
     pub header: RskBlockHeader,
@@ -30,11 +29,6 @@ pub struct CheckForkArgs {
     pub init_block_time: u64,
     pub init_block_number: u64,
     pub block_list: Vec<RskBlock>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct BridgeEvent {
-    pub utxo_id: String,
 }
 
 /// Check fork validity and return cumulative `PoW`
@@ -117,9 +111,6 @@ fn validate_first_block(
 }
 
 fn validate_consecutive_block(block: &RskBlock, prev_block: &RskBlock) -> Result<(), &'static str> {
-    if block.bridge_event.is_some() {
-        return Err("Only the first block should contain a BridgeEvent");
-    }
     // block timestamp should be greater than previous one
     if block.header.timestamp <= prev_block.header.timestamp {
         return Err("Block Timestamp is not increasing");
