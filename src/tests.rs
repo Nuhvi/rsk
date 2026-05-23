@@ -274,26 +274,6 @@ fn fails_when_event_found_in_second_block() {
 }
 
 #[test]
-fn fails_when_event_has_unexpected_utxo() {
-    let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-
-    let second_block = create_child_block(&first_block);
-
-    let block_list = vec![first_block, second_block];
-
-    let args = CheckForkArgsBuilder::new(block_list)
-        .event_utxo_id("fake_utxo".to_string())
-        .build();
-
-    let result = check_fork(&args);
-    assert_eq!(
-        result,
-        Err("BridgeEvent does not match utxoID"),
-        "Expected to fail if the event has a different utxo"
-    );
-}
-
-#[test]
 fn fails_when_event_has_unexpected_pegout_id() {
     let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
 
@@ -678,7 +658,6 @@ fn assert_minichain_hashes_are_valid_from_fixture(path: &str) {
 
 #[derive(Default)]
 struct CheckForkArgsBuilder {
-    utxo_id: Option<String>,
     pegout_id: Option<String>,
     operator_id: Option<String>,
     init_block_time: Option<u64>,
@@ -694,11 +673,6 @@ impl CheckForkArgsBuilder {
             block_list,
             ..Default::default()
         }
-    }
-
-    fn event_utxo_id(mut self, utxo_id: String) -> Self {
-        self.utxo_id = Some(utxo_id);
-        self
     }
 
     fn event_pegout_id(mut self, pegout_id: String) -> Self {
@@ -733,9 +707,6 @@ impl CheckForkArgsBuilder {
 
     fn build(self) -> CheckForkArgs {
         CheckForkArgs {
-            utxo_id: self
-                .utxo_id
-                .unwrap_or_else(|| format!("utxo_{DEFAULT_INIT_BLOCK_NUMBER}")),
             pegout_id: self
                 .pegout_id
                 .unwrap_or_else(|| format!("pegout_{DEFAULT_INIT_BLOCK_NUMBER}")),

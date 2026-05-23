@@ -27,7 +27,6 @@ pub struct RskBlock {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CheckForkArgs {
-    pub utxo_id: String,
     pub pegout_id: String,
     pub operator_id: String,
     pub init_block_time: u64,
@@ -53,7 +52,6 @@ pub struct BridgeEvent {
 #[allow(dead_code)]
 pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
     let CheckForkArgs {
-        utxo_id,
         pegout_id,
         operator_id,
         init_block_time,
@@ -83,7 +81,6 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
         first_block,
         init_block_time,
         init_block_number,
-        utxo_id,
         pegout_id,
         operator_id,
     )?;
@@ -147,7 +144,6 @@ fn validate_first_block(
     block: &RskBlock,
     init_block_time: u64,
     init_block_number: u64,
-    utxo_id: &str,
     pegout_id: &str,
     operator_id: &str,
 ) -> Result<(), &'static str> {
@@ -161,14 +157,13 @@ fn validate_first_block(
 
     validate_enough_effort_superblock(block, "first")?;
 
-    validate_bridge_event(block.bridge_event.as_ref(), utxo_id, pegout_id, operator_id)?;
+    validate_bridge_event(block.bridge_event.as_ref(), pegout_id, operator_id)?;
 
     Ok(())
 }
 
 fn validate_bridge_event(
     bridge_event: Option<&BridgeEvent>,
-    utxo_id: &str,
     pegout_id: &str,
     operator_id: &str,
 ) -> Result<(), &'static str> {
@@ -180,10 +175,6 @@ fn validate_bridge_event(
 
     if bridge_event.operator_id != operator_id {
         return Err("BridgeEvent does not match operatorID");
-    }
-
-    if bridge_event.utxo_id != utxo_id {
-        return Err("BridgeEvent does not match utxoID");
     }
 
     Ok(())
