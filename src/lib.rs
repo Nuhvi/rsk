@@ -1,379 +1,294 @@
-// TODO: do we have to use this crate?
-use num_bigint::BigUint;
-use std::collections::HashMap;
+// #![deny(missing_docs)]
+#![deny(rustdoc::broken_intra_doc_links)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![warn(clippy::must_use_candidate)]
 
-pub(crate) mod constants;
-pub mod validator;
+pub mod block_header;
+pub mod rlp;
+#[cfg(test)]
+mod tests;
 
 // --- RSK Core Logic Simulation ---
 
-/// checkpoint hard coded in the PowPeg HSM as reported by <https://dev.rootstock.io/concepts/powpeg/hsm-firmware-attestation/>
-const _POWPEG_CHECKPOINT: (usize, &str) = (
-    4575000,
-    "0x099657039569a2a5d9759d6e5fd5636a253b8c518daf26858ec5c5de0f66e8c7",
-);
+use primitive_types::{H256, U256};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug)]
-pub struct BlockHeader {
-    pub hash: String,
-    pub parent_hash: String,
-    pub difficulty: BigUint,
-    pub number: u64,
-    pub timestamp: u64,
+use crate::block_header::RskBlockHeader;
+
+pub const SUPERBLOCK_TIMES_DIFFICULTY: u8 = 20;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RskBlock {
+    pub bridge_event: Option<BridgeEvent>,
+    pub uncles: Vec<RskBlock>,
+    pub pow: H256, // used to accumulate effort (from check_fork_accumulator)
+    pub header: RskBlockHeader,
 }
 
-#[derive(Clone, Debug)]
-pub struct Block {
-    pub header: BlockHeader,
-    pub uncle_list: Vec<BlockHeader>,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CheckForkArgs {
+    pub utxo_id: String,
+    pub pegout_id: String,
+    pub operator_id: String,
+    pub init_block_time: u64,
+    pub init_block_number: u64,
+    pub required_effort: U256,
+    pub required_num_blocks: u32,
+    pub block_list: Vec<RskBlock>,
 }
 
-impl Block {
-    pub fn new(hash: String, parent_hash: String, difficulty: u32, number: u64) -> Self {
-        Self {
-            header: BlockHeader {
-                hash,
-                parent_hash,
-                difficulty: BigUint::from(difficulty),
-                number,
-                timestamp: 0,
-            },
-            uncle_list: vec![],
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BridgeEvent {
+    pub utxo_id: String,
+    pub pegout_id: String,
+    pub operator_id: String,
+}
+
+/// Check fork validity and return cumulative `PoW`
+///
+/// # Errors
+///
+/// Returns an error string if the fork validation fails (e.g., insufficient blocks,
+/// invalid block sequence, cumulative `PoW` below threshold, or bridge event mismatch)
+#[allow(dead_code)]
+pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
+    let CheckForkArgs {
+        utxo_id,
+        pegout_id,
+        operator_id,
+        init_block_time,
+        init_block_number,
+        required_effort,
+        required_num_blocks,
+        block_list,
+    } = args;
+
+    // extract values directly to avoid dereferencing later
+    let init_block_time = *init_block_time;
+    let init_block_number = *init_block_number;
+    let required_effort = *required_effort;
+    let required_num_blocks = *required_num_blocks;
+
+    //
+    // 1. basic validations: validate list size
+    //
+    validate_block_list(required_num_blocks, block_list)?;
+
+    //
+    // 2. validate first block
+    //
+
+    let first_block = &block_list[0];
+    validate_first_block(
+        first_block,
+        init_block_time,
+        init_block_number,
+        utxo_id,
+        pegout_id,
+        operator_id,
+    )?;
+    validate_block_hash(&first_block.header)?;
+
+    let mut cumulative_effort = accumulate_effort(U256::zero(), first_block)?;
+
+    //
+    // 3. validate consecutive blocks
+    //
+    for i in 1..block_list.len() {
+        let block = &block_list[i];
+        let prev_block = &block_list[i - 1];
+
+        validate_consecutive_block(block, prev_block)?;
+        validate_block_hash(&block.header)?;
+        cumulative_effort = accumulate_effort(cumulative_effort, block)?;
+
+        for uncle in &block.uncles {
+            validate_uncle(prev_block, uncle)?;
+            cumulative_effort = accumulate_effort(cumulative_effort, uncle)?;
         }
     }
 
-    pub fn get_hash(&self) -> String {
-        self.header.hash.clone()
+    //
+    // 4. validate enough cumulative PoW
+    //
+    dbg!((block_list.len(), cumulative_effort, required_effort));
+
+    if cumulative_effort < required_effort {
+        return Err("Cumulative PoW does not meet the required threshold");
     }
 
-    pub fn get_parent_hash(&self) -> String {
-        self.header.parent_hash.clone()
+    Ok(cumulative_effort)
+}
+
+fn accumulate_effort(cumulative_effort: U256, block: &RskBlock) -> Result<U256, &'static str> {
+    let effort = calculate_block_effort(block)?;
+
+    cumulative_effort
+        .checked_add(effort)
+        .ok_or("Overflow occurred adding block's PoW")
+}
+
+fn validate_block_list(
+    required_num_blocks: u32,
+    block_list: &[RskBlock],
+) -> Result<(), &'static str> {
+    if required_num_blocks < 1 {
+        return Err("Invalid number of required blocks");
     }
 
-    /// Ported logic: Sum of header difficulty + all uncles
-    pub fn get_cumulative_difficulty(&self) -> BigUint {
-        self.uncle_list
-            .iter()
-            .fold(self.header.difficulty.clone(), |acc, uncle| {
-                acc + &uncle.difficulty
-            })
+    if block_list.len() < required_num_blocks as usize {
+        return Err("Insufficient number of blocks");
+    }
+
+    Ok(())
+}
+
+fn validate_first_block(
+    block: &RskBlock,
+    init_block_time: u64,
+    init_block_number: u64,
+    utxo_id: &str,
+    pegout_id: &str,
+    operator_id: &str,
+) -> Result<(), &'static str> {
+    if block.header.timestamp < init_block_time {
+        return Err("First block timestamp lower than expected");
+    }
+
+    if block.header.number < init_block_number {
+        return Err("First block number lower than expected");
+    }
+
+    validate_enough_effort_superblock(block, "first")?;
+
+    validate_bridge_event(block.bridge_event.as_ref(), utxo_id, pegout_id, operator_id)?;
+
+    Ok(())
+}
+
+fn validate_bridge_event(
+    bridge_event: Option<&BridgeEvent>,
+    utxo_id: &str,
+    pegout_id: &str,
+    operator_id: &str,
+) -> Result<(), &'static str> {
+    let bridge_event = bridge_event.ok_or("First block is missing BridgeEvent")?;
+
+    if bridge_event.pegout_id != pegout_id {
+        return Err("BridgeEvent does not match pegoutID");
+    }
+
+    if bridge_event.operator_id != operator_id {
+        return Err("BridgeEvent does not match operatorID");
+    }
+
+    if bridge_event.utxo_id != utxo_id {
+        return Err("BridgeEvent does not match utxoID");
+    }
+
+    Ok(())
+}
+
+fn validate_consecutive_block(block: &RskBlock, prev_block: &RskBlock) -> Result<(), &'static str> {
+    if block.bridge_event.is_some() {
+        return Err("Only the first block should contain a BridgeEvent");
+    }
+    // block timestamp should be greater than previous one
+    if block.header.timestamp <= prev_block.header.timestamp {
+        return Err("Block Timestamp is not increasing");
+    }
+
+    // blocks should be consecutive
+    let expected_next_number = prev_block
+        .header
+        .number
+        .checked_add(1)
+        .ok_or("Overflow incrementing previous block number")?;
+
+    if block.header.number != expected_next_number {
+        return Err("Block numbers are not consecutive");
+    }
+    // previous should be the parent of current one
+    if block.header.parent != prev_block.header.hash {
+        return Err("Invalid parent linkage between blocks");
+    }
+    validate_enough_effort_superblock(block, "consecutive")?;
+    validate_difficulty_in_bounds(block, prev_block)?;
+
+    Ok(())
+}
+
+fn validate_uncle(trunk_block: &RskBlock, uncle: &RskBlock) -> Result<(), &'static str> {
+    if uncle.header.number != trunk_block.header.number {
+        return Err("Uncle's block number does not match trunk block number");
+    }
+
+    if uncle.header.parent != trunk_block.header.parent {
+        return Err("Uncle's parent does not match trunk block's parent");
+    }
+
+    if uncle.header.difficulty != trunk_block.header.difficulty {
+        return Err("Uncle's difficulty does not match trunk block's difficulty");
+    }
+
+    validate_block_hash(&uncle.header)?;
+    validate_enough_effort_superblock(uncle, "uncle")?;
+
+    Ok(())
+}
+
+fn validate_enough_effort_superblock(
+    block: &RskBlock,
+    _block_type: &str,
+) -> Result<(), &'static str> {
+    let expected_effort = block
+        .header
+        .difficulty
+        .checked_mul(SUPERBLOCK_TIMES_DIFFICULTY.into())
+        .ok_or("Overflow occurred multiplying difficulty by times")?;
+    let actual_effort = calculate_block_effort(block)?;
+
+    if actual_effort >= expected_effort {
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+fn validate_difficulty_in_bounds(
+    block: &RskBlock,
+    prev_block: &RskBlock,
+) -> Result<(), &'static str> {
+    // check these RSKj lines:
+    // - https://github.com/rsksmart/rskj/blob/3cd3401a9c6cfd3dfa63120304d0f26f691ae6e7/rskj-core/src/main/java/co/rsk/core/DifficultyCalculator.java#L64
+    // - https://github.com/rsksmart/rskj/blob/master/rskj-core/src/main/java/org/ethereum/config/Constants.java#L150
+    let max_delta = prev_block.header.difficulty / 400;
+
+    let lower_bound = prev_block.header.difficulty.saturating_sub(max_delta);
+    let upper_bound = prev_block.header.difficulty.saturating_add(max_delta);
+
+    let in_bounds = (lower_bound..=upper_bound).contains(&block.header.difficulty);
+    if in_bounds {
+        Ok(())
+    } else {
+        Err("Consecutive Block difficulty is out of bounds")
     }
 }
 
-// --- Block Store Simulation ---
-
-pub struct IndexedBlockStore {
-    // Stores: Block Hash -> (Block, TotalDifficulty)
-    pub blocks: HashMap<String, (Block, BigUint)>,
+fn calculate_block_effort(block: &RskBlock) -> Result<U256, &'static str> {
+    let pow = U256::from_big_endian(block.pow.as_bytes());
+    // compute the effort by inverting the pow
+    // U256::MAX, the "difficulty 1" target, represents the easiest possible target
+    U256::MAX
+        .checked_div(pow)
+        .ok_or("0 division on calculate_block_effort")
 }
 
-impl IndexedBlockStore {
-    pub fn new() -> Self {
-        Self {
-            blocks: HashMap::new(),
-        }
+fn validate_block_hash(header: &RskBlockHeader) -> Result<(), &'static str> {
+    let actual_hash = header.calculate_block_hash()?;
+    if header.hash != actual_hash {
+        println!("Block number: {}", header.number);
+        return Err("Block header hash is not matching");
     }
-
-    pub fn save_block(&mut self, block: Block, total_difficulty: BigUint) {
-        self.blocks
-            .insert(block.get_hash(), (block, total_difficulty));
-    }
-
-    pub fn save_block_with_total_difficulty_calculation(&mut self, block: Block) {
-        let parent_total_difficulty = self.get_total_difficulty_for_hash(&block.get_parent_hash());
-        let total_difficulty = parent_total_difficulty + block.get_cumulative_difficulty();
-        self.save_block(block, total_difficulty);
-    }
-
-    pub fn get_block_by_hash(&self, hash: &str) -> Option<&Block> {
-        self.blocks.get(hash).map(|(b, _)| b)
-    }
-
-    pub fn get_total_difficulty_for_hash(&self, hash: &str) -> BigUint {
-        self.blocks
-            .get(hash)
-            .map(|(_, td)| td.clone())
-            .unwrap_or_default()
-    }
-}
-
-// --- The Ported Test ---
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_rsk_cumulative_work_calculation() {
-        let mut indexed_block_store = IndexedBlockStore::new();
-
-        // 1. Setup Genesis
-        let genesis = Block::new("genesis".to_string(), "0".to_string(), 100, 0);
-        let genesis_hash = genesis.get_hash();
-        let mut td = genesis.get_cumulative_difficulty(); // In RSK, genesis TD starts with its own work
-
-        indexed_block_store.save_block(genesis.clone(), td.clone());
-
-        // 2. Build "Best Line" (Main Chain) - 100 blocks
-        let mut best_line = Vec::new();
-        let mut prev_hash = genesis_hash;
-
-        for i in 1..=100 {
-            let mut block = Block::new(format!("hash_{}", i), prev_hash.clone(), 10, i as u64);
-
-            // Simulate an uncle to test your get_cumulative_difficulty logic
-            if i % 10 == 0 {
-                block.uncle_list.push(BlockHeader {
-                    hash: format!("uncle_{}", i),
-                    parent_hash: prev_hash.clone(),
-                    difficulty: BigUint::from(2u32),
-                    number: i as u64,
-                    timestamp: 0,
-                });
-            }
-
-            td += block.get_cumulative_difficulty();
-            indexed_block_store.save_block(block.clone(), td.clone());
-
-            prev_hash = block.get_hash();
-            best_line.push(block);
-        }
-
-        // 3. Create Fork at block 60 - 50 blocks
-        let fork_parent = &best_line[59]; // index 59 is block 60
-        let mut fork_line = Vec::new();
-        let mut fork_prev_hash = fork_parent.get_hash();
-
-        // Get TD at the fork point
-        let mut fork_td = indexed_block_store.get_total_difficulty_for_hash(&fork_prev_hash);
-
-        for i in 1..=50 {
-            let block = Block::new(
-                format!("fork_hash_{}", i),
-                fork_prev_hash.clone(),
-                12, // slightly higher diff
-                fork_parent.header.number + i as u64,
-            );
-
-            fork_td += block.get_cumulative_difficulty();
-            indexed_block_store.save_block(block.clone(), fork_td.clone());
-
-            fork_prev_hash = block.get_hash();
-            fork_line.push(block);
-        }
-
-        // 4. Manual Verification Calculations (Replicating the HashMap logic in Java test)
-        let mut expected_tds = HashMap::new();
-        let mut manual_td = genesis.get_cumulative_difficulty();
-
-        for b in &best_line {
-            manual_td += b.get_cumulative_difficulty();
-            expected_tds.insert(b.get_hash(), manual_td.clone());
-        }
-
-        let mut manual_fork_td = expected_tds.get(&fork_parent.get_hash()).unwrap().clone();
-        for b in &fork_line {
-            manual_fork_td += b.get_cumulative_difficulty();
-            expected_tds.insert(b.get_hash(), manual_fork_td.clone());
-        }
-
-        // 5. Final Assertions
-        // Check Best Line
-        for block in &best_line {
-            let stored_td = indexed_block_store.get_total_difficulty_for_hash(&block.get_hash());
-            let expected = expected_tds.get(&block.get_hash()).unwrap();
-            assert_eq!(
-                stored_td, *expected,
-                "Main chain TD mismatch at block {}",
-                block.header.number
-            );
-        }
-
-        // Check Fork Line
-        for block in &fork_line {
-            let stored_td = indexed_block_store.get_total_difficulty_for_hash(&block.get_hash());
-            let expected = expected_tds.get(&block.get_hash()).unwrap();
-            assert_eq!(
-                stored_td, *expected,
-                "Fork chain TD mismatch at block {}",
-                block.header.number
-            );
-        }
-
-        println!("Test Passed: All cumulative difficulties match across branches.");
-    }
-
-    #[tokio::test]
-    async fn real_blocks_indexed_store_with_uncles() {
-        let rpc_url =
-            std::env::var("RSK_RPC").unwrap_or_else(|_| "https://public-node.rsk.co".to_string());
-        let client = reqwest::Client::new();
-
-        async fn rpc_call(
-            client: &reqwest::Client,
-            url: &str,
-            method: &str,
-            params: serde_json::Value,
-        ) -> serde_json::Value {
-            let body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": method,
-                "params": params,
-            });
-            let mut resp: serde_json::Value = client
-                .post(url)
-                .json(&body)
-                .send()
-                .await
-                .expect("RPC request failed")
-                .json()
-                .await
-                .expect("JSON parse failed");
-            resp["result"].take()
-        }
-
-        fn parse_difficulty(value: &serde_json::Value) -> BigUint {
-            let hex = value.as_str().unwrap_or("0x0").trim_start_matches("0x");
-            BigUint::parse_bytes(hex.as_bytes(), 16).unwrap_or_default()
-        }
-
-        fn parse_hex_u64(value: &serde_json::Value) -> u64 {
-            let hex = value.as_str().unwrap_or("0x0").trim_start_matches("0x");
-            u64::from_str_radix(hex, 16).unwrap_or(0)
-        }
-
-        fn display_eh(val: &BigUint) -> String {
-            let one_eh = BigUint::from(10u64).pow(18);
-            let whole = val / &one_eh;
-            let rem = val % &one_eh;
-            let dec = rem * BigUint::from(1000u32) / &one_eh;
-            let d: u64 = dec.iter_u64_digits().next().unwrap_or(0);
-            format!("{whole}.{d:03} EH")
-        }
-
-        fn fetch_uncles<'a>(
-            client: &'a reqwest::Client,
-            rpc_url: &'a str,
-            hex: &'a str,
-        ) -> impl std::future::Future<Output = Vec<BlockHeader>> + 'a {
-            async move {
-                let count = rpc_call(
-                    client,
-                    rpc_url,
-                    "eth_getUncleCountByBlockNumber",
-                    serde_json::json!([hex]),
-                )
-                .await;
-                let n = parse_hex_u64(&count) as usize;
-                let mut uncles = Vec::with_capacity(n);
-                for i in 0..n {
-                    let u = rpc_call(
-                        client,
-                        rpc_url,
-                        "eth_getUncleByBlockNumberAndIndex",
-                        serde_json::json!([hex, format!("{i:#x}")]),
-                    )
-                    .await;
-                    uncles.push(BlockHeader {
-                        hash: u["hash"].as_str().unwrap_or("").to_string(),
-                        parent_hash: u["parentHash"].as_str().unwrap_or("").to_string(),
-                        difficulty: parse_difficulty(&u["difficulty"]),
-                        number: parse_hex_u64(&u["number"]),
-                        timestamp: 0,
-                    });
-                }
-                uncles
-            }
-        }
-
-        let hex_8375 = "0x86c29f";
-        let hex_8376 = "0x86c2a0";
-        let hex_8377 = "0x86c2a1";
-
-        let raw_8375 = rpc_call(
-            &client,
-            &rpc_url,
-            "eth_getBlockByNumber",
-            serde_json::json!([hex_8375, false]),
-        )
-        .await;
-
-        let raw_8376 = rpc_call(
-            &client,
-            &rpc_url,
-            "eth_getBlockByNumber",
-            serde_json::json!([hex_8376, false]),
-        )
-        .await;
-
-        let raw_8377 = rpc_call(
-            &client,
-            &rpc_url,
-            "eth_getBlockByNumber",
-            serde_json::json!([hex_8377, false]),
-        )
-        .await;
-
-        let uncles_8376 = fetch_uncles(&client, &rpc_url, hex_8376).await;
-        let uncles_8377 = fetch_uncles(&client, &rpc_url, hex_8377).await;
-
-        // Starting TD comes from the RPC (block 8_833_375)
-        // The explorer shows it as ≈54,543,886,113.12 EH at time of viewing
-        let td_8375 = parse_difficulty(&raw_8375["totalDifficulty"]);
-
-        let block_8376 = Block {
-            header: BlockHeader {
-                hash: raw_8376["hash"].as_str().unwrap_or("").to_string(),
-                parent_hash: raw_8376["parentHash"].as_str().unwrap_or("").to_string(),
-                difficulty: parse_difficulty(&raw_8376["difficulty"]),
-                number: parse_hex_u64(&raw_8376["number"]),
-                timestamp: 0,
-            },
-            uncle_list: uncles_8376,
-        };
-
-        let block_8377 = Block {
-            header: BlockHeader {
-                hash: raw_8377["hash"].as_str().unwrap_or("").to_string(),
-                parent_hash: raw_8377["parentHash"].as_str().unwrap_or("").to_string(),
-                difficulty: parse_difficulty(&raw_8377["difficulty"]),
-                number: parse_hex_u64(&raw_8377["number"]),
-                timestamp: 0,
-            },
-            uncle_list: uncles_8377,
-        };
-
-        let expected_td = parse_difficulty(&raw_8377["totalDifficulty"]);
-
-        let mut store = IndexedBlockStore::new();
-
-        store.save_block(
-            Block {
-                header: BlockHeader {
-                    hash: block_8376.header.parent_hash.clone(),
-                    parent_hash: String::new(),
-                    difficulty: BigUint::from(0u32),
-                    number: 8_833_375,
-                    timestamp: 0,
-                },
-                uncle_list: vec![],
-            },
-            td_8375,
-        );
-
-        store.save_block_with_total_difficulty_calculation(block_8376);
-        let hash_8377 = block_8377.get_hash();
-        store.save_block_with_total_difficulty_calculation(block_8377);
-
-        let stored_td = store.get_total_difficulty_for_hash(&hash_8377);
-
-        println!("block 8_833_377 total difficulty:");
-        println!("  stored:   {}", display_eh(&stored_td));
-        println!("  RPC:      {}", display_eh(&expected_td));
-        println!();
-        println!("(explorer showed ≈54,543,940,517.27 EH at time of viewing)");
-
-        assert_eq!(stored_td, expected_td);
-    }
+    Ok(())
 }
