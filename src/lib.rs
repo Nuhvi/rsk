@@ -15,8 +15,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::block_header::RskBlockHeader;
 
-pub const SUPERBLOCK_TIMES_DIFFICULTY: u8 = 20;
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RskBlock {
     pub uncles: Vec<RskBlock>,
@@ -50,7 +48,7 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
     let init_block_number = *init_block_number;
 
     //
-    // 2. validate first block
+    // validate first block
     //
 
     let first_block = &block_list[0];
@@ -60,7 +58,7 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
     let mut cumulative_effort = accumulate_effort(U256::zero(), first_block)?;
 
     //
-    // 3. validate consecutive blocks
+    // validate consecutive blocks
     //
     for i in 1..block_list.len() {
         let block = &block_list[i];
@@ -75,11 +73,6 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
             cumulative_effort = accumulate_effort(cumulative_effort, uncle)?;
         }
     }
-
-    //
-    // 4. validate enough cumulative PoW
-    //
-    dbg!((block_list.len(), cumulative_effort));
 
     Ok(cumulative_effort)
 }
@@ -105,8 +98,6 @@ fn validate_first_block(
         return Err("First block number lower than expected");
     }
 
-    validate_enough_effort_superblock(block, "first")?;
-
     Ok(())
 }
 
@@ -130,7 +121,6 @@ fn validate_consecutive_block(block: &RskBlock, prev_block: &RskBlock) -> Result
     if block.header.parent != prev_block.header.hash {
         return Err("Invalid parent linkage between blocks");
     }
-    validate_enough_effort_superblock(block, "consecutive")?;
     validate_difficulty_in_bounds(block, prev_block)?;
 
     Ok(())
@@ -150,25 +140,6 @@ fn validate_uncle(trunk_block: &RskBlock, uncle: &RskBlock) -> Result<(), &'stat
     }
 
     validate_block_hash(&uncle.header)?;
-    validate_enough_effort_superblock(uncle, "uncle")?;
-
-    Ok(())
-}
-
-fn validate_enough_effort_superblock(
-    block: &RskBlock,
-    _block_type: &str,
-) -> Result<(), &'static str> {
-    let expected_effort = block
-        .header
-        .difficulty
-        .checked_mul(SUPERBLOCK_TIMES_DIFFICULTY.into())
-        .ok_or("Overflow occurred multiplying difficulty by times")?;
-    let actual_effort = calculate_block_effort(block)?;
-
-    if actual_effort >= expected_effort {
-        return Ok(());
-    }
 
     Ok(())
 }

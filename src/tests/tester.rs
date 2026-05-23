@@ -21,8 +21,6 @@ use serde::{Deserialize, Serialize};
 
 // const RSK_RPC_URL: &str = "https://public-node.rsk.co";
 
-// const SUPERBLOCK_THRESHOLD_FACTOR: u64 = 20;
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TesterRskBlockHeader {
     #[serde(rename = "number", deserialize_with = "deserialize_hex_u64")]

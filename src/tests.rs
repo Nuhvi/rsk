@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tester::TesterRskBlockHeader;
 
 use crate::block_header::{RskBlockHeader, encode_list};
-use crate::{CheckForkArgs, RskBlock, SUPERBLOCK_TIMES_DIFFICULTY, check_fork};
+use crate::{CheckForkArgs, RskBlock, check_fork};
 
 const DEFAULT_DIFFICULTY: u128 = 5_904_436_352_267_687_415_636;
 const DEFAULT_TIMESTAMP: u64 = 1000;
@@ -164,7 +164,7 @@ fn fails_when_consecutive_block_difficulty_is_lower_than_bounds() {
         .header
         .difficulty
         .saturating_sub(first_block.header.difficulty / 399);
-    second_block.pow = calculate_superblock_effort(second_block.header.difficulty);
+    second_block.pow = calculate_effort(second_block.header.difficulty);
 
     let block_list = vec![first_block, second_block];
 
@@ -187,7 +187,7 @@ fn fails_when_consecutive_block_difficulty_is_higher_than_bounds() {
         .header
         .difficulty
         .saturating_add(first_block.header.difficulty / 399);
-    second_block.pow = calculate_superblock_effort(second_block.header.difficulty);
+    second_block.pow = calculate_effort(second_block.header.difficulty);
 
     let block_list = vec![first_block, second_block];
 
@@ -291,7 +291,7 @@ fn fails_when_uncle_difficulty_is_different_from_trunk() {
 fn fails_when_first_block_pow_is_lower_than_required() {
     let mut first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
     // make pow lower than required
-    first_block.pow = calculate_superblock_effort(first_block.header.difficulty - 1);
+    first_block.pow = calculate_effort(first_block.header.difficulty - 1);
 
     let second_block = create_child_block(&first_block);
 
@@ -315,7 +315,7 @@ fn fails_when_consecutive_block_pow_is_lower_than_required() {
     let mut second_block = create_child_block(&first_block);
 
     // make pow lower than required
-    second_block.pow = calculate_superblock_effort(second_block.header.difficulty - 1);
+    second_block.pow = calculate_effort(second_block.header.difficulty - 1);
 
     let block_list = vec![first_block, second_block];
 
@@ -336,7 +336,7 @@ fn fails_when_uncle_block_pow_is_lower_than_required() {
 
     let mut second_block_uncle = create_uncle(&first_block);
     // make pow lower than required
-    second_block_uncle.pow = calculate_superblock_effort(second_block_uncle.header.difficulty - 1);
+    second_block_uncle.pow = calculate_effort(second_block_uncle.header.difficulty - 1);
 
     let mut second_block = create_child_block(&first_block);
     second_block.uncles = vec![second_block_uncle];
@@ -413,7 +413,7 @@ fn create_base_block(number: u64, parent: Option<H256>) -> RskBlock {
 
     RskBlock {
         uncles: vec![],
-        pow: calculate_superblock_effort(U256::from(DEFAULT_DIFFICULTY)),
+        pow: calculate_effort(U256::from(DEFAULT_DIFFICULTY)),
         header,
     }
 }
@@ -426,7 +426,7 @@ fn create_child_block(parent: &RskBlock) -> RskBlock {
     let mut child = create_base_block(parent.header.number + 1, Some(parent.header.hash));
     child.header.timestamp = parent.header.timestamp + 100;
     child.header.difficulty = build_valid_consecutive_difficulty(parent);
-    child.pow = calculate_superblock_effort(child.header.difficulty);
+    child.pow = calculate_effort(child.header.difficulty);
     // we modified the child, we need to recalculate the hash
     child.header.hash = child
         .header
@@ -439,7 +439,7 @@ fn create_uncle(brother: &RskBlock) -> RskBlock {
     let mut uncle = create_base_block(brother.header.number, Some(brother.header.parent));
     uncle.header.timestamp = brother.header.timestamp + 10;
     uncle.header.difficulty = brother.header.difficulty;
-    uncle.pow = calculate_superblock_effort(uncle.header.difficulty);
+    uncle.pow = calculate_effort(uncle.header.difficulty);
     // we modified the uncle, we need to recalculate the hash
     uncle.header.hash = uncle
         .header
@@ -452,11 +452,10 @@ fn build_valid_consecutive_difficulty(first_block: &RskBlock) -> U256 {
     first_block.header.difficulty + first_block.header.difficulty / 400 // limit threshold
 }
 
-fn calculate_superblock_effort(difficulty: U256) -> H256 {
+fn calculate_effort(difficulty: U256) -> H256 {
     H256::from(
         U256::MAX
             .checked_div(difficulty)
-            .and_then(|n| n.checked_div(U256::from(SUPERBLOCK_TIMES_DIFFICULTY)))
             .expect("0 division on calculate_superblock_effort")
             .to_big_endian(),
     )
