@@ -30,13 +30,13 @@ struct TestCaseMiniChainHashValidation {
 
 #[test]
 fn succeeds_with_two_blocks_when_all_conditions_met() {
-    let mut actual_effort = U256::zero();
+    let mut actual_difficulty = U256::zero();
 
     let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-    actual_effort += calculate_effort_from_pow(first_block.pow);
+    actual_difficulty += first_block.header.difficulty;
 
     let second_block = create_child_block(&first_block);
-    actual_effort += calculate_effort_from_pow(second_block.pow);
+    actual_difficulty += second_block.header.difficulty;
 
     let block_list = vec![first_block, second_block];
 
@@ -45,25 +45,25 @@ fn succeeds_with_two_blocks_when_all_conditions_met() {
 
     assert_eq!(
         result,
-        Ok(actual_effort),
+        Ok(actual_difficulty),
         "Expected to succeed for valid input"
     );
 }
 
 #[test]
 fn succeeds_with_two_blocks_and_one_uncle_when_all_conditions_met() {
-    let mut actual_effort = U256::zero();
+    let mut actual_difficulty = U256::zero();
 
     let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-    actual_effort += calculate_effort_from_pow(first_block.pow);
+    actual_difficulty += first_block.header.difficulty;
 
     let second_block_uncle = create_uncle(&first_block);
-    actual_effort += calculate_effort_from_pow(second_block_uncle.pow);
+    actual_difficulty += second_block_uncle.header.difficulty;
 
     let mut second_block = create_child_block(&first_block);
     second_block.uncles = vec![second_block_uncle];
 
-    actual_effort += calculate_effort_from_pow(second_block.pow);
+    actual_difficulty += second_block.header.difficulty;
 
     let block_list = vec![first_block, second_block];
 
@@ -72,7 +72,7 @@ fn succeeds_with_two_blocks_and_one_uncle_when_all_conditions_met() {
     let result = check_fork(&args);
     assert_eq!(
         result,
-        Ok(actual_effort),
+        Ok(actual_difficulty),
         "Expected to succeed for valid input"
     );
 }
@@ -164,7 +164,6 @@ fn fails_when_consecutive_block_difficulty_is_lower_than_bounds() {
         .header
         .difficulty
         .saturating_sub(first_block.header.difficulty / 399);
-    second_block.pow = calculate_effort(second_block.header.difficulty);
 
     let block_list = vec![first_block, second_block];
 
@@ -187,7 +186,6 @@ fn fails_when_consecutive_block_difficulty_is_higher_than_bounds() {
         .header
         .difficulty
         .saturating_add(first_block.header.difficulty / 399);
-    second_block.pow = calculate_effort(second_block.header.difficulty);
 
     let block_list = vec![first_block, second_block];
 
@@ -287,11 +285,10 @@ fn fails_when_uncle_difficulty_is_different_from_trunk() {
 }
 
 #[test]
-#[ignore = "TODO: re-enable this check when Superchain is implemented and checked in check_fork (now just logging)"]
 fn fails_when_first_block_pow_is_lower_than_required() {
     let mut first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
     // make pow lower than required
-    first_block.pow = calculate_effort(first_block.header.difficulty - 1);
+    first_block.header.difficulty -= 1.into();
 
     let second_block = create_child_block(&first_block);
 
@@ -308,14 +305,13 @@ fn fails_when_first_block_pow_is_lower_than_required() {
 }
 
 #[test]
-#[ignore = "TODO: re-enable this check when Superchain is implemented and checked in check_fork (now just logging)"]
 fn fails_when_consecutive_block_pow_is_lower_than_required() {
     let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
 
     let mut second_block = create_child_block(&first_block);
 
     // make pow lower than required
-    second_block.pow = calculate_effort(second_block.header.difficulty - 1);
+    second_block.header.difficulty -= 1.into();
 
     let block_list = vec![first_block, second_block];
 
@@ -330,13 +326,12 @@ fn fails_when_consecutive_block_pow_is_lower_than_required() {
 }
 
 #[test]
-#[ignore = "TODO: re-enable this check when Superchain is implemented and checked in check_fork (now just logging)"]
 fn fails_when_uncle_block_pow_is_lower_than_required() {
     let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
 
     let mut second_block_uncle = create_uncle(&first_block);
     // make pow lower than required
-    second_block_uncle.pow = calculate_effort(second_block_uncle.header.difficulty - 1);
+    second_block_uncle.header.difficulty -= 1.into();
 
     let mut second_block = create_child_block(&first_block);
     second_block.uncles = vec![second_block_uncle];
@@ -413,7 +408,6 @@ fn create_base_block(number: u64, parent: Option<H256>) -> RskBlock {
 
     RskBlock {
         uncles: vec![],
-        pow: calculate_effort(U256::from(DEFAULT_DIFFICULTY)),
         header,
     }
 }
@@ -426,7 +420,6 @@ fn create_child_block(parent: &RskBlock) -> RskBlock {
     let mut child = create_base_block(parent.header.number + 1, Some(parent.header.hash));
     child.header.timestamp = parent.header.timestamp + 100;
     child.header.difficulty = build_valid_consecutive_difficulty(parent);
-    child.pow = calculate_effort(child.header.difficulty);
     // we modified the child, we need to recalculate the hash
     child.header.hash = child
         .header
@@ -439,7 +432,6 @@ fn create_uncle(brother: &RskBlock) -> RskBlock {
     let mut uncle = create_base_block(brother.header.number, Some(brother.header.parent));
     uncle.header.timestamp = brother.header.timestamp + 10;
     uncle.header.difficulty = brother.header.difficulty;
-    uncle.pow = calculate_effort(uncle.header.difficulty);
     // we modified the uncle, we need to recalculate the hash
     uncle.header.hash = uncle
         .header
@@ -450,22 +442,6 @@ fn create_uncle(brother: &RskBlock) -> RskBlock {
 
 fn build_valid_consecutive_difficulty(first_block: &RskBlock) -> U256 {
     first_block.header.difficulty + first_block.header.difficulty / 400 // limit threshold
-}
-
-fn calculate_effort(difficulty: U256) -> H256 {
-    H256::from(
-        U256::MAX
-            .checked_div(difficulty)
-            .expect("0 division on calculate_superblock_effort")
-            .to_big_endian(),
-    )
-}
-
-fn calculate_effort_from_pow(pow: H256) -> U256 {
-    let pow_dec = U256::from_big_endian(pow.as_bytes());
-    U256::MAX
-        .checked_div(pow_dec)
-        .expect("0 division on calculate_effort_from_pow")
 }
 
 fn assert_minichain_hashes_are_valid_from_fixture(path: &str) {

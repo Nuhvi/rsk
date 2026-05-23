@@ -4,6 +4,9 @@
 
 use std::fmt;
 
+use bitcoin::block::Header as BitcoinHeader;
+use bitcoin::consensus::Decodable;
+use bitcoin::consensus::Encodable;
 use primitive_types::{H256, U256};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha3::{Digest, Keccak256};
@@ -54,7 +57,7 @@ pub struct RskBlockHeader {
     /// None: omit field in hash input, Some([]): include empty field
     pub rsk_pte_edges: Option<Vec<u16>>,
     /// 80-byte Bitcoin block header for merged mining
-    pub bitcoin_merged_mining_header: Vec<u8>,
+    pub bitcoin_merged_mining_header: BitcoinHeader,
 }
 
 impl Default for RskBlockHeader {
@@ -78,7 +81,17 @@ impl Default for RskBlockHeader {
             minimum_gas_price: Some(U256::zero()),
             uncles: Vec::new(),
             rsk_pte_edges: None,
-            bitcoin_merged_mining_header: vec![0u8; 80],
+            // genesis
+            bitcoin_merged_mining_header: BitcoinHeader::consensus_decode(
+                &mut hex::decode(
+                    "010000000000000000000000000000000000000000000000000000000000000000000000\
+                    3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a\
+                    29ab5f49ffff001d1dac2b7c",
+                )
+                .expect("infallible")
+                .as_slice(),
+            )
+            .expect("infallible"),
         }
     }
 }
@@ -103,6 +116,11 @@ impl RskBlockHeader {
             self.logs_bloom_v0()?.to_vec()
         };
 
+        let mut bitcoin_merged_mining_header = vec![];
+        self.bitcoin_merged_mining_header
+            .consensus_encode(&mut bitcoin_merged_mining_header)
+            .expect("infallible: Invalid bitcoin_merged_mining_header after already parsing it");
+
         let encoded_fields: Vec<Vec<u8>> = vec![
             alloy_rlp::encode(self.parent.as_bytes()),
             alloy_rlp::encode(self.uncles_hash.as_bytes()),
@@ -121,7 +139,7 @@ impl RskBlockHeader {
             encode_signed_coin_value_as_byte(&minimum_gas_price),
             alloy_rlp::encode(self.uncles.len()), // uncle_count
             alloy_rlp::encode::<&[u8]>(&self.umm_root()),
-            alloy_rlp::encode(self.bitcoin_merged_mining_header.as_slice()),
+            alloy_rlp::encode(bitcoin_merged_mining_header.as_slice()),
         ];
         let out = encode_list(encoded_fields);
         Ok(out)
@@ -304,7 +322,7 @@ impl fmt::Debug for RskBlockHeader {
 
         write!(
             f,
-            "RskBlockHeader {{ number: {}, hash: {}, parent: {}, diff: {}, ts: {}, uncles_hash: {}, coinbase: 0x{}, state_root: {}, tx_root: {}, receipt_root: {}, extension_data: {} bytes, rsk_pte_edges: {:?}, gas_limit: 0x{}, gas_used: {}, extra_data: {} bytes, paid_fees: {}, min_gas_price: {:?}, uncle_count: {}, umm_root: {:?}, mm_header: {} bytes }}",
+            "RskBlockHeader {{ number: {}, hash: {}, parent: {}, diff: {}, ts: {}, uncles_hash: {}, coinbase: 0x{}, state_root: {}, tx_root: {}, receipt_root: {}, extension_data: {} bytes, rsk_pte_edges: {:?}, gas_limit: 0x{}, gas_used: {}, extra_data: {} bytes, paid_fees: {}, min_gas_price: {:?}, uncle_count: {}, umm_root: {:?}, mm_header_hash: {} }}",
             self.number,
             short(&self.hash),
             short(&self.parent),
@@ -324,7 +342,7 @@ impl fmt::Debug for RskBlockHeader {
             self.minimum_gas_price,
             self.uncles.len(),
             self.umm_root(),
-            self.bitcoin_merged_mining_header.len(),
+            self.bitcoin_merged_mining_header.block_hash()
         )
     }
 }

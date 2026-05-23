@@ -6,11 +6,9 @@
 pub mod block_header;
 pub mod rlp;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
-// --- RSK Core Logic Simulation ---
-
-use primitive_types::{H256, U256};
+use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 
 use crate::block_header::RskBlockHeader;
@@ -18,7 +16,6 @@ use crate::block_header::RskBlockHeader;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct RskBlock {
     pub uncles: Vec<RskBlock>,
-    pub pow: H256, // used to accumulate effort (from check_fork_accumulator)
     pub header: RskBlockHeader,
 }
 
@@ -51,11 +48,13 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
     // validate first block
     //
 
+    // TODO: Move validation in the RskBlockHeader itself!
+
     let first_block = &block_list[0];
     validate_first_block(first_block, init_block_time, init_block_number)?;
     validate_block_hash(&first_block.header)?;
 
-    let mut cumulative_effort = accumulate_effort(U256::zero(), first_block)?;
+    let mut cumulative_effort = accumulate_difficulty(U256::zero(), first_block)?;
 
     //
     // validate consecutive blocks
@@ -66,22 +65,20 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
 
         validate_consecutive_block(block, prev_block)?;
         validate_block_hash(&block.header)?;
-        cumulative_effort = accumulate_effort(cumulative_effort, block)?;
+        cumulative_effort = accumulate_difficulty(cumulative_effort, block)?;
 
         for uncle in &block.uncles {
             validate_uncle(prev_block, uncle)?;
-            cumulative_effort = accumulate_effort(cumulative_effort, uncle)?;
+            cumulative_effort = accumulate_difficulty(cumulative_effort, uncle)?;
         }
     }
 
     Ok(cumulative_effort)
 }
 
-fn accumulate_effort(cumulative_effort: U256, block: &RskBlock) -> Result<U256, &'static str> {
-    let effort = calculate_block_effort(block)?;
-
+fn accumulate_difficulty(cumulative_effort: U256, block: &RskBlock) -> Result<U256, &'static str> {
     cumulative_effort
-        .checked_add(effort)
+        .checked_add(block.header.difficulty)
         .ok_or("Overflow occurred adding block's PoW")
 }
 
@@ -162,15 +159,6 @@ fn validate_difficulty_in_bounds(
     } else {
         Err("Consecutive Block difficulty is out of bounds")
     }
-}
-
-fn calculate_block_effort(block: &RskBlock) -> Result<U256, &'static str> {
-    let pow = U256::from_big_endian(block.pow.as_bytes());
-    // compute the effort by inverting the pow
-    // U256::MAX, the "difficulty 1" target, represents the easiest possible target
-    U256::MAX
-        .checked_div(pow)
-        .ok_or("0 division on calculate_block_effort")
 }
 
 fn validate_block_hash(header: &RskBlockHeader) -> Result<(), &'static str> {
