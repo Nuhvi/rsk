@@ -6,18 +6,18 @@ edition = "2024"
 [dependencies]
 hex = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
-serde_json = "1"
 tiny-keccak = { version = "2", features = ["keccak"] }
 tokio = { version = "1.52.3", features = ["full"] }
 
 esplora-client = { version = "0.9", features = ["async"] }
-bitcoin = "0.32"
 num-bigint = "0.4.6"
 
 primitive-types = { version = "0.13.1", features = ["std", "serde"] }
 sha3 = "0.10.8"
 serde = { version = "1.0.228", features = ["derive"] }
 alloy-rlp = "0.3.15"
+bitcoin = { version = "0.32", features = ["serde"] }
 
 [dev-dependencies]
 chrono = "0.4.44"
+serde_json = "1"
