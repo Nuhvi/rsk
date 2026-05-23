@@ -232,32 +232,12 @@ fn fails_when_consecutive_blocks_are_not_parent_child() {
 }
 
 #[test]
-fn fails_when_event_not_found_in_first_block() {
-    let mut first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-    first_block.bridge_event = None;
-
-    let second_block = create_child_block(&first_block);
-
-    let block_list = vec![first_block, second_block];
-
-    let args = CheckForkArgsBuilder::new(block_list).build();
-
-    let result = check_fork(&args);
-    assert_eq!(
-        result,
-        Err("First block is missing BridgeEvent"),
-        "Expected to fail if event is not found in first block"
-    );
-}
-
-#[test]
 fn fails_when_event_found_in_second_block() {
     let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
 
     let mut second_block = create_child_block(&first_block);
     second_block.bridge_event = Some(BridgeEvent {
         utxo_id: "utxo_2".to_string(),
-        operator_id: "operator_2".to_string(),
     });
 
     let block_list = vec![first_block, second_block];
@@ -269,26 +249,6 @@ fn fails_when_event_found_in_second_block() {
         result,
         Err("Only the first block should contain a BridgeEvent"),
         "Expected to fail if an event is found in second block"
-    );
-}
-
-#[test]
-fn fails_when_event_has_unexpected_operator() {
-    let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-
-    let second_block = create_child_block(&first_block);
-
-    let block_list = vec![first_block, second_block];
-
-    let args = CheckForkArgsBuilder::new(block_list)
-        .event_operator_id("fake_operator".to_string())
-        .build();
-
-    let result = check_fork(&args);
-    assert_eq!(
-        result,
-        Err("BridgeEvent does not match operatorID"),
-        "Expected to fail if the event has a different operator"
     );
 }
 
@@ -552,7 +512,6 @@ fn create_base_block(number: u64, bridge_event: bool, parent: Option<H256>) -> R
         // this will be removed
         bridge_event: bridge_event.then(|| BridgeEvent {
             utxo_id: format!("utxo_{number}"),
-            operator_id: format!("operator_{number}"),
         }),
         uncles: vec![],
         pow: calculate_superblock_effort(U256::from(DEFAULT_DIFFICULTY)),
@@ -636,7 +595,6 @@ fn assert_minichain_hashes_are_valid_from_fixture(path: &str) {
 
 #[derive(Default)]
 struct CheckForkArgsBuilder {
-    operator_id: Option<String>,
     init_block_time: Option<u64>,
     init_block_number: Option<u64>,
     required_num_blocks: Option<u32>,
@@ -650,11 +608,6 @@ impl CheckForkArgsBuilder {
             block_list,
             ..Default::default()
         }
-    }
-
-    fn event_operator_id(mut self, operator_id: String) -> Self {
-        self.operator_id = Some(operator_id);
-        self
     }
 
     fn init_block_time(mut self, init_block_time: u64) -> Self {
@@ -679,9 +632,6 @@ impl CheckForkArgsBuilder {
 
     fn build(self) -> CheckForkArgs {
         CheckForkArgs {
-            operator_id: self
-                .operator_id
-                .unwrap_or_else(|| format!("operator_{DEFAULT_INIT_BLOCK_NUMBER}")),
             init_block_time: self.init_block_time.unwrap_or(DEFAULT_TIMESTAMP),
             init_block_number: self.init_block_number.unwrap_or(DEFAULT_INIT_BLOCK_NUMBER),
             required_effort: self.required_effort.unwrap_or(U256::MAX),
