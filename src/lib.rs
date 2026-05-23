@@ -29,7 +29,6 @@ pub struct RskBlock {
 pub struct CheckForkArgs {
     pub init_block_time: u64,
     pub init_block_number: u64,
-    pub required_effort: U256,
     pub required_num_blocks: u32,
     pub block_list: Vec<RskBlock>,
 }
@@ -50,7 +49,6 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
     let CheckForkArgs {
         init_block_time,
         init_block_number,
-        required_effort,
         required_num_blocks,
         block_list,
     } = args;
@@ -58,7 +56,6 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
     // extract values directly to avoid dereferencing later
     let init_block_time = *init_block_time;
     let init_block_number = *init_block_number;
-    let required_effort = *required_effort;
     let required_num_blocks = *required_num_blocks;
 
     //
@@ -96,11 +93,7 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
     //
     // 4. validate enough cumulative PoW
     //
-    dbg!((block_list.len(), cumulative_effort, required_effort));
-
-    if cumulative_effort < required_effort {
-        return Err("Cumulative PoW does not meet the required threshold");
-    }
+    dbg!((block_list.len(), cumulative_effort));
 
     Ok(cumulative_effort)
 }

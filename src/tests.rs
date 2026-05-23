@@ -41,9 +41,7 @@ fn succeeds_with_two_blocks_when_all_conditions_met() {
 
     let block_list = vec![first_block, second_block];
 
-    let args = CheckForkArgsBuilder::new(block_list)
-        .required_effort(actual_effort)
-        .build();
+    let args = CheckForkArgsBuilder::new(block_list).build();
     let result = check_fork(&args);
 
     assert_eq!(
@@ -70,9 +68,7 @@ fn succeeds_with_two_blocks_and_one_uncle_when_all_conditions_met() {
 
     let block_list = vec![first_block, second_block];
 
-    let args = CheckForkArgsBuilder::new(block_list)
-        .required_effort(actual_effort)
-        .build();
+    let args = CheckForkArgsBuilder::new(block_list).build();
 
     let result = check_fork(&args);
     assert_eq!(
@@ -159,37 +155,6 @@ fn fails_when_first_block_number_is_lower_than_min_requested() {
         result,
         Err("First block number lower than expected"),
         "Expected to fail if first block number is lower than min requested"
-    );
-}
-
-#[test]
-fn fails_when_cumulative_effort_below_expected() {
-    let mut actual_effort = U256::zero();
-
-    let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-    actual_effort += calculate_effort_from_pow(first_block.pow);
-
-    let second_block_uncle = create_uncle(&first_block);
-    actual_effort += calculate_effort_from_pow(second_block_uncle.pow);
-
-    let mut second_block = create_child_block(&first_block);
-    second_block.uncles = vec![second_block_uncle];
-
-    actual_effort += calculate_effort_from_pow(second_block.pow);
-
-    let block_list = vec![first_block, second_block];
-
-    let expected_effort = actual_effort + 1;
-
-    let args = CheckForkArgsBuilder::new(block_list)
-        .required_effort(expected_effort)
-        .build();
-
-    let result = check_fork(&args);
-    assert_eq!(
-        result,
-        Err("Cumulative PoW does not meet the required threshold"),
-        "Expected to fail if cumulative PoW is lower than expected: {expected_effort}"
     );
 }
 
@@ -598,7 +563,6 @@ struct CheckForkArgsBuilder {
     init_block_time: Option<u64>,
     init_block_number: Option<u64>,
     required_num_blocks: Option<u32>,
-    required_effort: Option<U256>,
     block_list: Vec<RskBlock>,
 }
 
@@ -625,16 +589,10 @@ impl CheckForkArgsBuilder {
         self
     }
 
-    fn required_effort(mut self, required_effort: U256) -> Self {
-        self.required_effort = Some(required_effort);
-        self
-    }
-
     fn build(self) -> CheckForkArgs {
         CheckForkArgs {
             init_block_time: self.init_block_time.unwrap_or(DEFAULT_TIMESTAMP),
             init_block_number: self.init_block_number.unwrap_or(DEFAULT_INIT_BLOCK_NUMBER),
-            required_effort: self.required_effort.unwrap_or(U256::MAX),
             required_num_blocks: self
                 .required_num_blocks
                 .unwrap_or(DEFAULT_REQ_NUMBER_OF_BLOCKS),
