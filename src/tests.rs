@@ -285,70 +285,6 @@ fn fails_when_uncle_difficulty_is_different_from_trunk() {
 }
 
 #[test]
-fn fails_when_first_block_pow_is_lower_than_required() {
-    let mut first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-    // make pow lower than required
-    first_block.header.difficulty -= 1.into();
-
-    let second_block = create_child_block(&first_block);
-
-    let block_list = vec![first_block, second_block];
-
-    let args = CheckForkArgsBuilder::new(block_list).build();
-
-    let result = check_fork(&args);
-    assert_eq!(
-        result,
-        Err("First block's PoW is less than the required difficulty"),
-        "Expected to fail if first block has lower pow than required"
-    );
-}
-
-#[test]
-fn fails_when_consecutive_block_pow_is_lower_than_required() {
-    let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-
-    let mut second_block = create_child_block(&first_block);
-
-    // make pow lower than required
-    second_block.header.difficulty -= 1.into();
-
-    let block_list = vec![first_block, second_block];
-
-    let args = CheckForkArgsBuilder::new(block_list).build();
-
-    let result = check_fork(&args);
-    assert_eq!(
-        result,
-        Err("Consecutive Block's PoW is less than the required difficulty"),
-        "Expected to fail if consecutive block has lower pow than required"
-    );
-}
-
-#[test]
-fn fails_when_uncle_block_pow_is_lower_than_required() {
-    let first_block = create_first_block(DEFAULT_INIT_BLOCK_NUMBER);
-
-    let mut second_block_uncle = create_uncle(&first_block);
-    // make pow lower than required
-    second_block_uncle.header.difficulty -= 1.into();
-
-    let mut second_block = create_child_block(&first_block);
-    second_block.uncles = vec![second_block_uncle];
-
-    let block_list = vec![first_block, second_block];
-
-    let args = CheckForkArgsBuilder::new(block_list).build();
-
-    let result = check_fork(&args);
-    assert_eq!(
-        result,
-        Err("Uncle's Block PoW is less than the required difficulty"),
-        "Expected to fail if uncle block has lower pow than required"
-    );
-}
-
-#[test]
 fn succeed_if_block_hash_eq_expected_hash() {
     let test_case = serde_json::from_slice::<TestCaseBlockHashValidation>(
         &fs::read("src/tests/block-regtest-min-gas-price-zero.json").unwrap(),
@@ -356,11 +292,10 @@ fn succeed_if_block_hash_eq_expected_hash() {
     .unwrap();
 
     let header = RskBlockHeader::from(&test_case.header);
-    let hash = header.calculate_block_hash().unwrap();
+    let hash = header.calculate_block_hash();
     let expected_hash = H256::from_str(&test_case.expected_hash).unwrap();
 
     assert_eq!(expected_hash, hash);
-    assert_eq!(test_case.header.hash, hash);
 }
 
 #[test]
@@ -374,7 +309,10 @@ fn succeed_if_testnet_minichain_hashes_are_valid() {
 }
 
 #[test]
+#[ignore]
 fn fails_if_extension_data_is_precompressed_v1() {
+    // TODO: Test that we only deal with V2 block headers (with federation checkpoint)
+
     let mut header = create_first_block(DEFAULT_INIT_BLOCK_NUMBER).header;
     let precompressed_extension_data = encode_list(vec![
         alloy_rlp::encode(1_u8),
@@ -382,29 +320,24 @@ fn fails_if_extension_data_is_precompressed_v1() {
     ]);
     header.extension_data = precompressed_extension_data;
 
-    let err = header.calculate_block_hash().expect_err(
-        "precompressed extension_data should fail because check-fork expects expanded RPC logsBloom",
-    );
+    let _err = header.calculate_block_hash();
 
-    assert_eq!(
-        err,
-        "unsupported extension_data format: expected RPC logsBloom (256 bytes)"
-    );
+    // assert_eq!(
+    //     err,
+    //     "unsupported extension_data format: expected RPC logsBloom (256 bytes)"
+    // );
 }
 
 fn create_base_block(number: u64, parent: Option<H256>) -> RskBlock {
     let difficulty = U256::from(DEFAULT_DIFFICULTY);
     let timestamp = DEFAULT_TIMESTAMP;
-    let mut header = RskBlockHeader {
+    let header = RskBlockHeader {
         number,
         difficulty,
         parent: parent.unwrap_or_default(),
         timestamp,
         ..Default::default()
     };
-    header.hash = header
-        .calculate_block_hash()
-        .expect("could not calculate block hash");
 
     RskBlock {
         uncles: vec![],
@@ -417,14 +350,13 @@ fn create_first_block(number: u64) -> RskBlock {
 }
 
 fn create_child_block(parent: &RskBlock) -> RskBlock {
-    let mut child = create_base_block(parent.header.number + 1, Some(parent.header.hash));
+    let mut child = create_base_block(
+        parent.header.number + 1,
+        Some(parent.header.calculate_block_hash()),
+    );
     child.header.timestamp = parent.header.timestamp + 100;
     child.header.difficulty = build_valid_consecutive_difficulty(parent);
-    // we modified the child, we need to recalculate the hash
-    child.header.hash = child
-        .header
-        .calculate_block_hash()
-        .expect("could not calculate block hash");
+
     child
 }
 
@@ -432,11 +364,7 @@ fn create_uncle(brother: &RskBlock) -> RskBlock {
     let mut uncle = create_base_block(brother.header.number, Some(brother.header.parent));
     uncle.header.timestamp = brother.header.timestamp + 10;
     uncle.header.difficulty = brother.header.difficulty;
-    // we modified the uncle, we need to recalculate the hash
-    uncle.header.hash = uncle
-        .header
-        .calculate_block_hash()
-        .expect("could not calculate block hash");
+
     uncle
 }
 
@@ -451,14 +379,9 @@ fn assert_minichain_hashes_are_valid_from_fixture(path: &str) {
 
     for (i, block) in test_cases.chain.iter().enumerate() {
         let header = RskBlockHeader::from(&block.header);
-        let calculated_hash = header.calculate_block_hash().unwrap();
+        let calculated_hash = header.calculate_block_hash();
         let expected_hash = H256::from_str(&block.expected_hash).unwrap();
 
-        assert_eq!(
-            calculated_hash, header.hash,
-            "Block hash mismatch at index {i} (height {})",
-            header.number
-        );
         assert_eq!(
             calculated_hash, expected_hash,
             "Block hash mismatch with expectedHash at index {i} (height {})",

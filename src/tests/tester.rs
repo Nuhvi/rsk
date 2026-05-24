@@ -3,21 +3,15 @@
 #![forbid(unsafe_code)]
 
 use crate::RskBlock;
-use crate::block_header::{
-    RskBlockHeader, deserialize_hex_bytes, deserialize_hex_bytes_20, deserialize_hex_h256,
-    deserialize_hex_u64, deserialize_hex_u256, deserialize_hex_u256_option,
-    deserialize_vec_hex_h256,
-};
+use crate::block_header::RskBlockHeader;
 use bitcoin::consensus::Decodable;
 use primitive_types::{H256, U256};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TesterRskBlockHeader {
     #[serde(rename = "number", deserialize_with = "deserialize_hex_u64")]
     pub number: u64,
-    #[serde(rename = "hash", deserialize_with = "deserialize_hex_h256")]
-    pub hash: H256,
     #[serde(rename = "parentHash", deserialize_with = "deserialize_hex_h256")]
     pub parent: H256,
     #[serde(rename = "difficulty", deserialize_with = "deserialize_hex_u256")]
@@ -74,7 +68,6 @@ impl From<&TesterRskBlockHeader> for RskBlockHeader {
     fn from(t: &TesterRskBlockHeader) -> Self {
         RskBlockHeader {
             number: t.number,
-            hash: t.hash,
             parent: t.parent,
             difficulty: t.difficulty,
             timestamp: t.timestamp,
@@ -99,6 +92,15 @@ impl From<&TesterRskBlockHeader> for RskBlockHeader {
     }
 }
 
+impl From<&TesterRskBlock> for RskBlock {
+    fn from(tester_block: &TesterRskBlock) -> Self {
+        RskBlock {
+            uncles: tester_block.uncles.iter().map(RskBlock::from).collect(),
+            header: RskBlockHeader::from(&tester_block.header),
+        }
+    }
+}
+
 // used mainly for deserialization and also to avoid adding
 // dependencies (bitcoin) to the check_fork crate
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -116,11 +118,102 @@ where
     Option::<Vec<u16>>::deserialize(deserializer)
 }
 
-impl From<&TesterRskBlock> for RskBlock {
-    fn from(tester_block: &TesterRskBlock) -> Self {
-        RskBlock {
-            uncles: tester_block.uncles.iter().map(RskBlock::from).collect(),
-            header: RskBlockHeader::from(&tester_block.header),
+pub fn deserialize_hex_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    let s = s.strip_prefix("0x").unwrap_or(&s);
+    u64::from_str_radix(s, 16).map_err(serde::de::Error::custom)
+}
+
+pub fn deserialize_hex_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    let s = s.strip_prefix("0x").unwrap_or(&s);
+    hex::decode(s).map_err(serde::de::Error::custom)
+}
+
+pub fn deserialize_hex_u256_option<'de, D>(deserializer: D) -> Result<Option<U256>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(deserializer)?;
+    match s {
+        Some(s) => {
+            let s = s.strip_prefix("0x").unwrap_or(&s);
+            U256::from_str_radix(s, 16)
+                .map(Some)
+                .map_err(serde::de::Error::custom)
         }
+        None => Ok(None),
     }
+}
+
+pub fn deserialize_hex_h256<'de, D>(deserializer: D) -> Result<H256, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    let s = s.strip_prefix("0x").unwrap_or(&s);
+    let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+    from_bytes_vec_to_h256(&bytes)
+}
+
+pub fn deserialize_hex_u256<'de, D>(deserializer: D) -> Result<U256, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    let s = s.strip_prefix("0x").unwrap_or(&s);
+    U256::from_str_radix(s, 16).map_err(serde::de::Error::custom)
+}
+
+pub fn deserialize_vec_hex_h256<'de, D>(deserializer: D) -> Result<Vec<H256>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let strings: Vec<String> = Deserialize::deserialize(deserializer)?;
+    strings
+        .iter()
+        .map(|s| {
+            let s = s.strip_prefix("0x").unwrap_or(s);
+            let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+            from_bytes_vec_to_h256(&bytes)
+        })
+        .collect()
+}
+
+fn from_bytes_vec_to_h256<E>(bytes: &[u8]) -> Result<H256, E>
+where
+    E: serde::de::Error,
+{
+    if bytes.len() != 32 {
+        return Err(serde::de::Error::custom(format!(
+            "Expected 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+
+    Ok(H256::from_slice(bytes))
+}
+
+pub fn deserialize_hex_bytes_20<'de, D>(deserializer: D) -> Result<[u8; 20], D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    let s = s.strip_prefix("0x").unwrap_or(&s);
+    let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+    if bytes.len() != 20 {
+        return Err(serde::de::Error::custom(format!(
+            "expected 20 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut array = [0u8; 20];
+    array.copy_from_slice(&bytes);
+    Ok(array)
 }

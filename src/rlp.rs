@@ -1,6 +1,6 @@
 //! Copied from and based on <https://github.com/rsksmart/union-bridge-client/blob/main/check-fork/src/rlp.rs>
 
-use primitive_types::U256;
+use primitive_types::{H256, U256};
 
 #[must_use]
 pub fn encode_coin_value(value: &U256) -> Vec<u8> {
@@ -52,4 +52,30 @@ fn u256_be_coin_bytes(value: &U256) -> Vec<u8> {
         return Vec::new();
     }
     u256_be_trimmed(value)
+}
+
+pub fn decode_h256(decoder: &mut &[u8]) -> Result<H256, &'static str> {
+    let bytes: [u8; 32] =
+        alloy_rlp::Decodable::decode(decoder).map_err(|_| "failed to decode H256")?;
+    Ok(H256::from_slice(&bytes))
+}
+
+pub fn decode_u256_be(decoder: &mut &[u8]) -> Result<U256, &'static str> {
+    let bytes =
+        alloy_rlp::Header::decode_bytes(decoder, false).map_err(|_| "failed to decode U256")?;
+    Ok(U256::from_big_endian(bytes))
+}
+
+pub fn decode_bytes(decoder: &mut &[u8]) -> Result<Vec<u8>, &'static str> {
+    Ok(alloy_rlp::Header::decode_bytes(decoder, false)
+        .map_err(|_| "failed to decode bytes")?
+        .to_vec())
+}
+
+pub fn decode_u64(decoder: &mut &[u8]) -> Result<u64, &'static str> {
+    <u64 as alloy_rlp::Decodable>::decode(decoder).map_err(|_| "failed to decode number")
+}
+
+pub fn decode_fixed_bytes<const N: usize>(decoder: &mut &[u8]) -> Result<[u8; N], &'static str> {
+    <[u8; N] as alloy_rlp::Decodable>::decode(decoder).map_err(|_| "failed to decode fixed bytes")
 }

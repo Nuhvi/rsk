@@ -7,7 +7,7 @@ use crate::block_header::RskBlockHeader;
 pub mod pow;
 pub mod timestamp_rule;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ValidationError {
     FutureTimestamp,
     /// Bitcoin PoW hash does not meet RSK difficulty target

@@ -52,7 +52,6 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
 
     let first_block = &block_list[0];
     validate_first_block(first_block, init_block_time, init_block_number)?;
-    validate_block_hash(&first_block.header)?;
 
     let mut cumulative_effort = accumulate_difficulty(U256::zero(), first_block)?;
 
@@ -64,7 +63,6 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
         let prev_block = &block_list[i - 1];
 
         validate_consecutive_block(block, prev_block)?;
-        validate_block_hash(&block.header)?;
         cumulative_effort = accumulate_difficulty(cumulative_effort, block)?;
 
         for uncle in &block.uncles {
@@ -115,7 +113,7 @@ fn validate_consecutive_block(block: &RskBlock, prev_block: &RskBlock) -> Result
         return Err("Block numbers are not consecutive");
     }
     // previous should be the parent of current one
-    if block.header.parent != prev_block.header.hash {
+    if block.header.parent != prev_block.header.calculate_block_hash() {
         return Err("Invalid parent linkage between blocks");
     }
     validate_difficulty_in_bounds(block, prev_block)?;
@@ -135,8 +133,6 @@ fn validate_uncle(trunk_block: &RskBlock, uncle: &RskBlock) -> Result<(), &'stat
     if uncle.header.difficulty != trunk_block.header.difficulty {
         return Err("Uncle's difficulty does not match trunk block's difficulty");
     }
-
-    validate_block_hash(&uncle.header)?;
 
     Ok(())
 }
@@ -159,13 +155,4 @@ fn validate_difficulty_in_bounds(
     } else {
         Err("Consecutive Block difficulty is out of bounds")
     }
-}
-
-fn validate_block_hash(header: &RskBlockHeader) -> Result<(), &'static str> {
-    let actual_hash = header.calculate_block_hash()?;
-    if header.hash != actual_hash {
-        println!("Block number: {}", header.number);
-        return Err("Block header hash is not matching");
-    }
-    Ok(())
 }
