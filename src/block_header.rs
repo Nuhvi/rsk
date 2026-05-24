@@ -104,6 +104,8 @@ impl RskBlockHeader {
     }
 
     #[must_use]
+    /// Encode the [RskBlockHeader] according to [RSKIP194](https://github.com/rsksmart/RSKIPs/blob/master/IPs/RSKIP194.md)
+    /// for the purpose of calculating block hash, not for the purpose of serialization.
     pub fn encode_rlp(&self) -> Vec<u8> {
         let minimum_gas_price = self.minimum_gas_price.unwrap_or_default();
         // TODO: where does this check in encoding come from?
@@ -328,7 +330,7 @@ fn encode_hex(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    const RAW_BLOCK_HEADER_8329127: [u8; 581] = [
+    pub const RAW_BLOCK_HEADER_8329127: [u8; 581] = [
         249, 2, 66, 160, 139, 39, 189, 14, 132, 144, 210, 198, 3, 166, 231, 204, 52, 81, 201, 21,
         58, 204, 46, 36, 138, 146, 122, 12, 25, 233, 195, 59, 34, 229, 69, 209, 160, 29, 204, 77,
         232, 222, 199, 93, 122, 171, 133, 181, 103, 182, 204, 212, 26, 211, 18, 69, 27, 148, 138,

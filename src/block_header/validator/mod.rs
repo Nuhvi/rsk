@@ -1,6 +1,7 @@
 // Validation rules
 //
 // 1. Block header timestamp rules
+// 2. Proof of Work rules
 
 use crate::block_header::RskBlockHeader;
 
