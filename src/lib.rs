@@ -3,13 +3,13 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 #![warn(clippy::must_use_candidate)]
 
+use primitive_types::U256;
+use serde::{Deserialize, Serialize};
+
 pub mod block_header;
 pub mod rlp;
 #[cfg(test)]
 pub(crate) mod tests;
-
-use primitive_types::U256;
-use serde::{Deserialize, Serialize};
 
 use crate::block_header::RskBlockHeader;
 
@@ -66,7 +66,7 @@ pub fn check_fork(args: &CheckForkArgs) -> Result<U256, &'static str> {
         cumulative_effort = accumulate_difficulty(cumulative_effort, block)?;
 
         for uncle in &block.uncles {
-            validate_uncle(prev_block, uncle)?;
+            uncle.header.validate_is_uncle_of(&prev_block.header)?;
             cumulative_effort = accumulate_difficulty(cumulative_effort, uncle)?;
         }
     }
@@ -117,22 +117,6 @@ fn validate_consecutive_block(block: &RskBlock, prev_block: &RskBlock) -> Result
         return Err("Invalid parent linkage between blocks");
     }
     validate_difficulty_in_bounds(block, prev_block)?;
-
-    Ok(())
-}
-
-fn validate_uncle(trunk_block: &RskBlock, uncle: &RskBlock) -> Result<(), &'static str> {
-    if uncle.header.number != trunk_block.header.number {
-        return Err("Uncle's block number does not match trunk block number");
-    }
-
-    if uncle.header.parent != trunk_block.header.parent {
-        return Err("Uncle's parent does not match trunk block's parent");
-    }
-
-    if uncle.header.difficulty != trunk_block.header.difficulty {
-        return Err("Uncle's difficulty does not match trunk block's difficulty");
-    }
 
     Ok(())
 }
