@@ -7,6 +7,7 @@ use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 
 pub mod block_header;
+pub mod light_client;
 pub mod rlp;
 #[cfg(test)]
 pub(crate) mod tests;
