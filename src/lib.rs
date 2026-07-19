@@ -10,6 +10,7 @@ pub mod block_header;
 pub mod light_client;
 pub mod merge_mining;
 pub mod rlp;
+pub mod sha256_midstate;
 #[cfg(test)]
 pub(crate) mod tests;
 

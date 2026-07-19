@@ -1,13 +1,13 @@
 //! RSK Light Client PoC — runnable example
 //!
 //! Usage:
-//!     cargo run --example light_client_sync
+//!     RSK_RPC_URL=https://rpc.mainnet.rootstock.io/YOUR_KEY cargo run --example light_client_sync
 //!
 //! This will:
-//! 1. Fetch the last 144 Bitcoin headers from blockstream.info
-//! 2. Calculate total Bitcoin work over that window
-//! 3. Walk backwards from the RSK chain tip, accumulating difficulty
-//! 4. Report the finalized block once RSK work >= Bitcoin work
+//! 1. Derive Bitcoin work target from the RSK tip's embedded Bitcoin header
+//! 2. Walk backwards from the RSK chain tip, verifying merge-mining proofs (Rules 1-7)
+//!    for EVERY block using data from the RSK node's JSON-RPC API
+//! 3. Report the finalized block once RSK cumulative work >= Bitcoin target work
 
 use rsk::light_client::{self, LightClientConfig};
 
