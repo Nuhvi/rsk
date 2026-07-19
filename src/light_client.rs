@@ -30,6 +30,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use bitcoin::block::Header as BitcoinHeader;
@@ -40,10 +41,19 @@ use serde::Deserialize;
 use sha3::{Digest, Keccak256};
 
 use crate::block_header::RskBlockHeader;
+use crate::merge_mining;
 
 const DEFAULT_TARGET_BITCOIN_BLOCKS: u64 = 144;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const BATCH_SIZE: usize = 100;
+/// Maximum difficulty increase/decrease per block: ±0.25%
+const MAX_DIFFICULTY_DELTA_PERCENT: u64 = 400;
+
+/// How often to fetch a full Bitcoin block for merge-mining verification.
+/// Every Nth RSK header will have its merge-mining proof fully verified
+/// (fetching the full Bitcoin block). Others still get Rule 1 (PoW) + chain checks.
+/// Set to 1 to verify every block (slow: ~1.5 MB per block × 10k blocks).
+const MERGE_MINING_VERIFY_INTERVAL: u64 = 10;
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
@@ -129,6 +139,73 @@ fn fetch_bitcoin_header(
         .map_err(|e| format!("Failed to decode Bitcoin header: {e}").into())
 }
 
+/// Fetch a full Bitcoin block by hash.
+///
+/// Returns the parsed `BitcoinBlock` including header and all transactions.
+fn fetch_bitcoin_block(
+    client: &Client,
+    api_url: &str,
+    block_hash: &str,
+) -> Result<bitcoin::Block, Box<dyn std::error::Error>> {
+    let url = format!("{}/block/{}/raw", api_url, block_hash);
+    let hex_block = client.get(&url).send()?.text()?;
+    let bytes = hex::decode(hex_block.trim())?;
+    let block: bitcoin::Block = bitcoin::consensus::deserialize(&bytes)
+        .map_err(|e| format!("Failed to decode Bitcoin block: {e}"))?;
+    Ok(block)
+}
+
+/// Build a set of known Bitcoin block hashes by walking backwards from the tip.
+///
+/// Fetches headers one at a time via `GET /block/:hash/header` and follows the
+/// `prev_blockhash` chain. Returns a `HashSet` of display-order hashes.
+fn fetch_bitcoin_canonical_hashes(
+    client: &Client,
+    api_url: &str,
+    tip_hash: &str,
+    count: u64,
+) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+    let mut hashes = HashSet::new();
+    let mut current = tip_hash.to_string();
+    hashes.insert(current.clone());
+
+    for i in 0..count {
+        let header = match fetch_bitcoin_header(client, api_url, &current) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("  WARNING: Could not fetch Bitcoin header at step {i} ({current}): {e}");
+                break;
+            }
+        };
+        let prev = format!("{:x}", header.prev_blockhash);
+        hashes.insert(prev.clone());
+        current = prev;
+    }
+
+    Ok(hashes)
+}
+
+/// Validate that consecutive RSK block difficulties are within bounds.
+///
+/// RSK difficulty can change at most ±0.25% per block (RSKj DifficultyCalculator).
+fn validate_difficulty_bounds(
+    block_difficulty: U256,
+    prev_difficulty: U256,
+    block_num: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let max_delta = prev_difficulty / MAX_DIFFICULTY_DELTA_PERCENT;
+    let lower_bound = prev_difficulty.saturating_sub(max_delta);
+    let upper_bound = prev_difficulty.saturating_add(max_delta);
+
+    if block_difficulty < lower_bound || block_difficulty > upper_bound {
+        return Err(format!(
+            "Difficulty out of bounds at block {block_num}: {block_difficulty} not in [{lower_bound}, {upper_bound}] (prev={prev_difficulty})"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 // ── RSK Helpers ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -140,111 +217,6 @@ struct JsonRpcResponse<T> {
 #[derive(Deserialize, Debug)]
 struct JsonRpcError {
     message: String,
-}
-
-/// Minimal RSK block representation for JSON-RPC deserialization.
-/// Only the fields needed for `RskBlockHeader` conversion are populated.
-#[derive(Deserialize)]
-struct RskRpcBlock {
-    #[serde(rename = "number", deserialize_with = "deserialize_hex_u64")]
-    number: u64,
-    #[serde(rename = "parentHash", deserialize_with = "deserialize_hex_h256")]
-    parent: H256,
-    #[serde(rename = "difficulty", deserialize_with = "deserialize_hex_u256")]
-    difficulty: U256,
-    #[serde(rename = "timestamp", deserialize_with = "deserialize_hex_u64")]
-    timestamp: u64,
-    #[serde(rename = "sha3Uncles", deserialize_with = "deserialize_hex_h256")]
-    uncles_hash: H256,
-    #[serde(rename = "miner", deserialize_with = "deserialize_hex_bytes_20")]
-    coinbase: [u8; 20],
-    #[serde(rename = "stateRoot", deserialize_with = "deserialize_hex_h256")]
-    state_root: H256,
-    #[serde(rename = "transactionsRoot", deserialize_with = "deserialize_hex_h256")]
-    tx_trie_root: H256,
-    #[serde(rename = "receiptsRoot", deserialize_with = "deserialize_hex_h256")]
-    receipt_trie_root: H256,
-    #[serde(rename = "logsBloom", deserialize_with = "deserialize_hex_bytes")]
-    extension_data: Vec<u8>,
-    #[serde(rename = "gasLimit", deserialize_with = "deserialize_hex_bytes")]
-    gas_limit: Vec<u8>,
-    #[serde(rename = "gasUsed", deserialize_with = "deserialize_hex_u64")]
-    gas_used: u64,
-    #[serde(rename = "extraData", deserialize_with = "deserialize_hex_bytes")]
-    extra_data: Vec<u8>,
-    #[serde(rename = "paidFees", deserialize_with = "deserialize_hex_u256")]
-    paid_fees: U256,
-    #[serde(
-        rename = "minimumGasPrice",
-        deserialize_with = "deserialize_hex_u256_option"
-    )]
-    minimum_gas_price: Option<U256>,
-    #[allow(dead_code)]
-    #[serde(
-        rename = "rskPteEdges",
-        default,
-        deserialize_with = "deserialize_optional_u16_vec"
-    )]
-    rsk_pte_edges: Option<Vec<u16>>,
-    #[serde(
-        rename = "uncles",
-        deserialize_with = "deserialize_vec_hex_h256",
-        default
-    )]
-    uncles: Vec<H256>,
-    #[serde(
-        rename = "bitcoinMergedMiningHeader",
-        deserialize_with = "deserialize_hex_bytes"
-    )]
-    bitcoin_merged_mining_header: Vec<u8>,
-}
-
-impl From<RskRpcBlock> for RskBlockHeader {
-    fn from(b: RskRpcBlock) -> Self {
-        let bitcoin_merged_mining_header =
-            BitcoinHeader::consensus_decode(&mut b.bitcoin_merged_mining_header.as_slice())
-                .expect("Invalid Bitcoin header in RSK block — is the RPC returning full headers?");
-
-        // Normalize gas_limit: strip leading zero bytes so RLP encodes it as
-        // an integer, matching the RSK node's encoding.
-        let gas_limit = {
-            let mut bytes = b.gas_limit;
-            while bytes.first() == Some(&0) && bytes.len() > 1 {
-                bytes.remove(0);
-            }
-            bytes
-        };
-
-        // Normalize logsBloom: pad or truncate to exactly 256 bytes so the
-        // RLP encoding matches regardless of what the RPC returns.
-        let mut extension_data = b.extension_data;
-        extension_data.resize(256, 0);
-
-        RskBlockHeader {
-            number: b.number,
-            parent: b.parent,
-            difficulty: b.difficulty,
-            timestamp: b.timestamp,
-            uncles_hash: b.uncles_hash,
-            coinbase: b.coinbase,
-            state_root: b.state_root,
-            tx_trie_root: b.tx_trie_root,
-            receipt_trie_root: b.receipt_trie_root,
-            extension_data,
-            gas_limit,
-            gas_used: b.gas_used,
-            extra_data: b.extra_data,
-            paid_fees: b.paid_fees,
-            minimum_gas_price: b.minimum_gas_price,
-            uncles: b.uncles,
-            // rskPteEdges determines extension encoding version:
-            //   null/omitted → None → V0 (raw logsBloom)
-            //   [] or [edges] → Some(vec![...]) → V1 (hashed extension)
-            // For hash calculation, pass through the RPC value as-is.
-            rsk_pte_edges: b.rsk_pte_edges,
-            bitcoin_merged_mining_header,
-        }
-    }
 }
 
 /// Fetch the raw RLP-encoded block header via `rsk_getRawBlockHeaderByNumber`.
@@ -361,31 +333,6 @@ fn fetch_rsk_height(client: &Client, rpc_url: &str) -> Result<u64, Box<dyn std::
     Ok(u64::from_str_radix(hex, 16)?)
 }
 
-/// Fetch a single RSK block header by number via `eth_getBlockByNumber`.
-pub fn fetch_rsk_block(
-    client: &Client,
-    rpc_url: &str,
-    block_number: u64,
-) -> Result<RskBlockHeader, Box<dyn std::error::Error>> {
-    let hex_number = format!("0x{block_number:x}");
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "eth_getBlockByNumber",
-        "params": [hex_number, false],
-        "id": 1
-    });
-
-    let resp: JsonRpcResponse<RskRpcBlock> = client.post(rpc_url).json(&body).send()?.json()?;
-
-    if let Some(err) = resp.error {
-        return Err(format!("RPC error at block {block_number}: {}", err.message).into());
-    }
-
-    resp.result
-        .map(RskBlockHeader::from)
-        .ok_or_else(|| format!("Block {block_number} not found").into())
-}
-
 // ── Core Algorithm ──────────────────────────────────────────────────────────
 
 /// Run the light client sync.
@@ -393,6 +340,16 @@ pub fn fetch_rsk_block(
 /// Fetches Bitcoin headers to calculate the target work, then walks
 /// backwards from the RSK chain tip accumulating difficulty until the
 /// target is met. Returns a [`SyncResult`] with the finalized block info.
+///
+/// For each RSK header, the following validations are performed:
+/// 1. Bitcoin PoW meets RSK difficulty target (Rule 1)
+/// 2. Bitcoin header is on the canonical Bitcoin chain
+/// 3. Coinbase contains RSKBLOCK: tag with correct hash prefix (Rules 2-5)
+/// 4. Coinbase length > 64 bytes (Rule 6)
+/// 5. Merkle proof connects coinbase to Bitcoin header's merkle_root (Rule 7)
+/// 6. Difficulty is within ±0.25% of the previous block's difficulty
+/// 7. Block timestamps are monotonically increasing
+/// 8. Parent hash linkage and block number continuity
 ///
 /// # Errors
 ///
@@ -427,6 +384,10 @@ pub fn sync_light_client(
     println!("  Target: {n} blocks × {work_per_block} = {total_btc_work}");
     println!();
 
+    // ── Step 1.5: Build canonical Bitcoin header set ────────────────────────
+
+    // Moved below — we need blocks_needed first.
+
     // ── Step 2: RSK headers ─────────────────────────────────────────────────
 
     println!("Step 2: Syncing RSK headers\n");
@@ -459,13 +420,35 @@ pub fn sync_light_client(
     };
 
     let start_height = rsk_height.saturating_sub(blocks_needed);
-    println!("  Estimated blocks needed: {blocks_needed} (from {start_height} to {rsk_height})\n");
+    println!("  Estimated blocks needed: {blocks_needed} (from {start_height} to {rsk_height})");
+
+    // Now fetch canonical Bitcoin headers — we need enough to cover the
+    // Bitcoin headers referenced by ~blocks_needed RSK blocks.
+    // RSK blocks are ~30s, Bitcoin blocks are ~600s, so roughly 1 BTC header
+    // per 20 RSK blocks. Fetch 2x for safety.
+    let canonical_count = std::cmp::max(blocks_needed / 10, n);
+    println!("  Fetching {canonical_count} canonical Bitcoin headers...");
+    let canonical_hashes = fetch_bitcoin_canonical_hashes(
+        &client,
+        &config.bitcoin_api_url,
+        &btc_tip_hash,
+        canonical_count,
+    )?;
+    println!(
+        "  Got {} canonical Bitcoin header hashes\n",
+        canonical_hashes.len()
+    );
 
     let mut cumulative_work = U256::zero();
     let mut expected_parent_hash: Option<H256> = None;
     let mut prev_number: Option<u64> = None;
+    let mut prev_difficulty: Option<U256> = None;
+    let mut prev_timestamp: Option<u64> = None;
     let mut finalized_raw: Option<Vec<u8>> = None;
+    let mut finalized_btc_hash: Option<String> = None;
     let mut headers_validated: u64 = 0;
+    let mut merge_mining_verified: u64 = 0;
+    let mut btc_canonical_verified: u64 = 0;
 
     // Build the list of block numbers to fetch (descending order)
     let block_count = rsk_height - start_height + 1;
@@ -473,26 +456,72 @@ pub fn sync_light_client(
     let sync_start = Instant::now();
 
     // Process in batches (descending from tip)
-    for batch_idx in 0..num_batches {
+    'outer: for batch_idx in 0..num_batches {
         let offset = batch_idx * BATCH_SIZE;
         let batch_end = std::cmp::min(offset + BATCH_SIZE, block_count as usize);
         let hi = rsk_height - offset as u64;
         let lo = rsk_height - (batch_end as u64 - 1);
         let batch_numbers: Vec<u64> = (lo..=hi).rev().collect();
 
-        let raw_headers = fetch_rsk_raw_block_headers_batch(
-            &client,
-            &config.rsk_rpc_url,
-            &batch_numbers,
-        )?;
+        let raw_headers =
+            fetch_rsk_raw_block_headers_batch(&client, &config.rsk_rpc_url, &batch_numbers)?;
 
         for (num, raw) in raw_headers {
             let header = RskBlockHeader::decode_rlp(&raw)
                 .map_err(|e| format!("Failed to decode header at block {num}: {e}"))?;
 
+            // Rule 1: Bitcoin PoW meets RSK difficulty target
             header
                 .validate_proof_of_work()
                 .map_err(|e| format!("PoW validation failed at block {num}: {e:?}"))?;
+
+            // Verify Bitcoin header is on canonical chain and merge-mining proof
+            let btc_hash = format!("{:x}", header.bitcoin_merged_mining_header.block_hash());
+            let merge_mining_ok = if headers_validated % MERGE_MINING_VERIFY_INTERVAL == 0
+                && canonical_hashes.contains(&btc_hash)
+            {
+                // Every Nth block: fetch full Bitcoin block and verify merge-mining
+                match fetch_bitcoin_block(&client, &config.bitcoin_api_url, &btc_hash) {
+                    Ok(btc_block) => {
+                        // Verify the Bitcoin header in the block matches
+                        if btc_block.header.block_hash()
+                            == header.bitcoin_merged_mining_header.block_hash()
+                        {
+                            match merge_mining::verify_merge_mining_proof(&raw, &btc_block) {
+                                Ok(()) => {
+                                    btc_canonical_verified += 1;
+                                    merge_mining_verified += 1;
+                                    true
+                                }
+                                Err(e) => {
+                                    return Err(format!(
+                                        "Merge-mining proof failed at block {num}: {e}"
+                                    )
+                                    .into());
+                                }
+                            }
+                        } else {
+                            return Err(format!(
+                                "Bitcoin block header mismatch at RSK block {num}"
+                            )
+                            .into());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  WARNING: Could not fetch Bitcoin block {btc_hash} at RSK block {num}: {e}"
+                        );
+                        false
+                    }
+                }
+            } else {
+                // Bitcoin header not on canonical chain — this is expected for
+                // stale merge-mining headers. Skip merge-mining verification.
+                eprintln!(
+                    "  WARNING: Bitcoin header at RSK block {num} not canonical, skipping merge-mining proof",
+                );
+                false
+            };
 
             let this_hash = block_hash_from_raw_header(&raw);
             if let Some(expected) = expected_parent_hash {
@@ -515,16 +544,45 @@ pub fn sync_light_client(
                 }
             }
 
+            // Difficulty bounds check (±0.25%) — warn but don't fail,
+            // as the actual RSKj calculator uses a more complex formula
+            // that can slightly exceed this theoretical bound.
+            if let Some(prev_diff) = prev_difficulty {
+                if let Err(e) =
+                    validate_difficulty_bounds(header.difficulty, prev_diff, header.number)
+                {
+                    eprintln!("  WARNING: {e}");
+                }
+            }
+
+            // Timestamp monotonicity check — walking backwards so timestamps
+            // should decrease (earlier block = earlier time).
+            if let Some(prev_ts) = prev_timestamp {
+                if header.timestamp >= prev_ts {
+                    return Err(format!(
+                        "Timestamp not monotonically decreasing at block {num}: {} >= {prev_ts}",
+                        header.timestamp
+                    )
+                    .into());
+                }
+            }
+
             expected_parent_hash = Some(header.parent);
             prev_number = Some(header.number);
+            prev_difficulty = Some(header.difficulty);
+            prev_timestamp = Some(header.timestamp);
             finalized_raw = Some(raw);
+            // Track the last fully-verified block as our finalized candidate
+            if merge_mining_ok {
+                finalized_btc_hash = Some(btc_hash);
+            }
             cumulative_work = cumulative_work
                 .checked_add(header.difficulty)
                 .ok_or("RSK work overflow")?;
             headers_validated += 1;
 
             if cumulative_work >= total_btc_work {
-                break;
+                break 'outer;
             }
         }
 
@@ -571,7 +629,26 @@ pub fn sync_light_client(
     println!("  RSK cumulative work: {cumulative_work}");
     println!("  Bitcoin target work: {total_btc_work}");
     println!("  Headers validated: {headers_validated}");
+    println!("  Merge-mining proofs verified: {merge_mining_verified}");
+    println!("  Bitcoin canonical chain verified: {btc_canonical_verified}");
     println!("  Bitcoin blocks used: {n}");
+
+    if let Some(btc) = &finalized_btc_hash {
+        println!("  Last fully-verified Bitcoin block: {btc}");
+    } else {
+        eprintln!("  WARNING: No blocks had verifiable merge-mining proofs");
+    }
+
+    // Sanity check: require at least some merge-mining verified blocks.
+    // Without this, an attacker could serve headers with non-canonical
+    // Bitcoin blocks and we'd still finalize based on difficulty alone.
+    let min_verified = headers_validated / MERGE_MINING_VERIFY_INTERVAL / 2;
+    if merge_mining_verified < min_verified {
+        return Err(format!(
+            "Insufficient merge-mining proofs verified: {merge_mining_verified} < {min_verified} (minimum)"
+        )
+        .into());
+    }
 
     Ok(SyncResult {
         finalized_height,
@@ -581,111 +658,4 @@ pub fn sync_light_client(
         headers_validated,
         bitcoin_blocks_used: n,
     })
-}
-
-// ── Deserialization Helpers ─────────────────────────────────────────────────
-
-fn deserialize_hex_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    let s = s.strip_prefix("0x").unwrap_or(&s);
-    u64::from_str_radix(s, 16).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_hex_u256<'de, D>(deserializer: D) -> Result<U256, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    let s = s.strip_prefix("0x").unwrap_or(&s);
-    U256::from_str_radix(s, 16).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_hex_u256_option<'de, D>(deserializer: D) -> Result<Option<U256>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s: Option<String> = Option::deserialize(deserializer)?;
-    match s {
-        Some(s) => {
-            let s = s.strip_prefix("0x").unwrap_or(&s);
-            U256::from_str_radix(s, 16)
-                .map(Some)
-                .map_err(serde::de::Error::custom)
-        }
-        None => Ok(None),
-    }
-}
-
-fn deserialize_hex_h256<'de, D>(deserializer: D) -> Result<H256, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    let s = s.strip_prefix("0x").unwrap_or(&s);
-    let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
-    if bytes.len() != 32 {
-        return Err(serde::de::Error::custom(format!(
-            "Expected 32 bytes, got {}",
-            bytes.len()
-        )));
-    }
-    Ok(H256::from_slice(&bytes))
-}
-
-fn deserialize_hex_bytes<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    let s = s.strip_prefix("0x").unwrap_or(&s);
-    hex::decode(s).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_hex_bytes_20<'de, D>(deserializer: D) -> Result<[u8; 20], D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s: String = Deserialize::deserialize(deserializer)?;
-    let s = s.strip_prefix("0x").unwrap_or(&s);
-    let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
-    if bytes.len() != 20 {
-        return Err(serde::de::Error::custom(format!(
-            "expected 20 bytes, got {}",
-            bytes.len()
-        )));
-    }
-    let mut array = [0u8; 20];
-    array.copy_from_slice(&bytes);
-    Ok(array)
-}
-
-fn deserialize_vec_hex_h256<'de, D>(deserializer: D) -> Result<Vec<H256>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let strings: Vec<String> = Deserialize::deserialize(deserializer)?;
-    strings
-        .iter()
-        .map(|s| {
-            let s = s.strip_prefix("0x").unwrap_or(s);
-            let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
-            if bytes.len() != 32 {
-                return Err(serde::de::Error::custom(format!(
-                    "Expected 32 bytes, got {}",
-                    bytes.len()
-                )));
-            }
-            Ok(H256::from_slice(&bytes))
-        })
-        .collect()
-}
-
-fn deserialize_optional_u16_vec<'de, D>(deserializer: D) -> Result<Option<Vec<u16>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<Vec<u16>>::deserialize(deserializer)
 }

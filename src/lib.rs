@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod block_header;
 pub mod light_client;
+pub mod merge_mining;
 pub mod rlp;
 #[cfg(test)]
 pub(crate) mod tests;
