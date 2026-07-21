@@ -57,7 +57,11 @@ pub fn fetch_headers(
     while remaining > 0 {
         let batch = remaining.min(max_per_request);
         let client = pick_client(clients, idx);
-        debug!(start = current, count = batch, "fetching BTC headers from Electrum");
+        debug!(
+            start = current,
+            count = batch,
+            "fetching BTC headers from Electrum"
+        );
         let res: GetHeadersRes = client
             .block_headers(current as usize, batch as usize)
             .map_err(|e| NodeError::Electrum(e.to_string()))?;
@@ -67,7 +71,11 @@ pub fn fetch_headers(
         }
 
         let fetched = res.headers.len() as u64;
-        debug!(fetched = fetched, remaining = remaining, "Electrum batch result");
+        debug!(
+            fetched = fetched,
+            remaining = remaining,
+            "Electrum batch result"
+        );
         if fetched == 0 {
             break;
         }

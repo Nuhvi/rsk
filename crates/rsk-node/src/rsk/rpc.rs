@@ -178,8 +178,12 @@ impl RskRpc {
     }
 
     async fn post(&self, body: &serde_json::Value) -> Result<JsonRpcResponse<String>, NodeError> {
-        debug!(method = body.get("method").and_then(|v| v.as_str()).unwrap_or("?"), "RSK RPC request");
-        let resp = self.client
+        debug!(
+            method = body.get("method").and_then(|v| v.as_str()).unwrap_or("?"),
+            "RSK RPC request"
+        );
+        let resp = self
+            .client
             .post(&self.url)
             .json(body)
             .send()
@@ -196,7 +200,8 @@ impl RskRpc {
         batch: &[serde_json::Value],
     ) -> Result<Vec<T>, NodeError> {
         debug!(count = batch.len(), "RSK RPC batch request");
-        let resp = self.client
+        let resp = self
+            .client
             .post(&self.url)
             .json(batch)
             .send()

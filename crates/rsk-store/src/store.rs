@@ -105,7 +105,10 @@ impl Store {
     }
 
     /// Append validated Bitcoin headers. Returns the number of headers stored.
-    pub fn btc_append_headers(&self, headers: &[(u64, BitcoinHeader)]) -> Result<usize, StoreError> {
+    pub fn btc_append_headers(
+        &self,
+        headers: &[(u64, BitcoinHeader)],
+    ) -> Result<usize, StoreError> {
         if headers.is_empty() {
             return Ok(0);
         }
@@ -360,5 +363,50 @@ impl Store {
             }
         }
         Ok(result)
+    }
+
+    /// Delete RSK headers and merge-mining data below the given height (exclusive).
+    pub fn rsk_prune_below_height(&self, below: u64) -> Result<u64, StoreError> {
+        if below == 0 {
+            return Ok(0);
+        }
+
+        let txn = self.db.begin_write()?;
+        let mut pruned = 0u64;
+
+        {
+            let mut headers = txn.open_table(RSK_HEADERS)?;
+            let mut mm = txn.open_table(RSK_MERGE_MINING)?;
+
+            // redb tables are ordered by key, so iterate from 0 up
+            let keys: Vec<u64> = {
+                let mut cursor = headers.iter()?;
+                let mut keys = Vec::new();
+                while let Some(entry) = cursor.next() {
+                    let (key, _) = entry.map_err(StoreError::Storage)?;
+                    let h: u64 = key.value();
+                    if h < below {
+                        keys.push(h);
+                    } else {
+                        break;
+                    }
+                }
+                keys
+            };
+
+            for h in keys {
+                headers.remove(h)?;
+                mm.remove(h)?;
+                pruned += 1;
+            }
+        }
+
+        {
+            let mut meta = txn.open_table(RSK_META)?;
+            meta.insert("lowest_validated_height", below.to_be_bytes().as_slice())?;
+        }
+
+        txn.commit()?;
+        Ok(pruned)
     }
 }

@@ -2,9 +2,7 @@ pub mod error;
 pub mod store;
 
 pub use error::StoreError;
-pub use store::{
-    MergeMiningData, Store, decode_rsk_header, header_work,
-};
+pub use store::{MergeMiningData, Store, decode_rsk_header, header_work};
 
 /// Tracks the cumulative work of the last N Bitcoin blocks.
 pub struct DifficultyTracker {
@@ -48,11 +46,7 @@ impl DifficultyTracker {
     }
 
     /// Rebuild from stored headers starting at `tip_height`.
-    pub fn rebuild_from_chain(
-        &mut self,
-        store: &Store,
-        tip_height: u64,
-    ) -> Result<(), StoreError> {
+    pub fn rebuild_from_chain(&mut self, store: &Store, tip_height: u64) -> Result<(), StoreError> {
         self.ring_buffer.clear();
         self.cumulative = primitive_types::U256::zero();
 

@@ -42,4 +42,8 @@ pub struct NodeConfig {
     /// Batch size for header fetching
     #[arg(long, default_value_t = 100)]
     pub sync_batch_size: usize,
+
+    /// Polling interval in seconds for new blocks
+    #[arg(long, default_value_t = 30)]
+    pub poll_interval_secs: u64,
 }
