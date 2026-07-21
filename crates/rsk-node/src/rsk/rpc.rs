@@ -5,6 +5,8 @@ use serde::Deserialize;
 
 use crate::error::NodeError;
 
+use tracing::debug;
+
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
@@ -176,13 +178,15 @@ impl RskRpc {
     }
 
     async fn post(&self, body: &serde_json::Value) -> Result<JsonRpcResponse<String>, NodeError> {
-        self.client
+        debug!(method = body.get("method").and_then(|v| v.as_str()).unwrap_or("?"), "RSK RPC request");
+        let resp = self.client
             .post(&self.url)
             .json(body)
             .send()
             .await
-            .map_err(|e| NodeError::RskRpc(format!("HTTP: {e}")))?
-            .json()
+            .map_err(|e| NodeError::RskRpc(format!("HTTP: {e}")))?;
+        debug!(status = %resp.status(), "RSK RPC response");
+        resp.json()
             .await
             .map_err(|e| NodeError::RskRpc(format!("JSON: {e}")))
     }
@@ -191,13 +195,15 @@ impl RskRpc {
         &self,
         batch: &[serde_json::Value],
     ) -> Result<Vec<T>, NodeError> {
-        self.client
+        debug!(count = batch.len(), "RSK RPC batch request");
+        let resp = self.client
             .post(&self.url)
             .json(batch)
             .send()
             .await
-            .map_err(|e| NodeError::RskRpc(format!("HTTP: {e}")))?
-            .json()
+            .map_err(|e| NodeError::RskRpc(format!("HTTP: {e}")))?;
+        debug!(status = %resp.status(), "RSK RPC batch response");
+        resp.json()
             .await
             .map_err(|e| NodeError::RskRpc(format!("JSON: {e}")))
     }

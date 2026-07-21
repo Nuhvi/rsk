@@ -2,6 +2,13 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+const DEFAULT_ELECTRUM_SERVERS: &[&str] = &[
+    "ssl://blockstream.info:993",
+    "ssl://electrum.blockstream.info:993",
+];
+
+const DEFAULT_RSK_RPC_URL: &str = "https://public-node.rsk.co";
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "rsk-node",
@@ -13,11 +20,11 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
 
     /// Electrum server URLs (can specify multiple)
-    #[arg(long = "electrum", num_args = 1..)]
+    #[arg(long = "electrum", num_args = 1.., default_values_t = DEFAULT_ELECTRUM_SERVERS.iter().map(|s| s.to_string()).collect::<Vec<_>>())]
     pub electrum_servers: Vec<String>,
 
     /// RSK JSON-RPC endpoint
-    #[arg(long)]
+    #[arg(long, default_value = DEFAULT_RSK_RPC_URL)]
     pub rsk_rpc_url: String,
 
     /// Bitcoin checkpoint block height (skip syncing before this)

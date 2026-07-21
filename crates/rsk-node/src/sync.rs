@@ -1,18 +1,27 @@
-use bitcoin::block::Header as BitcoinHeader;
-use electrum_client::{ElectrumApi, GetHeadersRes};
-use tracing::{info, warn};
+use std::time::Duration;
 
-use crate::bitcoin::difficulty::DifficultyTracker;
-use crate::bitcoin::storage::{BitcoinHeaderStorage, header_work};
+use bitcoin::block::Header as BitcoinHeader;
+use electrum_client::{Client as ElectrumClient, ConfigBuilder, ElectrumApi, GetHeadersRes};
+use tracing::{debug, info, warn};
+
+use rsk_store::{DifficultyTracker, Store, header_work};
+
 use crate::error::NodeError;
 
+const ELECTRUM_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Connect to Electrum servers. Returns connected clients.
-pub fn connect_electrum(urls: &[String]) -> Result<Vec<electrum_client::Client>, NodeError> {
+pub fn connect_electrum(urls: &[String]) -> Result<Vec<ElectrumClient>, NodeError> {
     let mut clients = Vec::new();
     for url in urls {
-        match electrum_client::Client::new(url) {
+        debug!(url = %url, "attempting Electrum connection");
+        let config = ConfigBuilder::new()
+            .timeout(Some(ELECTRUM_TIMEOUT))
+            .retry(2)
+            .build();
+        match ElectrumClient::from_config(url, config) {
             Ok(c) => {
-                info!(url = %url, "connected to Electrum");
+                info!(url = %url, timeout_secs = ELECTRUM_TIMEOUT.as_secs(), "connected to Electrum");
                 clients.push(c);
             }
             Err(e) => warn!(url = %url, error = %e, "failed to connect"),
@@ -48,6 +57,7 @@ pub fn fetch_headers(
     while remaining > 0 {
         let batch = remaining.min(max_per_request);
         let client = pick_client(clients, idx);
+        debug!(start = current, count = batch, "fetching BTC headers from Electrum");
         let res: GetHeadersRes = client
             .block_headers(current as usize, batch as usize)
             .map_err(|e| NodeError::Electrum(e.to_string()))?;
@@ -57,6 +67,7 @@ pub fn fetch_headers(
         }
 
         let fetched = res.headers.len() as u64;
+        debug!(fetched = fetched, remaining = remaining, "Electrum batch result");
         if fetched == 0 {
             break;
         }
@@ -73,21 +84,23 @@ pub fn get_tip_height(
     idx: &mut usize,
 ) -> Result<u64, NodeError> {
     let client = pick_client(clients, idx);
+    debug!("subscribing to Electrum tip");
     let header = client
         .block_headers_subscribe()
         .map_err(|e| NodeError::Electrum(e.to_string()))?;
+    debug!(height = header.height, "Electrum tip received");
     Ok(header.height as u64)
 }
 
 /// Sync Bitcoin headers from Electrum into storage (incremental).
 pub fn sync_bitcoin_headers(
-    storage: &BitcoinHeaderStorage,
+    store: &Store,
     clients: &[electrum_client::Client],
     idx: &mut usize,
     difficulty_tracker: &mut DifficultyTracker,
     checkpoint_height: u64,
 ) -> Result<u64, NodeError> {
-    let start_height = match storage.get_tip_height()? {
+    let start_height = match store.btc_get_tip_height()? {
         Some(tip) => {
             if tip >= checkpoint_height {
                 tip + 1
@@ -107,15 +120,15 @@ pub fn sync_bitcoin_headers(
 
     if start_height > tip_height {
         info!("already synced to tip {tip_height}");
-        if let Some(tip) = storage.get_tip_height()? {
-            difficulty_tracker.rebuild_from_chain(storage, tip)?;
+        if let Some(tip) = store.btc_get_tip_height()? {
+            difficulty_tracker.rebuild_from_chain(store, tip)?;
         }
         return Ok(tip_height);
     }
 
     // Rebuild difficulty tracker from what we have
-    if let Some(tip) = storage.get_tip_height()? {
-        difficulty_tracker.rebuild_from_chain(storage, tip)?;
+    if let Some(tip) = store.btc_get_tip_height()? {
+        difficulty_tracker.rebuild_from_chain(store, tip)?;
     }
 
     let batch_size = 2016u64;
@@ -135,7 +148,7 @@ pub fn sync_bitcoin_headers(
 
             // Validate chain continuity
             if height > checkpoint_height {
-                if let Some(prev) = storage.get_header_at_height(height - 1)? {
+                if let Some(prev) = store.btc_get_header_at_height(height - 1)? {
                     if header.prev_blockhash != prev.block_hash() {
                         return Err(NodeError::Validation(format!(
                             "Bitcoin header at {height}: prev_blockhash mismatch"
@@ -154,7 +167,7 @@ pub fn sync_bitcoin_headers(
             validated.push((height, *header));
         }
 
-        let stored = storage.append_headers(&validated)?;
+        let stored = store.btc_append_headers(&validated)?;
         current += stored as u64;
 
         let pct = ((current - start_height) as f64 / (tip_height + 1 - start_height) as f64 * 100.0)

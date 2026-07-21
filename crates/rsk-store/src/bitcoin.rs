@@ -6,7 +6,7 @@ use bitcoin::hashes::Hash as _;
 use primitive_types::U256;
 use redb::{Database, ReadableTable, TableDefinition};
 
-use crate::error::NodeError;
+use crate::error::StoreError;
 
 const HEADERS: TableDefinition<u64, &[u8]> = TableDefinition::new("headers");
 const HASH_TO_HEIGHT: TableDefinition<&[u8], u64> = TableDefinition::new("hash_to_height");
@@ -17,7 +17,7 @@ pub struct BitcoinHeaderStorage {
 }
 
 impl BitcoinHeaderStorage {
-    pub fn open(path: &Path) -> Result<Self, NodeError> {
+    pub fn open(path: &Path) -> Result<Self, StoreError> {
         let db = Database::create(path)?;
         let txn = db.begin_write()?;
         txn.open_table(HEADERS)?;
@@ -27,7 +27,7 @@ impl BitcoinHeaderStorage {
         Ok(Self { db })
     }
 
-    pub fn get_tip_height(&self) -> Result<Option<u64>, NodeError> {
+    pub fn get_tip_height(&self) -> Result<Option<u64>, StoreError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(META)?;
         Ok(table.get("tip_height")?.map(|v| {
@@ -36,7 +36,7 @@ impl BitcoinHeaderStorage {
         }))
     }
 
-    pub fn get_tip_hash(&self) -> Result<Option<[u8; 32]>, NodeError> {
+    pub fn get_tip_hash(&self) -> Result<Option<[u8; 32]>, StoreError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(META)?;
         Ok(table.get("tip_hash")?.map(|v| {
@@ -47,7 +47,7 @@ impl BitcoinHeaderStorage {
         }))
     }
 
-    pub fn get_header_at_height(&self, height: u64) -> Result<Option<BitcoinHeader>, NodeError> {
+    pub fn get_header_at_height(&self, height: u64) -> Result<Option<BitcoinHeader>, StoreError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(HEADERS)?;
         Ok(table.get(height)?.map(|v| {
@@ -57,14 +57,14 @@ impl BitcoinHeaderStorage {
         }))
     }
 
-    pub fn header_exists_on_canonical_chain(&self, hash: &[u8; 32]) -> Result<bool, NodeError> {
+    pub fn header_exists_on_canonical_chain(&self, hash: &[u8; 32]) -> Result<bool, StoreError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(HASH_TO_HEIGHT)?;
         Ok(table.get(hash.as_slice())?.is_some())
     }
 
     /// Append validated headers. Returns the number of headers stored.
-    pub fn append_headers(&self, headers: &[(u64, BitcoinHeader)]) -> Result<usize, NodeError> {
+    pub fn append_headers(&self, headers: &[(u64, BitcoinHeader)]) -> Result<usize, StoreError> {
         if headers.is_empty() {
             return Ok(0);
         }
@@ -109,7 +109,7 @@ impl BitcoinHeaderStorage {
     }
 
     /// Truncate chain to height (inclusive). Used for reorgs.
-    pub fn truncate_to_height(&self, height: u64) -> Result<(), NodeError> {
+    pub fn truncate_to_height(&self, height: u64) -> Result<(), StoreError> {
         let current_height = {
             let txn = self.db.begin_read()?;
             let meta = txn.open_table(META)?;
@@ -118,7 +118,7 @@ impl BitcoinHeaderStorage {
         };
 
         let current_height =
-            current_height.ok_or_else(|| NodeError::Sync("no chain to truncate".into()))?;
+            current_height.ok_or_else(|| StoreError::Internal("no chain to truncate".into()))?;
 
         if height >= current_height {
             return Ok(());
@@ -170,7 +170,7 @@ impl BitcoinHeaderStorage {
         &self,
         height: u64,
         expected_hash: &[u8; 32],
-    ) -> Result<bool, NodeError> {
+    ) -> Result<bool, StoreError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(HEADERS)?;
         match table.get(height)? {

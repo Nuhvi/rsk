@@ -9,13 +9,29 @@ RSK One syncs and stores Bitcoin and Rootstock headers to disk on startup so alg
 ```
 crates/
   rsk/        — Rust SDK library (block validation, merge-mining verification, light client logic)
-  rsk-node/   — Binary crate (header sync, persistence, future API)
+  rsk-store/  — Persistent storage for Bitcoin and RSK headers (redb). Shared between node and client.
+  rsk-node/   — Binary crate (header sync orchestration, Electrum + RSK RPC)
 ```
 
-## What It Does
+### `rsk-store` (library, usable by both node and client)
 
-1. **Bitcoin headers** — Connects to Electrum servers, fetches Bitcoin headers from a checkpoint (default block 900,000), and persists them to a redb database. Maintains a sliding-window cumulative difficulty tracker.
-2. **RSK headers** — Walks backwards from the RSK tip, fetches block headers and merge-mining data from an RSK JSON-RPC endpoint, and stores everything to a second redb database. Accumulates RSK difficulty until it meets or exceeds the Bitcoin window work.
+| Type | Description |
+|---|---|
+| `BitcoinHeaderStorage` | redb persistence for Bitcoin block headers |
+| `RskHeaderStorage` | redb persistence for RSK headers + merge-mining data |
+| `DifficultyTracker` | Sliding-window cumulative Bitcoin work tracker |
+| `MergeMiningData` | Merge-mining proof components (hex strings) |
+| `header_work()` | Compute work from a Bitcoin header's nBits target |
+| `decode_rsk_header()` | Decode an RSK header from raw RLP bytes |
+| `StoreError` | Error type for storage operations |
+
+The client can use `get_tip_height()` and header range queries to tell the node which blocks it already has, so the node only sends what's missing.
+
+### `rsk-node` (binary)
+
+Phase 1: Connects to Electrum servers, syncs Bitcoin headers from a checkpoint (default block 900,000), validates PoW and chain continuity.
+
+Phase 2: Walks backwards from the RSK tip, fetches block headers and merge-mining data from an RSK JSON-RPC endpoint, accumulates RSK difficulty until it meets or exceeds the Bitcoin window work.
 
 Both phases skip already-stored data on restart.
 
@@ -33,7 +49,7 @@ cargo run -p rsk-node -- \
 
 | Flag | Default | Description |
 |---|---|---|
-| `--data-dir` | `data` | Directory for `btc_headers.redb` and `rsk_headers.redb` |
+| `--data-dir` | `data` | Directory for `store.redb` |
 | `--electrum` | *(required)* | Electrum server URL(s), repeatable |
 | `--rsk-rpc-url` | *(required)* | RSK JSON-RPC endpoint |
 | `--btc-checkpoint-height` | `900000` | Skip Bitcoin headers before this block |
@@ -44,3 +60,7 @@ cargo run -p rsk-node -- \
 ## Status
 
 Persistence-only first commit. No HTTP API, no merge-mining verification in the sync path yet, no Bitcoin reorg handling.
+
+## Acknowledgment
+
+This implementation was bootstrapped by copying the great work at `check-fork` for the [Union bridge client](https://github.com/rsksmart/union-bridge-client).
