@@ -1,0 +1,29 @@
+[package]
+name = "rsk-node"
+version = "0.1.0"
+edition = "2024"
+description = "RSK One — long-living node for Rootstock light client sync"
+
+[[bin]]
+name = "rsk-node"
+path = "src/main.rs"
+
+[dependencies]
+rsk = { path = "../rsk" }
+electrum-client = { version = "0.25", default-features = false, features = ["use-rustls"] }
+redb = "2"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls"] }
+hex = "0.4"
+primitive-types = { version = "0.13.1", features = ["std", "serde"] }
+bitcoin = { version = "0.32", features = ["serde"] }
+
+[lints.clippy]
+unwrap_used = "deny"

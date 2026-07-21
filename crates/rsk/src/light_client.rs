@@ -100,14 +100,14 @@ pub struct SyncResult {
 ///
 /// `Work = 2^256 / (target + 1)` — the expected number of hashes needed
 /// to find a block at this difficulty.
-fn bitcoin_header_work(header: &BitcoinHeader) -> U256 {
+pub fn bitcoin_header_work(header: &BitcoinHeader) -> U256 {
     let work = header.target().to_work();
     let le_bytes = work.to_le_bytes();
     U256::from_little_endian(&le_bytes)
 }
 
 /// Parse an 80-byte Bitcoin header from hex.
-fn parse_btc_header_hex(hex_str: &str) -> Result<BitcoinHeader, Box<dyn std::error::Error>> {
+pub fn parse_btc_header_hex(hex_str: &str) -> Result<BitcoinHeader, Box<dyn std::error::Error>> {
     let hex = hex_str.strip_prefix("0x").unwrap_or(hex_str);
     let bytes = hex::decode(hex)?;
     if bytes.len() != 80 {

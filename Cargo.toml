@@ -1,17 +1,3 @@
-[package]
-name = "rsk"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-primitive-types = { version = "0.13.1", features = ["std", "serde"] }
-sha3 = "0.10.8"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1"
-alloy-rlp = "0.3.15"
-bitcoin = { version = "0.32", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "http2", "rustls-tls"] }
-hex = "0.4"
-
-[dev-dependencies]
-chrono = "0.4.44"
+[workspace]
+resolver = "2"
+members = ["crates/rsk", "crates/rsk-node"]
