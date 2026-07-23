@@ -8,7 +8,7 @@ pub fn encode_coin_value(value: &U256) -> Vec<u8> {
 }
 
 #[must_use]
-pub fn encode_signed_coin_value(value: &U256) -> Vec<u8> {
+fn encode_signed_coin_value(value: &U256) -> Vec<u8> {
     // RLP integers are big-endian: 0 -> 0x80, 0x00–0x7f encode as-is,
     // and if the MSB≥0x80 we prefix 0x00 to keep the value positive
     // before adding the length prefix.

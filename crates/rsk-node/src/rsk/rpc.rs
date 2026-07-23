@@ -10,6 +10,7 @@ use tracing::debug;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct JsonRpcResponse<T> {
     result: Option<T>,
     error: Option<JsonRpcError>,

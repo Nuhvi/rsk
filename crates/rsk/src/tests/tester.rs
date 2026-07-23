@@ -2,8 +2,8 @@
 
 #![forbid(unsafe_code)]
 
-use crate::RskBlock;
 use crate::block_header::RskBlockHeader;
+use crate::fork_check::RskBlock;
 use bitcoin::consensus::Decodable;
 use primitive_types::{H256, U256};
 use serde::{Deserialize, Deserializer, Serialize};

@@ -17,7 +17,4 @@ pub enum NodeError {
 
     #[error("merge-mining proof failed: {0}")]
     MergeMining(#[from] rsk::merge_mining::MergeMiningError),
-
-    #[error("sync error: {0}")]
-    Sync(String),
 }

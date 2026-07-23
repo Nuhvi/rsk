@@ -17,9 +17,6 @@ pub enum StoreError {
     #[error("commit error: {0}")]
     Commit(#[from] redb::CommitError),
 
-    #[error("decode error: {0}")]
-    Decode(String),
-
     #[error("validation failed: {0}")]
     Validation(String),
 

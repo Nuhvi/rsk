@@ -266,7 +266,7 @@ impl RskBlockHeader {
     }
 }
 
-pub fn encode_list(rlp_list: Vec<Vec<u8>>) -> Vec<u8> {
+pub(crate) fn encode_list(rlp_list: Vec<Vec<u8>>) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
     let payload_length: usize = rlp_list.iter().map(Vec::len).sum();
     alloy_rlp::Header {

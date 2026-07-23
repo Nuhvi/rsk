@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tester::TesterRskBlockHeader;
 
 use crate::block_header::{RskBlockHeader, encode_list};
-use crate::{CheckForkArgs, RskBlock, check_fork};
+use crate::fork_check::{CheckForkArgs, RskBlock, check_fork};
 
 const DEFAULT_DIFFICULTY: u128 = 5_904_436_352_267_687_415_636;
 const DEFAULT_TIMESTAMP: u64 = 1000;

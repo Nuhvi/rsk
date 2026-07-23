@@ -11,8 +11,30 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::NodeConfig;
-use crate::rsk::rpc::RskRpc;
+use crate::rsk::rpc::{RskBlockWithMergeMining, RskRpc};
 use rsk_store::{DifficultyTracker, MergeMiningData, Store, decode_rsk_header};
+
+fn build_merge_map<'a>(
+    blocks: &'a [RskBlockWithMergeMining],
+) -> std::collections::HashMap<u64, &'a RskBlockWithMergeMining> {
+    blocks
+        .iter()
+        .map(|b| {
+            let num = u64::from_str_radix(b.number.strip_prefix("0x").unwrap_or(&b.number), 16)
+                .expect("invalid block number");
+            (num, b)
+        })
+        .collect()
+}
+
+fn extract_merge_mining(block: &RskBlockWithMergeMining) -> Option<MergeMiningData> {
+    Some(MergeMiningData {
+        bitcoin_header_hex: block.bitcoin_header.as_ref()?.clone(),
+        compressed_coinbase_hex: block.compressed_coinbase.as_ref()?.clone(),
+        merkle_proof_hex: block.merkle_proof.as_ref()?.clone(),
+        hash_for_merged_mining_hex: block.hash_for_merged_mining.as_ref()?.clone(),
+    })
+}
 
 fn main() -> anyhow::Result<()> {
     let config = NodeConfig::parse();
@@ -162,34 +184,14 @@ async fn sync_rsk_initial(
             .await?;
         debug!(fetched = merge_blocks.len(), "got merge-mining data");
 
-        let merge_map: std::collections::HashMap<u64, &rsk::rpc::RskBlockWithMergeMining> =
-            merge_blocks
-                .iter()
-                .map(|b| {
-                    let num =
-                        u64::from_str_radix(b.number.strip_prefix("0x").unwrap_or(&b.number), 16)
-                            .expect("invalid block number");
-                    (num, b)
-                })
-                .collect();
+        let merge_map = build_merge_map(&merge_blocks);
 
         for (num, raw) in &raw_headers {
             let header = decode_rsk_header(raw)
                 .map_err(|e| error::NodeError::Validation(format!("block {num}: {e}")))?;
 
             if let Some(merge_block) = merge_map.get(num) {
-                if let (Some(btc_hex), Some(coinbase_hex), Some(proof_hex), Some(hfm_hex)) = (
-                    &merge_block.bitcoin_header,
-                    &merge_block.compressed_coinbase,
-                    &merge_block.merkle_proof,
-                    &merge_block.hash_for_merged_mining,
-                ) {
-                    let mm_data = MergeMiningData {
-                        bitcoin_header_hex: btc_hex.clone(),
-                        compressed_coinbase_hex: coinbase_hex.clone(),
-                        merkle_proof_hex: proof_hex.clone(),
-                        hash_for_merged_mining_hex: hfm_hex.clone(),
-                    };
+                if let Some(mm_data) = extract_merge_mining(merge_block) {
                     store.rsk_store_header(*num, raw, &mm_data)?;
                 }
             }
@@ -262,31 +264,12 @@ async fn sync_rsk_forward(
     let raw_headers = rsk_rpc.get_raw_block_headers_batch(&numbers).await?;
     let merge_blocks = rsk_rpc.get_blocks_with_merge_mining_batch(&numbers).await?;
 
-    let merge_map: std::collections::HashMap<u64, &rsk::rpc::RskBlockWithMergeMining> =
-        merge_blocks
-            .iter()
-            .map(|b| {
-                let num = u64::from_str_radix(b.number.strip_prefix("0x").unwrap_or(&b.number), 16)
-                    .expect("invalid block number");
-                (num, b)
-            })
-            .collect();
+    let merge_map = build_merge_map(&merge_blocks);
 
     let mut stored = 0u64;
     for (num, raw) in &raw_headers {
         if let Some(merge_block) = merge_map.get(num) {
-            if let (Some(btc_hex), Some(coinbase_hex), Some(proof_hex), Some(hfm_hex)) = (
-                &merge_block.bitcoin_header,
-                &merge_block.compressed_coinbase,
-                &merge_block.merkle_proof,
-                &merge_block.hash_for_merged_mining,
-            ) {
-                let mm_data = MergeMiningData {
-                    bitcoin_header_hex: btc_hex.clone(),
-                    compressed_coinbase_hex: coinbase_hex.clone(),
-                    merkle_proof_hex: proof_hex.clone(),
-                    hash_for_merged_mining_hex: hfm_hex.clone(),
-                };
+            if let Some(mm_data) = extract_merge_mining(merge_block) {
                 store.rsk_store_header(*num, raw, &mm_data)?;
                 stored += 1;
             }

@@ -104,9 +104,6 @@ impl RskBlockHeader {
 mod tests {
     use super::*;
     use crate::block_header::tests::RAW_BLOCK_HEADER_8329127;
-    use bitcoin::BlockHash;
-    use bitcoin::hashes::Hash;
-    use primitive_types::U256;
 
     // ── helpers ───────────────────────────────────────────────────────────────
 

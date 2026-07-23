@@ -4,7 +4,7 @@
 //!
 //! 1. Check timestamp is not too far in the future.
 
-use crate::{RskBlockHeader, block_header::validator::ValidationError};
+use crate::block_header::{RskBlockHeader, validator::ValidationError};
 
 pub const DEFAULT_MAX_TIMESTAMPS_DIFF_IN_SECS: u64 = 5 * 60;
 
