@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/rsk", "crates/rsk-store", "crates/rsk-node", "crates/rsk-p2p"]
+members = ["crates/rsk", "crates/rsk-store", "crates/rsk-node"]
