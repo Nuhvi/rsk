@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -44,6 +44,9 @@ const BITCOIN_COINBASE_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new
 const RSK_BLOCK_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rsk_block");
 // rootstock uncles: height -> repeated [8-byte BE uncle height][32-byte mm hash]
 const RSK_UNCLES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rsk_uncles");
+// rootstock headers kept since the latest FINAL block, WITHOUT merge-mining
+// proofs: height -> [32 hash][32 parent hash][32 state root][8-byte BE timestamp]
+const RSK_HEADER_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rsk_header");
 
 // Reorg safety margins: never persist data this close to the tip.
 const BITCOIN_FINAL_DEPTH: u64 = 2;
@@ -103,6 +106,7 @@ fn main() -> Result<()> {
     let mut uncle_scan_depth: u64 = 6;
     let mut pause_ms: u64 = 150;
     let mut database_path = "tag-check.redb".to_string();
+    let mut keep_headers = true;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -117,6 +121,7 @@ fn main() -> Result<()> {
             }
             "--pause-ms" => pause_ms = args.next().context("--pause-ms needs a value")?.parse()?,
             "--db" | "--cache" => database_path = args.next().context("--db needs a value")?,
+            "--no-headers" => keep_headers = false,
             other => bail!("unknown argument: {other}"),
         }
     }
@@ -138,6 +143,7 @@ fn main() -> Result<()> {
         transaction.open_table(BITCOIN_COINBASE_TABLE)?;
         transaction.open_table(RSK_BLOCK_TABLE)?;
         transaction.open_table(RSK_UNCLES_TABLE)?;
+        transaction.open_table(RSK_HEADER_TABLE)?;
         transaction.commit()?;
     }
 
@@ -196,6 +202,11 @@ fn main() -> Result<()> {
     let mut neutral_count: u64 = 0;
     let mut bitcoin_from_cache: u64 = 0;
     let mut bitcoin_fetched: u64 = 0;
+    // Bitcoin block hashes of the scan window in internal little-endian byte
+    // order, as they appear in the prevHash field of a bitcoin header. Used
+    // for the checkpoint freshness rule.
+    let mut window_bitcoin_hashes: std::collections::HashSet<[u8; 32]> =
+        std::collections::HashSet::new();
     for height in scan_start..=bitcoin_tip {
         let (hash_bytes, tag_bytes): (Vec<u8>, Option<[u8; 32]>) =
             if let Some(stored) = database_read(&database, BITCOIN_COINBASE_TABLE, height)? {
@@ -230,6 +241,15 @@ fn main() -> Result<()> {
                 std::thread::sleep(Duration::from_millis(pause_ms));
                 (hash_bytes, tag)
             };
+        {
+            // Esplora hex is display (big-endian) order; prevHash fields are
+            // little-endian, so store reversed.
+            let mut little_endian = [0u8; 32];
+            for (i, byte) in hash_bytes.iter().rev().enumerate() {
+                little_endian[i] = *byte;
+            }
+            window_bitcoin_hashes.insert(little_endian);
+        }
         match tag_bytes {
             Some(raw) => {
                 let mut hash_prefix = [0u8; 20];
@@ -489,6 +509,58 @@ fn main() -> Result<()> {
         "subjective SAFE block  : {safe_block} (tip - {})",
         rsk_tip.saturating_sub(safe_block)
     );
+
+    // ---- FINAL checkpoint, header retention, pruning ------------------------
+    // Operational version of the Ephemeral Sidechains rule: the checkpoint
+    // block is the earliest RSK block whose merge-mined bitcoin header has a
+    // prevHash inside the scanned bitcoin window (proving it was mined after
+    // the window started). If the window's acceptance rule (S > H) passed,
+    // that checkpoint is FINAL: keep all RSK headers (without merge-mining
+    // proofs) from it to the tip, and delete everything older.
+    if keep_headers {
+        println!();
+        println!("---------------- FINAL + headers ----------------");
+        if supporting_count <= hiding_count {
+            println!("acceptance rule failed; FINAL not advanced, nothing pruned");
+        } else {
+            let final_block = find_checkpoint_block(
+                &client,
+                &rsk_rpc,
+                &mut rsk,
+                &window_bitcoin_hashes,
+                deepest_allowed_fork_root.max(1),
+                rsk_tip,
+            )?;
+            match final_block {
+                None => println!("no checkpoint block found in range; nothing pruned"),
+                Some(final_block) => {
+                    println!(
+                        "FINAL block            : {final_block} (tip - {})",
+                        rsk_tip.saturating_sub(final_block)
+                    );
+                    let (stored, fetched, link_breaks) =
+                        sync_headers(&client, &rsk_rpc, &database, final_block, rsk_tip, pause_ms)?;
+                    println!(
+                        "headers since FINAL    : {stored} stored ({fetched} fetched this run)"
+                    );
+                    if link_breaks > 0 {
+                        println!(
+                            "WARNING: {link_breaks} parent-hash link break(s) in stored headers \
+                             (possible reorg; delete affected heights and re-run)"
+                        );
+                    } else {
+                        println!("header chain verified  : parent links OK");
+                    }
+                    let pruned_headers = prune_below(&database, RSK_HEADER_TABLE, final_block)?;
+                    let pruned_blocks = prune_below(&database, RSK_BLOCK_TABLE, final_block)?;
+                    let pruned_uncles = prune_below(&database, RSK_UNCLES_TABLE, final_block)?;
+                    println!(
+                        "pruned below FINAL     : {pruned_headers} headers, {pruned_blocks} block records, {pruned_uncles} uncle lists"
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -900,6 +972,252 @@ fn fork_root_interval(tag: &Tag, matched: usize, deepest_allowed_root: u64) -> (
         )
     };
     (lower.max(deepest_allowed_root), upper)
+}
+
+// ---------------------------------------------------------------------------
+// FINAL checkpoint + header retention
+
+// Is this RSK block provably mined after the bitcoin window started? True
+// when its merge-mined bitcoin header's prevHash (bytes 4..36, little endian)
+// is one of the window's bitcoin blocks.
+fn is_fresh(
+    client: &reqwest::blocking::Client,
+    rpc: &str,
+    rsk: &mut RskCache,
+    window: &std::collections::HashSet<[u8; 32]>,
+    height: u64,
+) -> Result<bool> {
+    Ok(rsk
+        .get_block(client, rpc, height)?
+        .and_then(|block| block.bitcoin_header.as_ref())
+        .and_then(|header| header.get(4..36))
+        .map(|prev_hash| {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(prev_hash);
+            window.contains(&key)
+        })
+        .unwrap_or(false))
+}
+
+// Earliest RSK block whose merge-mined bitcoin parent is inside the window.
+// Bitcoin parent references advance almost monotonically with RSK height, so
+// binary search finds the boundary, then a bounded backward walk absorbs the
+// non-monotonic fuzz (miners briefly building on stale bitcoin tips).
+fn find_checkpoint_block(
+    client: &reqwest::blocking::Client,
+    rpc: &str,
+    rsk: &mut RskCache,
+    window: &std::collections::HashSet<[u8; 32]>,
+    mut low: u64,
+    mut high: u64,
+) -> Result<Option<u64>> {
+    if !is_fresh(client, rpc, rsk, window, high)? {
+        return Ok(None);
+    }
+    if is_fresh(client, rpc, rsk, window, low)? {
+        return Ok(Some(low));
+    }
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if is_fresh(client, rpc, rsk, window, middle)? {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    // Backward refinement: accept earlier fresh blocks within a short gap.
+    let mut checkpoint = high;
+    let mut probe = high;
+    let mut gap = 0u64;
+    while probe > 1 && gap < 32 {
+        probe -= 1;
+        if is_fresh(client, rpc, rsk, window, probe)? {
+            checkpoint = probe;
+            gap = 0;
+        } else {
+            gap += 1;
+        }
+    }
+    Ok(Some(checkpoint))
+}
+
+// Header record: [32 hash][32 parent hash][32 state root][8-byte BE timestamp]
+fn encode_header(value: &Value) -> Option<Vec<u8>> {
+    let field = |name: &str| -> Option<Vec<u8>> {
+        let bytes = hex::decode(value.get(name)?.as_str()?.trim_start_matches("0x")).ok()?;
+        (bytes.len() == 32).then_some(bytes)
+    };
+    let mut out = Vec::with_capacity(104);
+    out.extend_from_slice(&field("hash")?);
+    out.extend_from_slice(&field("parentHash")?);
+    out.extend_from_slice(&field("stateRoot")?);
+    let timestamp = value
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .and_then(|s| hex_to_u64(s).ok())?;
+    out.extend_from_slice(&timestamp.to_be_bytes());
+    Some(out)
+}
+
+// Download any missing headers in [final_block, rsk_tip], persist those that
+// are reorg-final (height <= tip - RSK_FINAL_DEPTH), and verify parent-hash
+// links over the stored range. Returns (stored, fetched, link breaks).
+fn sync_headers(
+    client: &reqwest::blocking::Client,
+    rpc: &str,
+    database: &Database,
+    final_block: u64,
+    rsk_tip: u64,
+    pause_ms: u64,
+) -> Result<(u64, u64, u64)> {
+    let persist_up_to = rsk_tip.saturating_sub(RSK_FINAL_DEPTH);
+    let mut missing: Vec<u64> = Vec::new();
+    {
+        let transaction = database.begin_read()?;
+        let table = transaction.open_table(RSK_HEADER_TABLE)?;
+        let mut present = std::collections::HashSet::new();
+        for entry in table.range(final_block..=persist_up_to)? {
+            present.insert(entry?.0.value());
+        }
+        for height in final_block..=persist_up_to {
+            if !present.contains(&height) {
+                missing.push(height);
+            }
+        }
+    }
+    let total_missing = missing.len();
+    let mut fetched = 0u64;
+    const BATCH: usize = 25;
+    for (batch_index, chunk) in missing.chunks(BATCH).enumerate() {
+        let requests: Vec<(u64, &str, Value)> = chunk
+            .iter()
+            .map(|height| {
+                (
+                    *height,
+                    "eth_getBlockByNumber",
+                    json!([to_hex(*height), false]),
+                )
+            })
+            .collect();
+        let results = rsk_batch_call(client, rpc, &requests)?;
+        for height in chunk {
+            let Some(block) = results.get(height) else {
+                continue;
+            };
+            if block.is_null() {
+                continue;
+            }
+            let Some(record) = encode_header(block) else {
+                bail!("block {height} response missing header fields");
+            };
+            database_write(database, RSK_HEADER_TABLE, *height, &record)?;
+            fetched += 1;
+        }
+        if batch_index % 20 == 0 {
+            eprintln!(
+                "  headers: {} / {} fetched",
+                (batch_index * BATCH + chunk.len()).min(total_missing),
+                total_missing
+            );
+        }
+        std::thread::sleep(Duration::from_millis(pause_ms));
+    }
+
+    // Verify parent links and count stored headers.
+    let mut stored = 0u64;
+    let mut link_breaks = 0u64;
+    {
+        let transaction = database.begin_read()?;
+        let table = transaction.open_table(RSK_HEADER_TABLE)?;
+        let mut previous_hash: Option<[u8; 32]> = None;
+        let mut previous_height: Option<u64> = None;
+        for entry in table.range(final_block..=persist_up_to)? {
+            let (key, value) = entry?;
+            let height = key.value();
+            let bytes = value.value();
+            if bytes.len() < 64 {
+                link_breaks += 1;
+                continue;
+            }
+            if let (Some(previous_hash), Some(previous_height)) = (previous_hash, previous_height) {
+                if previous_height + 1 == height && bytes[32..64] != previous_hash {
+                    link_breaks += 1;
+                }
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&bytes[0..32]);
+            previous_hash = Some(hash);
+            previous_height = Some(height);
+            stored += 1;
+        }
+    }
+    Ok((stored, fetched, link_breaks))
+}
+
+// Delete all entries with key < cutoff. Returns how many were removed.
+fn prune_below(
+    database: &Database,
+    table_definition: TableDefinition<'static, u64, &'static [u8]>,
+    cutoff: u64,
+) -> Result<u64> {
+    let keys: Vec<u64> = {
+        let transaction = database.begin_read()?;
+        let table = transaction.open_table(table_definition)?;
+        let mut keys = Vec::new();
+        for entry in table.range(..cutoff)? {
+            keys.push(entry?.0.value());
+        }
+        keys
+    };
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    let transaction = database.begin_write()?;
+    {
+        let mut table = transaction.open_table(table_definition)?;
+        for key in &keys {
+            table.remove(key)?;
+        }
+    }
+    transaction.commit()?;
+    Ok(keys.len() as u64)
+}
+
+// JSON-RPC batch: one POST carrying many requests, results keyed by id.
+fn rsk_batch_call(
+    client: &reqwest::blocking::Client,
+    rpc: &str,
+    requests: &[(u64, &str, Value)],
+) -> Result<HashMap<u64, Value>> {
+    let body = Value::Array(
+        requests
+            .iter()
+            .map(|(id, method, params)| {
+                json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+            })
+            .collect(),
+    );
+    let mut last_error: Option<anyhow::Error> = None;
+    for attempt in 0..4 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(500 * (1 << attempt)));
+        }
+        match client.post(rpc).json(&body).send() {
+            Ok(response) if response.status().is_success() => {
+                let parsed: Value = response.json()?;
+                let mut out = HashMap::new();
+                for item in parsed.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                    if let Some(id) = item.get("id").and_then(|v| v.as_u64()) {
+                        out.insert(id, item.get("result").cloned().unwrap_or(Value::Null));
+                    }
+                }
+                return Ok(out);
+            }
+            Ok(response) => last_error = Some(anyhow!("batch call: HTTP {}", response.status())),
+            Err(error) => last_error = Some(error.into()),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("batch call failed")))
 }
 
 // ---------------------------------------------------------------------------
