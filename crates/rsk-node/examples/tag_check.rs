@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, TableDefinition};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -47,6 +47,9 @@ const RSK_UNCLES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rsk_
 // rootstock headers kept since the latest FINAL block, WITHOUT merge-mining
 // proofs: height -> [32 hash][32 parent hash][32 state root][8-byte BE timestamp]
 const RSK_HEADER_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("rsk_header");
+// bitcoin coinbase + SPV proof, servable to syncing peers:
+// height -> [u32 LE coinbase length][coinbase raw][merkleblock proof raw]
+const BITCOIN_PROOF_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("btc_proof");
 
 // Reorg safety margins: never persist data this close to the tip.
 const BITCOIN_FINAL_DEPTH: u64 = 2;
@@ -81,6 +84,16 @@ const SAFETY_MARGIN: usize = 2;
 // to allege a root deeper than this, which is what defuses free fake tags
 // with garbage CPV bytes.
 const MAX_REORG_DEPTH: u64 = 40320;
+//
+// MAX_TIMESTAMP_SKEW_SECONDS: every RSK block's timestamp must lie within
+// this bound of the timestamp of the bitcoin block referenced by its
+// merge-mining header's prevHash. Combined with the freshness rule this
+// binds each block's claimed time to its real mining time: prevHash
+// unpredictability proves "mined after", timestamp consistency prevents
+// claiming any other time (backdated or forward-dated forks, and timestamp
+// games against difficulty). 6h is generous against honest bitcoin
+// timestamp drift (~2h future rule, MTP skew, long inter-block gaps).
+const MAX_TIMESTAMP_SKEW_SECONDS: u64 = 6 * 3600;
 
 #[derive(Debug, Clone)]
 struct Tag {
@@ -91,7 +104,11 @@ struct Tag {
     block_number: u64,
     bitcoin_height: u64,
     bitcoin_hash: String,
+    // difficulty of the bitcoin block's period; 1.0 in fixed-window test mode
+    difficulty: f64,
 }
+
+// TODO: actually verify the incoming rootsotck block merge mining hash against the json header.
 
 #[derive(Debug)]
 enum Verdict {
@@ -102,7 +119,13 @@ enum Verdict {
 }
 
 fn main() -> Result<()> {
-    let mut blocks_to_scan: u64 = 2016;
+    // 0 = objective mode (default): the scan window is derived from the
+    // difficulty-period rule below. Non-zero = fixed window for testing.
+    let mut fixed_blocks: u64 = 0;
+    // Bitcoin's retarget interval. Consensus-fixed: every node MUST use 2016
+    // or checkpoints stop being objective. Overridable ONLY as a test
+    // harness (--test-period-len) to exercise the walk on tiny windows.
+    let mut period_length: u64 = 2016;
     let mut uncle_scan_depth: u64 = 6;
     let mut pause_ms: u64 = 150;
     let mut database_path = "tag-check.redb".to_string();
@@ -110,8 +133,12 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--blocks" => {
-                blocks_to_scan = args.next().context("--blocks needs a value")?.parse()?
+            "--blocks" => fixed_blocks = args.next().context("--blocks needs a value")?.parse()?,
+            "--test-period-len" => {
+                period_length = args
+                    .next()
+                    .context("--test-period-len needs a value")?
+                    .parse()?
             }
             "--uncle-depth" => {
                 uncle_scan_depth = args
@@ -126,8 +153,23 @@ fn main() -> Result<()> {
         }
     }
 
-    let esplora =
-        std::env::var("ESPLORA_URL").unwrap_or_else(|_| "https://blockstream.info/api".to_string());
+    if period_length != 2016 {
+        eprintln!("==========================================================");
+        eprintln!("WARNING: test period length {period_length} != 2016.");
+        eprintln!("Results are NOT objective and NOT comparable across nodes.");
+        eprintln!("Never use this outside of testing.");
+        eprintln!("==========================================================");
+    }
+
+    // Comma-separated list of API-compatible Esplora hosts. On rate limiting
+    // the tool rotates to the next host immediately and only backs off when
+    // every host in the pool is limited.
+    let esplora_hosts: Vec<String> = std::env::var("ESPLORA_URL")
+        .unwrap_or_else(|_| "https://blockstream.info/api,https://mempool.space/api".to_string())
+        .split(',')
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     let rsk_rpc =
         std::env::var("RSK_RPC_URL").unwrap_or_else(|_| "https://public-node.rsk.co".to_string());
 
@@ -135,6 +177,12 @@ fn main() -> Result<()> {
         .timeout(Duration::from_secs(30))
         .user_agent("rsk-tag-check/0.2")
         .build()?;
+    let esplora = Esplora {
+        client: client.clone(),
+        hosts: esplora_hosts,
+        current: std::cell::Cell::new(0),
+    };
+    eprintln!("esplora hosts: {}", esplora.hosts.join(", "));
 
     let database = Database::create(&database_path)?;
     {
@@ -144,146 +192,120 @@ fn main() -> Result<()> {
         transaction.open_table(RSK_BLOCK_TABLE)?;
         transaction.open_table(RSK_UNCLES_TABLE)?;
         transaction.open_table(RSK_HEADER_TABLE)?;
+        transaction.open_table(BITCOIN_PROOF_TABLE)?;
         transaction.commit()?;
     }
 
-    let bitcoin_tip: u64 = http_get(&client, &format!("{esplora}/blocks/tip/height"))?
+    let bitcoin_tip: u64 = esplora
+        .get("/blocks/tip/height")?
         .trim()
         .parse()
         .context("parsing bitcoin tip height")?;
-    let scan_start = bitcoin_tip.saturating_sub(blocks_to_scan - 1);
-    eprintln!(
-        "bitcoin tip = {bitcoin_tip}, scanning heights {scan_start}..={bitcoin_tip} ({blocks_to_scan} blocks)"
-    );
-
     let rsk_tip = hex_to_u64(
         rsk_call(&client, &rsk_rpc, "eth_blockNumber", json!([]))?
             .as_str()
             .context("eth_blockNumber returned no string")?,
     )?;
-    eprintln!("rootstock tip = {rsk_tip}");
+    eprintln!("bitcoin tip = {bitcoin_tip}, rootstock tip = {rsk_tip}");
 
-    // ---- pass 1: collect tags from bitcoin coinbases -----------------------
-    // Block hashes for heights missing from the database, 10 per request via
-    // the /blocks/{start_height} batch endpoint.
-    let mut block_hashes_by_height: HashMap<u64, String> = HashMap::new();
-    let mut cursor = bitcoin_tip;
-    loop {
-        let batch_needed = (0..10u64).any(|offset| {
-            let height = cursor.saturating_sub(offset);
-            height >= scan_start
-                && !matches!(
-                    database_read(&database, BITCOIN_COINBASE_TABLE, height),
-                    Ok(Some(_))
-                )
-        });
-        if batch_needed {
-            let body = http_get(&client, &format!("{esplora}/blocks/{cursor}"))?;
-            let parsed: Value = serde_json::from_str(&body).context("parsing /blocks batch")?;
-            for block in parsed.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
-                if let (Some(height), Some(id)) = (
-                    block.get("height").and_then(|x| x.as_u64()),
-                    block.get("id").and_then(|x| x.as_str()),
-                ) {
-                    if height >= scan_start {
-                        block_hashes_by_height.insert(height, id.to_string());
-                    }
-                }
+    // ---- pass 1: determine the scan window and collect tags ----------------
+    //
+    // Objective mode (default), following the Ephemeral Sidechains rule:
+    // walk backwards period by period (difficulty periods of `period_length`
+    // bitcoin blocks). The tail is accepted once the difficulty-weighted
+    // tagged work observed in it exceeds the ENTIRE difficulty of the next
+    // older period (period_length * D). The lower the merge-mining
+    // participation, the more coinbases must be explored. The first period
+    // that the tail outweighs is the Checkpoint Period; it is scanned too
+    // (its tags join the audit and its start anchors the freshness rule).
+    let mut scan = ScanState::default();
+    let mut difficulty_by_period: HashMap<u64, f64> = HashMap::new();
+    let scan_start;
+    if fixed_blocks > 0 {
+        scan_start = bitcoin_tip.saturating_sub(fixed_blocks - 1);
+        eprintln!("fixed window: scanning {scan_start}..={bitcoin_tip} ({fixed_blocks} blocks)");
+        scan_bitcoin_range(
+            &esplora,
+            &database,
+            &mut scan,
+            scan_start,
+            bitcoin_tip,
+            bitcoin_tip,
+            pause_ms,
+            1.0,
+        )?;
+    } else {
+        // Step 1 (headers only, no coinbase downloads): walk back period by
+        // period accumulating the bitcoin tail's HEADER work until it exceeds
+        // the entire work of the next older period. Difficulty is read per
+        // period, so this costs two API calls per period and nothing else.
+        const MAX_PERIODS_BACK: u64 = 20;
+        let mut tail_start = (bitcoin_tip / period_length) * period_length;
+        let mut target_work = {
+            let difficulty =
+                period_difficulty(&esplora, tail_start, &mut difficulty_by_period, pause_ms)?;
+            (bitcoin_tip - tail_start + 1) as f64 * difficulty
+        };
+        let mut walked = 0u64;
+        loop {
+            if walked >= MAX_PERIODS_BACK || tail_start < period_length {
+                bail!("no acceptable bitcoin tail within {MAX_PERIODS_BACK} periods");
             }
-            std::thread::sleep(Duration::from_millis(pause_ms));
+            let previous_start = tail_start - period_length;
+            let d_previous = period_difficulty(
+                &esplora,
+                previous_start,
+                &mut difficulty_by_period,
+                pause_ms,
+            )?;
+            let full_previous_work = period_length as f64 * d_previous;
+            if target_work > full_previous_work {
+                break;
+            }
+            target_work += full_previous_work;
+            tail_start = previous_start;
+            walked += 1;
         }
-        if cursor.saturating_sub(9) <= scan_start {
-            break;
-        }
-        cursor -= 10;
+        eprintln!(
+            "bitcoin tail {tail_start}..={bitcoin_tip} ({} blocks), header work target {target_work:.4e}",
+            bitcoin_tip - tail_start + 1
+        );
+        // Step 2: download coinbases backwards from the tip until the
+        // difficulty-weighted TAGGED work matches the tail's header work.
+        // Participation self-adjusts the depth: at p participation the tag
+        // tail spans ~(tail blocks)/p bitcoin blocks.
+        scan_start = scan_tags_until_target(
+            &esplora,
+            &database,
+            &mut scan,
+            bitcoin_tip,
+            target_work,
+            &mut difficulty_by_period,
+            period_length,
+            pause_ms,
+        )?;
+        eprintln!(
+            "tag tail {scan_start}..={bitcoin_tip} ({} blocks) reached the target",
+            bitcoin_tip - scan_start + 1
+        );
     }
-
-    let mut tags: Vec<Tag> = Vec::new();
-    let mut neutral_count: u64 = 0;
-    let mut bitcoin_from_cache: u64 = 0;
-    let mut bitcoin_fetched: u64 = 0;
-    // Bitcoin block hashes of the scan window in internal little-endian byte
-    // order, as they appear in the prevHash field of a bitcoin header. Used
-    // for the checkpoint freshness rule.
-    let mut window_bitcoin_hashes: std::collections::HashSet<[u8; 32]> =
-        std::collections::HashSet::new();
-    for height in scan_start..=bitcoin_tip {
-        let (hash_bytes, tag_bytes): (Vec<u8>, Option<[u8; 32]>) =
-            if let Some(stored) = database_read(&database, BITCOIN_COINBASE_TABLE, height)? {
-                bitcoin_from_cache += 1;
-                decode_bitcoin_record(&stored)
-                    .with_context(|| format!("corrupt bitcoin record at {height}"))?
-            } else {
-                let hash = block_hashes_by_height
-                    .get(&height)
-                    .cloned()
-                    .with_context(|| format!("no block hash for height {height}"))?;
-                let coinbase_txid = http_get(&client, &format!("{esplora}/block/{hash}/txid/0"))?
-                    .trim()
-                    .to_string();
-                let coinbase_hex = http_get(&client, &format!("{esplora}/tx/{coinbase_txid}/hex"))?
-                    .trim()
-                    .to_string();
-                let coinbase_raw = hex::decode(&coinbase_hex).context("decoding coinbase hex")?;
-                let tag = extract_tag(&coinbase_raw);
-                let hash_bytes = hex::decode(&hash).context("decoding block hash hex")?;
-                if hash_bytes.len() != 32 {
-                    bail!("unexpected block hash length for height {height}");
-                }
-                if height + BITCOIN_FINAL_DEPTH <= bitcoin_tip {
-                    let mut record = hash_bytes.clone();
-                    if let Some(tag) = &tag {
-                        record.extend_from_slice(tag);
-                    }
-                    database_write(&database, BITCOIN_COINBASE_TABLE, height, &record)?;
-                }
-                bitcoin_fetched += 1;
-                std::thread::sleep(Duration::from_millis(pause_ms));
-                (hash_bytes, tag)
-            };
-        {
-            // Esplora hex is display (big-endian) order; prevHash fields are
-            // little-endian, so store reversed.
-            let mut little_endian = [0u8; 32];
-            for (i, byte) in hash_bytes.iter().rev().enumerate() {
-                little_endian[i] = *byte;
-            }
-            window_bitcoin_hashes.insert(little_endian);
-        }
-        match tag_bytes {
-            Some(raw) => {
-                let mut hash_prefix = [0u8; 20];
-                hash_prefix.copy_from_slice(&raw[0..20]);
-                let mut cpv = [0u8; 7];
-                cpv.copy_from_slice(&raw[20..27]);
-                let block_number = u32::from_be_bytes([raw[28], raw[29], raw[30], raw[31]]) as u64;
-                tags.push(Tag {
-                    tag_bytes: raw,
-                    hash_prefix,
-                    cpv,
-                    recent_uncles: raw[27],
-                    block_number,
-                    bitcoin_height: height,
-                    bitcoin_hash: hex::encode(&hash_bytes),
-                });
-            }
-            None => neutral_count += 1,
-        }
-        if (height - scan_start) % 100 == 0 {
-            eprintln!(
-                "  scanned {} / {} btc blocks, {} tags so far",
-                height - scan_start + 1,
-                blocks_to_scan,
-                tags.len()
-            );
-        }
-    }
+    let blocks_scanned = bitcoin_tip - scan_start + 1;
+    let ScanState {
+        tags,
+        neutral_count,
+        from_cache: bitcoin_from_cache,
+        fetched: bitcoin_fetched,
+        proofs_stored,
+        window_bitcoin,
+    } = scan;
     eprintln!(
-        "pass 1 done: {} tagged, {} untagged (neutral); {} from cache, {} fetched",
+        "pass 1 done: window {scan_start}..={bitcoin_tip} ({blocks_scanned} blocks), \
+         {} tagged, {} untagged; {} from cache, {} fetched, {} proofs stored",
         tags.len(),
         neutral_count,
         bitcoin_from_cache,
-        bitcoin_fetched
+        bitcoin_fetched,
+        proofs_stored
     );
 
     // ---- pass 2: match tags against rootstock blocks + uncles --------------
@@ -368,10 +390,22 @@ fn main() -> Result<()> {
     let tagged_count = tags.len() as u64;
     let supporting_count = supporting_canonical + supporting_uncle;
     let hiding_count = hiding_tags.len() as u64;
+    // Difficulty-weighted observed work on each side.
+    let supporting_work: f64 = verdicts
+        .iter()
+        .filter(|(_, verdict)| {
+            matches!(
+                verdict,
+                Verdict::SupportingCanonical | Verdict::SupportingUncle { .. }
+            )
+        })
+        .map(|(tag, _)| tag.difficulty)
+        .sum();
+    let hiding_work: f64 = hiding_tags.iter().map(|(tag, _)| tag.difficulty).sum();
 
     println!();
     println!("================ RSK tag audit ================");
-    println!("bitcoin blocks scanned : {blocks_to_scan}");
+    println!("bitcoin blocks scanned : {blocks_scanned} ({scan_start}..={bitcoin_tip})");
     println!("tagged coinbases (n)   : {tagged_count}");
     println!("untagged (neutral)     : {neutral_count}");
     println!(
@@ -393,9 +427,10 @@ fn main() -> Result<()> {
                 100.0 * hiding_count as f64 / tagged_count as f64
             );
         }
+        println!("weighted work          : S {supporting_work:.4e} vs H {hiding_work:.4e}");
         println!(
             "acceptance rule S > H  : {}",
-            if supporting_count > hiding_count {
+            if supporting_work > hiding_work {
                 "PASS"
             } else {
                 "FAIL"
@@ -485,19 +520,25 @@ fn main() -> Result<()> {
             deepest_fork_root = deepest_fork_root
                 .min(fork_root_interval(tag, matched, deepest_allowed_fork_root).0);
         }
-        let hiding_work = hiding_tags.len();
-        let supporting_above_root = supporting_heights
+        let supporting_work_above_root: f64 = verdicts
             .iter()
-            .filter(|height| **height > deepest_fork_root)
-            .count();
+            .filter(|(tag, verdict)| {
+                matches!(
+                    verdict,
+                    Verdict::SupportingCanonical | Verdict::SupportingUncle { .. }
+                ) && tag.block_number > deepest_fork_root
+            })
+            .map(|(tag, _)| tag.difficulty)
+            .sum();
         println!(
-            "unresolved evidence: {hiding_work} tag(s), deepest possible fork root {deepest_fork_root} (tip - {})",
+            "unresolved evidence: {} tag(s), deepest possible fork root {deepest_fork_root} (tip - {})",
+            hiding_tags.len(),
             rsk_tip.saturating_sub(deepest_fork_root)
         );
         println!(
-            "work race above root: S {supporting_above_root} vs H {hiding_work} (need S > {SAFETY_MARGIN}*H)"
+            "work race above root: S {supporting_work_above_root:.4e} vs H {hiding_work:.4e} (need S > {SAFETY_MARGIN}*H)"
         );
-        if supporting_above_root > SAFETY_MARGIN * hiding_work {
+        if supporting_work_above_root > SAFETY_MARGIN as f64 * hiding_work {
             println!("hypothetical fork is losing on the bitcoin record; no retreat");
             confirmation_ceiling
         } else {
@@ -527,7 +568,7 @@ fn main() -> Result<()> {
                 &client,
                 &rsk_rpc,
                 &mut rsk,
-                &window_bitcoin_hashes,
+                &window_bitcoin,
                 deepest_allowed_fork_root.max(1),
                 rsk_tip,
             )?;
@@ -538,8 +579,17 @@ fn main() -> Result<()> {
                         "FINAL block            : {final_block} (tip - {})",
                         rsk_tip.saturating_sub(final_block)
                     );
+                    let report = sync_headers(
+                        &client,
+                        &rsk_rpc,
+                        &database,
+                        final_block,
+                        rsk_tip,
+                        pause_ms,
+                        &window_bitcoin,
+                    )?;
                     let (stored, fetched, link_breaks) =
-                        sync_headers(&client, &rsk_rpc, &database, final_block, rsk_tip, pause_ms)?;
+                        (report.stored, report.fetched, report.link_breaks);
                     println!(
                         "headers since FINAL    : {stored} stored ({fetched} fetched this run)"
                     );
@@ -551,17 +601,375 @@ fn main() -> Result<()> {
                     } else {
                         println!("header chain verified  : parent links OK");
                     }
+                    if report.timestamp_violations > 0 || report.order_violations > 0 {
+                        println!(
+                            "WARNING: timestamp check: {} skew violation(s) (> {}h), {} bitcoin-parent order violation(s)",
+                            report.timestamp_violations,
+                            MAX_TIMESTAMP_SKEW_SECONDS / 3600,
+                            report.order_violations
+                        );
+                    } else if report.fetched > 0 {
+                        println!(
+                            "timestamp check        : {} fetched headers within {}h of their bitcoin parents ({} unresolved refs)",
+                            report.fetched,
+                            MAX_TIMESTAMP_SKEW_SECONDS / 3600,
+                            report.unresolved_parents
+                        );
+                    }
                     let pruned_headers = prune_below(&database, RSK_HEADER_TABLE, final_block)?;
                     let pruned_blocks = prune_below(&database, RSK_BLOCK_TABLE, final_block)?;
                     let pruned_uncles = prune_below(&database, RSK_UNCLES_TABLE, final_block)?;
+                    // The window slid forward with FINAL: coinbases and SPV
+                    // proofs below the current window are no longer needed to
+                    // reproduce the checkpoint decision, so drop them too.
+                    let pruned_coinbases =
+                        prune_below(&database, BITCOIN_COINBASE_TABLE, scan_start)?;
+                    let pruned_proofs = prune_below(&database, BITCOIN_PROOF_TABLE, scan_start)?;
                     println!(
                         "pruned below FINAL     : {pruned_headers} headers, {pruned_blocks} block records, {pruned_uncles} uncle lists"
+                    );
+                    println!(
+                        "pruned bitcoin < window: {pruned_coinbases} coinbases, {pruned_proofs} proofs"
                     );
                 }
             }
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Bitcoin scanning
+
+#[derive(Default)]
+struct ScanState {
+    tags: Vec<Tag>,
+    neutral_count: u64,
+    from_cache: u64,
+    fetched: u64,
+    proofs_stored: u64,
+    // Window bitcoin blocks keyed by hash in internal little-endian order
+    // (prevHash field order) -> (height, timestamp; 0 = unknown from a
+    // legacy cache record). Used by the freshness rule and the RSK-vs-
+    // bitcoin timestamp consistency check.
+    window_bitcoin: HashMap<[u8; 32], (u64, u32)>,
+}
+
+// Scan one contiguous bitcoin height range, filling ScanState. Returns the
+// difficulty-weighted tagged work added by this range.
+fn scan_bitcoin_range(
+    esplora: &Esplora,
+    database: &Database,
+    scan: &mut ScanState,
+    start: u64,
+    end: u64,
+    bitcoin_tip: u64,
+    pause_ms: u64,
+    difficulty: f64,
+) -> Result<f64> {
+    // Prefetch hashes + timestamps for heights missing from the database,
+    // 10 per request.
+    let mut hints_by_height: HashMap<u64, (String, u32)> = HashMap::new();
+    let mut cursor = end;
+    loop {
+        let batch_needed = (0..10u64).any(|offset| {
+            let height = cursor.saturating_sub(offset);
+            height >= start
+                && height <= end
+                && !matches!(
+                    database_read(database, BITCOIN_COINBASE_TABLE, height),
+                    Ok(Some(_))
+                )
+        });
+        if batch_needed {
+            let body = esplora.get(&format!("/blocks/{cursor}"))?;
+            let parsed: Value = serde_json::from_str(&body).context("parsing /blocks batch")?;
+            for block in parsed.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                if let (Some(height), Some(id)) = (
+                    block.get("height").and_then(|x| x.as_u64()),
+                    block.get("id").and_then(|x| x.as_str()),
+                ) {
+                    let timestamp =
+                        block.get("timestamp").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    if height >= start {
+                        hints_by_height.insert(height, (id.to_string(), timestamp));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(pause_ms));
+        }
+        if cursor.saturating_sub(9) <= start {
+            break;
+        }
+        cursor -= 10;
+    }
+
+    let mut added_tag_work = 0.0f64;
+    for height in start..=end {
+        let (hash_hex, timestamp, tag_bytes) = ensure_bitcoin_block(
+            esplora,
+            database,
+            scan,
+            height,
+            hints_by_height.get(&height),
+            bitcoin_tip,
+            pause_ms,
+        )?;
+        {
+            let hash_bytes = hex::decode(&hash_hex).context("decoding block hash hex")?;
+            let mut little_endian = [0u8; 32];
+            for (i, byte) in hash_bytes.iter().rev().enumerate() {
+                little_endian[i] = *byte;
+            }
+            scan.window_bitcoin
+                .insert(little_endian, (height, timestamp.unwrap_or(0)));
+        }
+        match tag_bytes {
+            Some(raw) => {
+                let mut hash_prefix = [0u8; 20];
+                hash_prefix.copy_from_slice(&raw[0..20]);
+                let mut cpv = [0u8; 7];
+                cpv.copy_from_slice(&raw[20..27]);
+                let block_number = u32::from_be_bytes([raw[28], raw[29], raw[30], raw[31]]) as u64;
+                scan.tags.push(Tag {
+                    tag_bytes: raw,
+                    hash_prefix,
+                    cpv,
+                    recent_uncles: raw[27],
+                    block_number,
+                    bitcoin_height: height,
+                    bitcoin_hash: hash_hex,
+                    difficulty,
+                });
+                added_tag_work += difficulty;
+            }
+            None => scan.neutral_count += 1,
+        }
+        if (height - start) % 100 == 0 {
+            eprintln!(
+                "  scanned {} / {} btc blocks in range, {} tags total",
+                height - start + 1,
+                end - start + 1,
+                scan.tags.len()
+            );
+        }
+    }
+    Ok(added_tag_work)
+}
+
+// Make sure the coinbase record AND the servable SPV proof for this height
+// exist in the database (when reorg-final), fetching whatever is missing.
+// Returns (block hash hex, block timestamp if known, tag bytes if any).
+#[allow(clippy::too_many_arguments)]
+fn ensure_bitcoin_block(
+    esplora: &Esplora,
+    database: &Database,
+    scan: &mut ScanState,
+    height: u64,
+    hint: Option<&(String, u32)>,
+    bitcoin_tip: u64,
+    pause_ms: u64,
+) -> Result<(String, Option<u32>, Option<[u8; 32]>)> {
+    let persistable = height + BITCOIN_FINAL_DEPTH <= bitcoin_tip;
+    let cached = database_read(database, BITCOIN_COINBASE_TABLE, height)?;
+    let have_proof = database_read(database, BITCOIN_PROOF_TABLE, height)?.is_some();
+
+    if let Some(stored) = &cached {
+        let (hash_bytes, timestamp, tag) = decode_bitcoin_record(stored)
+            .with_context(|| format!("corrupt bitcoin record at {height}"))?;
+        if have_proof || !persistable {
+            scan.from_cache += 1;
+            return Ok((hex::encode(hash_bytes), timestamp, tag));
+        }
+    }
+
+    // Something is missing: fetch coinbase (and proof) from the network.
+    let (hash_hex, mut timestamp): (String, Option<u32>) = if let Some(stored) = &cached {
+        let (hash_bytes, timestamp, _) = decode_bitcoin_record(stored)?;
+        (hex::encode(hash_bytes), timestamp)
+    } else if let Some((hash, timestamp)) = hint {
+        (hash.clone(), (*timestamp != 0).then_some(*timestamp))
+    } else {
+        let hash = esplora
+            .get(&format!("/block-height/{height}"))?
+            .trim()
+            .to_string();
+        (hash, None)
+    };
+    if timestamp.is_none() {
+        let body = esplora.get(&format!("/block/{hash_hex}"))?;
+        let parsed: Value = serde_json::from_str(&body).context("parsing block json")?;
+        timestamp = parsed
+            .get("timestamp")
+            .and_then(|v| v.as_u64())
+            .map(|t| t as u32);
+    }
+    let coinbase_txid = esplora
+        .get(&format!("/block/{hash_hex}/txid/0"))?
+        .trim()
+        .to_string();
+    let coinbase_hex = esplora
+        .get(&format!("/tx/{coinbase_txid}/hex"))?
+        .trim()
+        .to_string();
+    let coinbase_raw = hex::decode(&coinbase_hex).context("decoding coinbase hex")?;
+    let tag = extract_tag(&coinbase_raw);
+
+    if persistable {
+        if cached.is_none() {
+            let hash_bytes = hex::decode(&hash_hex).context("decoding block hash hex")?;
+            if hash_bytes.len() != 32 {
+                bail!("unexpected block hash length for height {height}");
+            }
+            let mut record = hash_bytes;
+            record.extend_from_slice(&timestamp.unwrap_or(0).to_be_bytes());
+            if let Some(tag) = &tag {
+                record.extend_from_slice(tag);
+            }
+            database_write(database, BITCOIN_COINBASE_TABLE, height, &record)?;
+        }
+        if !have_proof {
+            let proof_hex = esplora
+                .get(&format!("/tx/{coinbase_txid}/merkleblock-proof"))?
+                .trim()
+                .to_string();
+            let proof_raw = hex::decode(&proof_hex).context("decoding merkleblock proof")?;
+            let mut record = Vec::with_capacity(4 + coinbase_raw.len() + proof_raw.len());
+            record.extend_from_slice(&(coinbase_raw.len() as u32).to_le_bytes());
+            record.extend_from_slice(&coinbase_raw);
+            record.extend_from_slice(&proof_raw);
+            database_write(database, BITCOIN_PROOF_TABLE, height, &record)?;
+            scan.proofs_stored += 1;
+        }
+    }
+    scan.fetched += 1;
+    std::thread::sleep(Duration::from_millis(pause_ms));
+    Ok((hash_hex, timestamp, tag))
+}
+
+// Step 2 of the objective window: walk backwards from the tip downloading
+// coinbases until the difficulty-weighted tagged work reaches the header
+// work target of the bitcoin tail. Returns the first (lowest) height of the
+// tag tail.
+fn scan_tags_until_target(
+    esplora: &Esplora,
+    database: &Database,
+    scan: &mut ScanState,
+    bitcoin_tip: u64,
+    target_work: f64,
+    difficulty_by_period: &mut HashMap<u64, f64>,
+    period_length: u64,
+    pause_ms: u64,
+) -> Result<u64> {
+    // If participation collapsed, refuse to walk back forever.
+    let hard_floor = bitcoin_tip.saturating_sub(8 * period_length);
+    let mut tagged_work = 0.0f64;
+    let mut hints_by_height: HashMap<u64, (String, u32)> = HashMap::new();
+    let mut height = bitcoin_tip;
+    loop {
+        // Batch-prefetch summaries (hash + timestamp) for this height and the
+        // 9 below it, but only when something in that span is missing.
+        if !hints_by_height.contains_key(&height)
+            && database_read(database, BITCOIN_COINBASE_TABLE, height)?.is_none()
+        {
+            let body = esplora.get(&format!("/blocks/{height}"))?;
+            let parsed: Value = serde_json::from_str(&body).context("parsing /blocks batch")?;
+            for block in parsed.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                if let (Some(entry_height), Some(id)) = (
+                    block.get("height").and_then(|x| x.as_u64()),
+                    block.get("id").and_then(|x| x.as_str()),
+                ) {
+                    let timestamp =
+                        block.get("timestamp").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    hints_by_height.insert(entry_height, (id.to_string(), timestamp));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(pause_ms));
+        }
+        let period_start = (height / period_length) * period_length;
+        let difficulty = period_difficulty(esplora, period_start, difficulty_by_period, pause_ms)?;
+        let (hash_hex, timestamp, tag_bytes) = ensure_bitcoin_block(
+            esplora,
+            database,
+            scan,
+            height,
+            hints_by_height.get(&height),
+            bitcoin_tip,
+            pause_ms,
+        )?;
+        {
+            let hash_bytes = hex::decode(&hash_hex).context("decoding block hash hex")?;
+            let mut little_endian = [0u8; 32];
+            for (i, byte) in hash_bytes.iter().rev().enumerate() {
+                little_endian[i] = *byte;
+            }
+            scan.window_bitcoin
+                .insert(little_endian, (height, timestamp.unwrap_or(0)));
+        }
+        match tag_bytes {
+            Some(raw) => {
+                let mut hash_prefix = [0u8; 20];
+                hash_prefix.copy_from_slice(&raw[0..20]);
+                let mut cpv = [0u8; 7];
+                cpv.copy_from_slice(&raw[20..27]);
+                let block_number = u32::from_be_bytes([raw[28], raw[29], raw[30], raw[31]]) as u64;
+                scan.tags.push(Tag {
+                    tag_bytes: raw,
+                    hash_prefix,
+                    cpv,
+                    recent_uncles: raw[27],
+                    block_number,
+                    bitcoin_height: height,
+                    bitcoin_hash: hash_hex,
+                    difficulty,
+                });
+                tagged_work += difficulty;
+            }
+            None => scan.neutral_count += 1,
+        }
+        if (bitcoin_tip - height) % 100 == 0 {
+            eprintln!(
+                "  scanned {} btc blocks back, tagged work {tagged_work:.4e} / {target_work:.4e}",
+                bitcoin_tip - height + 1
+            );
+        }
+        if tagged_work >= target_work {
+            return Ok(height);
+        }
+        if height <= hard_floor {
+            bail!(
+                "tagged work {tagged_work:.4e} did not reach target {target_work:.4e} \
+                 within 8 periods; participation too low"
+            );
+        }
+        height -= 1;
+    }
+}
+
+// Difficulty of the period starting at the given height, read from that
+// period's first block and cached per run.
+fn period_difficulty(
+    esplora: &Esplora,
+    period_start: u64,
+    cache: &mut HashMap<u64, f64>,
+    pause_ms: u64,
+) -> Result<f64> {
+    if let Some(difficulty) = cache.get(&period_start) {
+        return Ok(*difficulty);
+    }
+    let hash = esplora
+        .get(&format!("/block-height/{period_start}"))?
+        .trim()
+        .to_string();
+    let body = esplora.get(&format!("/block/{hash}"))?;
+    let parsed: Value = serde_json::from_str(&body).context("parsing block json")?;
+    let difficulty = parsed
+        .get("difficulty")
+        .and_then(|v| v.as_f64())
+        .context("block json missing difficulty")?;
+    cache.insert(period_start, difficulty);
+    std::thread::sleep(Duration::from_millis(pause_ms));
+    Ok(difficulty)
 }
 
 // ---------------------------------------------------------------------------
@@ -613,14 +1021,23 @@ fn database_write(
     Ok(())
 }
 
-// bitcoin record: [32-byte hash][optional 32-byte tag]
-fn decode_bitcoin_record(bytes: &[u8]) -> Result<(Vec<u8>, Option<[u8; 32]>)> {
+// bitcoin record: [32-byte hash][4-byte BE timestamp][optional 32-byte tag].
+// Legacy records (32 or 64 bytes, no timestamp) are still readable; their
+// timestamp reads as unknown and the consistency check skips them.
+fn decode_bitcoin_record(bytes: &[u8]) -> Result<(Vec<u8>, Option<u32>, Option<[u8; 32]>)> {
+    let tag_at = |offset: usize| {
+        let mut tag = [0u8; 32];
+        tag.copy_from_slice(&bytes[offset..offset + 32]);
+        tag
+    };
     match bytes.len() {
-        32 => Ok((bytes.to_vec(), None)),
-        64 => {
-            let mut tag = [0u8; 32];
-            tag.copy_from_slice(&bytes[32..64]);
-            Ok((bytes[0..32].to_vec(), Some(tag)))
+        32 => Ok((bytes.to_vec(), None, None)),
+        64 => Ok((bytes[0..32].to_vec(), None, Some(tag_at(32)))),
+        36 | 68 => {
+            let timestamp = u32::from_be_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+            let timestamp = (timestamp != 0).then_some(timestamp);
+            let tag = (bytes.len() == 68).then(|| tag_at(36));
+            Ok((bytes[0..32].to_vec(), timestamp, tag))
         }
         length => bail!("bitcoin record has invalid length {length}"),
     }
@@ -984,7 +1401,7 @@ fn is_fresh(
     client: &reqwest::blocking::Client,
     rpc: &str,
     rsk: &mut RskCache,
-    window: &std::collections::HashSet<[u8; 32]>,
+    window: &HashMap<[u8; 32], (u64, u32)>,
     height: u64,
 ) -> Result<bool> {
     Ok(rsk
@@ -994,7 +1411,7 @@ fn is_fresh(
         .map(|prev_hash| {
             let mut key = [0u8; 32];
             key.copy_from_slice(prev_hash);
-            window.contains(&key)
+            window.contains_key(&key)
         })
         .unwrap_or(false))
 }
@@ -1007,7 +1424,7 @@ fn find_checkpoint_block(
     client: &reqwest::blocking::Client,
     rpc: &str,
     rsk: &mut RskCache,
-    window: &std::collections::HashSet<[u8; 32]>,
+    window: &HashMap<[u8; 32], (u64, u32)>,
     mut low: u64,
     mut high: u64,
 ) -> Result<Option<u64>> {
@@ -1059,9 +1476,25 @@ fn encode_header(value: &Value) -> Option<Vec<u8>> {
     Some(out)
 }
 
+struct HeaderSyncReport {
+    stored: u64,
+    fetched: u64,
+    link_breaks: u64,
+    // RSK timestamp more than MAX_TIMESTAMP_SKEW_SECONDS away from the
+    // timestamp of the bitcoin block its merge-mining header points to.
+    timestamp_violations: u64,
+    // Referenced bitcoin parent heights must be non-decreasing along the RSK
+    // chain (a decrease of 1 is tolerated for miners on briefly stale tips).
+    order_violations: u64,
+    // prevHash not found among the window's canonical bitcoin blocks
+    // (below-window or orphaned bitcoin parents; checked only when fetched).
+    unresolved_parents: u64,
+}
+
 // Download any missing headers in [final_block, rsk_tip], persist those that
-// are reorg-final (height <= tip - RSK_FINAL_DEPTH), and verify parent-hash
-// links over the stored range. Returns (stored, fetched, link breaks).
+// are reorg-final (height <= tip - RSK_FINAL_DEPTH), verify parent-hash
+// links over the stored range, and check RSK-vs-bitcoin timestamp
+// consistency on every header fetched this run.
 fn sync_headers(
     client: &reqwest::blocking::Client,
     rpc: &str,
@@ -1069,7 +1502,8 @@ fn sync_headers(
     final_block: u64,
     rsk_tip: u64,
     pause_ms: u64,
-) -> Result<(u64, u64, u64)> {
+    window: &HashMap<[u8; 32], (u64, u32)>,
+) -> Result<HeaderSyncReport> {
     let persist_up_to = rsk_tip.saturating_sub(RSK_FINAL_DEPTH);
     let mut missing: Vec<u64> = Vec::new();
     {
@@ -1087,6 +1521,10 @@ fn sync_headers(
     }
     let total_missing = missing.len();
     let mut fetched = 0u64;
+    let mut timestamp_violations = 0u64;
+    let mut order_violations = 0u64;
+    let mut unresolved_parents = 0u64;
+    let mut previous_bitcoin_parent: Option<(u64, u64)> = None; // (rsk height, btc height)
     const BATCH: usize = 25;
     for (batch_index, chunk) in missing.chunks(BATCH).enumerate() {
         let requests: Vec<(u64, &str, Value)> = chunk
@@ -1110,6 +1548,43 @@ fn sync_headers(
             let Some(record) = encode_header(block) else {
                 bail!("block {height} response missing header fields");
             };
+            // Timestamp + ordering consistency against the bitcoin parent
+            // referenced by this block's merge-mining header.
+            let bitcoin_parent = block
+                .get("bitcoinMergedMiningHeader")
+                .and_then(|v| v.as_str())
+                .and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
+                .and_then(|header| {
+                    header.get(4..36).map(|prev_hash| {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(prev_hash);
+                        key
+                    })
+                })
+                .and_then(|key| window.get(&key).copied());
+            match bitcoin_parent {
+                Some((bitcoin_height, bitcoin_timestamp)) => {
+                    if bitcoin_timestamp != 0 {
+                        let rsk_timestamp = block
+                            .get("timestamp")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| hex_to_u64(s).ok())
+                            .unwrap_or(0);
+                        if rsk_timestamp.abs_diff(bitcoin_timestamp as u64)
+                            > MAX_TIMESTAMP_SKEW_SECONDS
+                        {
+                            timestamp_violations += 1;
+                        }
+                    }
+                    if let Some((previous_rsk, previous_bitcoin)) = previous_bitcoin_parent {
+                        if previous_rsk < *height && bitcoin_height + 1 < previous_bitcoin {
+                            order_violations += 1;
+                        }
+                    }
+                    previous_bitcoin_parent = Some((*height, bitcoin_height));
+                }
+                None => unresolved_parents += 1,
+            }
             database_write(database, RSK_HEADER_TABLE, *height, &record)?;
             fetched += 1;
         }
@@ -1151,7 +1626,14 @@ fn sync_headers(
             stored += 1;
         }
     }
-    Ok((stored, fetched, link_breaks))
+    Ok(HeaderSyncReport {
+        stored,
+        fetched,
+        link_breaks,
+        timestamp_violations,
+        order_violations,
+        unresolved_parents,
+    })
 }
 
 // Delete all entries with key < cutoff. Returns how many were removed.
@@ -1223,36 +1705,57 @@ fn rsk_batch_call(
 // ---------------------------------------------------------------------------
 // network plumbing
 
-fn http_get(client: &reqwest::blocking::Client, url: &str) -> Result<String> {
-    let mut last_error: Option<anyhow::Error> = None;
-    for attempt in 0..8u32 {
-        match client.get(url).send() {
-            Ok(response) if response.status().is_success() => return Ok(response.text()?),
-            Ok(response) => {
-                let status = response.status();
-                let wait_seconds = if status.as_u16() == 429 {
-                    response
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or_else(|| (1u64 << attempt).min(60))
-                } else {
-                    (1u64 << attempt).min(30)
-                };
-                if wait_seconds > 2 {
-                    eprintln!("  HTTP {status}, backing off {wait_seconds}s ({url})");
+// Esplora client with host rotation: on any failure (rate limit, outage)
+// the next request goes to the next host; the tool only sleeps once every
+// host in the pool has failed in the current cycle. Retry-After is honored
+// when present.
+struct Esplora {
+    client: reqwest::blocking::Client,
+    hosts: Vec<String>,
+    current: std::cell::Cell<usize>,
+}
+
+impl Esplora {
+    fn get(&self, path: &str) -> Result<String> {
+        let host_count = self.hosts.len().max(1);
+        let total_attempts = host_count * 8;
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut retry_after_hint: u64 = 0;
+        for attempt in 0..total_attempts {
+            let host = &self.hosts[self.current.get() % host_count];
+            let url = format!("{host}{path}");
+            match self.client.get(&url).send() {
+                Ok(response) if response.status().is_success() => return Ok(response.text()?),
+                Ok(response) => {
+                    let status = response.status();
+                    if status.as_u16() == 429 {
+                        let hinted = response
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        retry_after_hint = retry_after_hint.max(hinted);
+                    }
+                    last_error = Some(anyhow!("GET {url}: HTTP {status}"));
                 }
-                last_error = Some(anyhow!("GET {url}: HTTP {status}"));
+                Err(error) => last_error = Some(anyhow!("GET {url}: {error}")),
+            }
+            // This host failed: rotate to the next one immediately.
+            self.current.set(self.current.get().wrapping_add(1));
+            // Sleep only after a full cycle through every host.
+            if (attempt + 1) % host_count == 0 {
+                let cycle = ((attempt + 1) / host_count) as u32;
+                let wait_seconds = retry_after_hint.max((1u64 << cycle.min(7)).min(120));
+                retry_after_hint = 0;
+                if wait_seconds > 2 {
+                    eprintln!("  all esplora hosts failing, backing off {wait_seconds}s");
+                }
                 std::thread::sleep(Duration::from_secs(wait_seconds));
             }
-            Err(error) => {
-                last_error = Some(error.into());
-                std::thread::sleep(Duration::from_secs((1u64 << attempt).min(30)));
-            }
         }
+        Err(last_error.unwrap_or_else(|| anyhow!("GET {path} failed on all hosts")))
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("GET {url} failed")))
 }
 
 fn rsk_call(
