@@ -25,5 +25,8 @@ primitive-types = { version = "0.13.1", features = ["std", "serde"] }
 bitcoin = { version = "0.32", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 
+sha2 = "0.10"
+redb = "2"
+
 [lints.clippy]
 unwrap_used = "deny"
