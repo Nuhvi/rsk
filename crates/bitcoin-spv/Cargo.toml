@@ -1,0 +1,13 @@
+[package]
+name = "bitcoin-spv"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "checkpoints"
+path = "bin/checkpoints.rs"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+hex = "0.4"
