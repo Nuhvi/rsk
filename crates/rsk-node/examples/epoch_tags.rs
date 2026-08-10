@@ -17,6 +17,18 @@
 // (v(0) is the newest checkpoint). The table pairs each CPV byte with the RSK
 // block height it is claimed to be the LSB of, so you can go check that block.
 //
+// A CPV byte is a property of the shared ancestor history, not of the tag, so
+// every tag that references the same checkpoint height MUST claim the same
+// byte. The tool exploits this to detect hidden/competing forks from Bitcoin
+// data alone (no RSK node needed):
+//   1. Enforces a minimum merge-mining participation in the window.
+//   2. Builds the consensus CPV byte at every referenced checkpoint height
+//      (the value claimed by the most tags) and marks each tag CONSISTENT or
+//      DIVERGENT against it.
+//   3. Reports the agreement rate; only if it passes the thresholds (default
+//      P >= 50% participation, A >= 90% agreement) is the crowd's history
+//      trusted enough to be worth confirming against RSK endpoints later.
+//
 // Data comes from Electrum (not a rate-limited HTTP API): the whole epoch's
 // headers arrive in one `blockchain.block.header` batch, and the ~2016
 // coinbases are fetched in parallel across many public Electrum servers (each
@@ -232,22 +244,24 @@ fn main() -> Result<()> {
             // silently stuck.
             let monitor_done = Arc::clone(&done);
             let monitor_failed = Arc::clone(&failed);
-            scope.spawn(move || loop {
-                let d = monitor_done.load(Ordering::Relaxed);
-                if d >= total {
-                    break;
+            scope.spawn(move || {
+                loop {
+                    let d = monitor_done.load(Ordering::Relaxed);
+                    if d >= total {
+                        break;
+                    }
+                    let failed_count = monitor_failed
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .len();
+                    let rate = d as f64 / start_time.elapsed().as_secs_f64().max(0.001);
+                    eprintln!(
+                        "  progress: {d}/{total} coinbases ({} failed), {rate:.0}/s, {}s elapsed",
+                        failed_count,
+                        start_time.elapsed().as_secs()
+                    );
+                    std::thread::sleep(Duration::from_secs(1));
                 }
-                let failed_count = monitor_failed
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .len();
-                let rate = d as f64 / start_time.elapsed().as_secs_f64().max(0.001);
-                eprintln!(
-                    "  progress: {d}/{total} coinbases ({} failed), {rate:.0}/s, {}s elapsed",
-                    failed_count,
-                    start_time.elapsed().as_secs()
-                );
-                std::thread::sleep(Duration::from_secs(1));
             });
 
             for _ in 0..worker_count {
@@ -324,18 +338,98 @@ fn main() -> Result<()> {
         eprintln!("pass 2 done: coinbases cached for all heights");
     }
 
-    // ---- Render table -----------------------------------------------------
+    // ---- Render table + CPV agreement detection ---------------------------
+    let epoch_size = (epoch_end - epoch_start) + 1;
+
+    // Collect every decoded tag in the window.
+    let mut tagged: Vec<(u64, Tag)> = Vec::new();
+    for height in epoch_start..=epoch_end {
+        if let Some(record) = records.get(&height)
+            && let Some(raw) = record.tag
+            && let Some(tag) = decode_tag(raw)
+        {
+            tagged.push((height, tag));
+        }
+    }
+    let tagged_count = tagged.len() as u64;
+    let neutral_count = epoch_size - tagged_count;
+    let participation = tagged_count as f64 / epoch_size as f64;
+
+    // Per checkpoint RSK height, count how many tags claim each LSB byte.
+    let mut cpv_tally: HashMap<u64, HashMap<u8, u32>> = HashMap::new();
+    for (_, tag) in &tagged {
+        for (h, b) in &tag.cpv {
+            *cpv_tally.entry(*h).or_default().entry(*b).or_insert(0) += 1;
+        }
+    }
+    // The consensus byte at each checkpoint is the one claimed by the most tags.
+    let consensus: HashMap<u64, u8> = cpv_tally
+        .into_iter()
+        .filter_map(|(h, tally)| {
+            tally
+                .into_iter()
+                .max_by_key(|&(_, count)| count)
+                .map(|(byte, _)| (h, byte))
+        })
+        .collect();
+
+    // A tag is CONSISTENT iff it agrees with the consensus byte at every
+    // checkpoint it references; otherwise it points at a different history
+    // (a fork candidate).
+    let mut status: HashMap<u64, String> = HashMap::new();
+    let mut divergent_at: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut consistent_count = 0u64;
+    for (btc_height, tag) in &tagged {
+        let mut ok = true;
+        for (h, b) in &tag.cpv {
+            if let Some(&consensus_byte) = consensus.get(h)
+                && consensus_byte != *b
+            {
+                ok = false;
+                divergent_at.entry(*btc_height).or_default().push(*h);
+            }
+        }
+        if ok {
+            consistent_count += 1;
+            status.insert(*btc_height, "CONSISTENT".to_string());
+        } else {
+            status.insert(*btc_height, "DIVERGENT".to_string());
+        }
+    }
+    let agreement = if tagged_count > 0 {
+        consistent_count as f64 / tagged_count as f64
+    } else {
+        0.0
+    };
+
     let mut rows: Vec<Row> = (epoch_start..=epoch_end)
         .map(|height| {
             let record = records.get(&height).context("record missing after fetch")?;
+            let tag = record.tag.and_then(decode_tag);
+            let status = match (&tag, status.get(&height)) {
+                (Some(_), Some(s)) => s.clone(),
+                (None, _) => "-".to_string(),
+                (Some(_), None) => "CONSISTENT".to_string(),
+            };
             Ok(Row {
                 height,
                 timestamp: record.timestamp,
-                tag: record.tag.and_then(decode_tag),
+                tag,
+                status,
             })
         })
         .collect::<Result<_>>()?;
+
     print_table(&mut rows);
+    print_summary(
+        epoch_size,
+        tagged_count,
+        neutral_count,
+        participation,
+        consistent_count,
+        agreement,
+        &divergent_at,
+    );
     Ok(())
 }
 
@@ -393,6 +487,8 @@ struct Row {
     height: u64,
     timestamp: u64,
     tag: Option<Tag>,
+    // CPV-consistency verdict for this bitcoin block: CONSISTENT / DIVERGENT / "-".
+    status: String,
 }
 
 struct Tag {
@@ -546,6 +642,69 @@ fn store_range(database: &Database, records: &HashMap<u64, Record>) -> Result<()
 // ---------------------------------------------------------------------------
 // Table output
 
+#[allow(clippy::too_many_arguments)]
+fn print_summary(
+    epoch_size: u64,
+    tagged_count: u64,
+    neutral_count: u64,
+    participation: f64,
+    consistent_count: u64,
+    agreement: f64,
+    divergent_at: &HashMap<u64, Vec<u64>>,
+) {
+    println!();
+    println!("================ CPV agreement (RSKIP110) ================");
+    println!("bitcoin blocks in window : {epoch_size}");
+    println!("rsk tagged (T)           : {tagged_count}");
+    println!("untagged (neutral)       : {neutral_count}");
+    println!(
+        "participation P          : {:.2}%  ({})",
+        participation * 100.0,
+        if participation >= 0.50 {
+            "OK >= 50%"
+        } else {
+            "FAIL < 50%"
+        }
+    );
+    println!("cpv-consistent tags      : {consistent_count} / {tagged_count}");
+    println!(
+        "agreement A              : {:.2}%  ({})",
+        agreement * 100.0,
+        if agreement >= 0.90 {
+            "OK >= 90%"
+        } else {
+            "FAIL < 90%"
+        }
+    );
+    if divergent_at.is_empty() {
+        println!("divergent tags           : none — all CPVs agree on a single chain");
+    } else {
+        println!("divergent tags           : {}", divergent_at.len());
+        let mut rows: Vec<(&u64, &Vec<u64>)> = divergent_at.iter().collect();
+        rows.sort_unstable_by_key(|(h, _)| **h);
+        for (btc_height, heights) in rows {
+            // Deepest disagreeing checkpoint = the smallest (oldest) height.
+            let deepest = heights.iter().min().copied().unwrap_or(0);
+            let hn: Vec<String> = heights.iter().map(|h| h.to_string()).collect();
+            println!(
+                "  btc {btc_height}: disagrees at rsk#{} (deepest {deepest})",
+                hn.join(", ")
+            );
+        }
+    }
+    println!("-----------------------------------------------------------");
+    let confirmed = participation >= 0.50 && agreement >= 0.90;
+    println!(
+        "verdict                  : {}",
+        if confirmed {
+            "AGREEMENT CONFIRMED"
+        } else {
+            "AGREEMENT NOT CONFIRMED"
+        }
+    );
+    println!();
+}
+
 fn print_table(rows: &mut [Row]) {
     enum Cell {
         Single(String),
@@ -583,6 +742,7 @@ fn print_table(rows: &mut [Row]) {
             Cell::Single(prefix),
             Cell::Single(nu),
             Cell::Multi(cpv.split(", ").map(|s| s.to_string()).collect()),
+            Cell::Single(row.status.clone()),
             Cell::Single(timestamp),
         ]);
     }
@@ -593,11 +753,12 @@ fn print_table(rows: &mut [Row]) {
         "RSK prefix (20B)",
         "NU",
         "RSK CPV (rsk#ht=claimed LSB)",
+        "CPV agree",
         "btc timestamp",
     ];
 
     // Widths are the tallest cell or header per column.
-    let mut col_widths = [0usize; 6];
+    let mut col_widths = [0usize; 7];
     for (col, header) in headers.iter().enumerate() {
         col_widths[col] = header.len();
     }
