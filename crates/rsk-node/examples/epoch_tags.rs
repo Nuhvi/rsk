@@ -1,20 +1,24 @@
 // rsk-epoch-tags
 //
-// Instead of a fixed epoch, builds a work-based "tail" ending at a reorg-safe
-// confirmed tip (>= `confirmations` below the live tip), then measures
-// merge-mining participation and CPV agreement over it:
+// Iteratively picks a work-based "tail" of Bitcoin blocks ending at a
+// reorg-safe confirmed tip (>= `confirmations` below the live tip), measures
+// merge-mining participation and CPV agreement over it, and only stops once the
+// combined statistic t = participation x agreement exceeds a threshold T:
 //
-//   Epoch tail: start at the tip's epoch boundary and walk back while the
-//     tail's cumulative work (sum of per-block difficulty) does NOT exceed the
-//     work of the single epoch immediately before it (difficulty * 2016).
-//     The tail is everything from the final boundary to the tip.
+//   1. Start from the (work-based) epoch tail: walk back epoch by epoch from
+//      the confirmed tip while the tail's cumulative work (sum of per-block
+//      difficulty) does NOT exceed the single epoch before it (~difficulty
+//      * 2016). The tail is everything from the final boundary to the tip.
+//   2. Download every block header and the coinbases (to parse the RSKBLOCK
+//      tag) for the current tail, concurrently and out of order.
+//   3. Compute t = participation x agreement over that tail.
+//   4. If t > T (default 0.5, override with --threshold) we succeed and print
+//      the full table. Otherwise extend the tail back one full epoch and
+//      re-measure, repeating until t > T or the lookback cap is reached.
 //
-// Over the tail it downloads every block header (timestamp + difficulty) and
-// coinbase (to parse the RSKBLOCK tag), then:
-//   1. Enforces a minimum merge-mining participation.
-//   2. Builds the consensus CPV byte at every referenced checkpoint height and
-//      marks each tag CONSISTENT or DIVERGENT.
-//   3. Reports the agreement rate; hidden/corrupt tags surface as DIVERGENT.
+// Agreement is RSKIP110-style: a CPV byte is a property of the shared ancestor
+// history, not of the tag, so every tag referencing the same checkpoint height
+// MUST claim the same byte; tags that diverge from the majority are flagged.
 //
 // The 32-byte tag (RSKIP110) is laid out as:
 //   [0..20]  PREFIX - 20-byte prefix of hashForMergedMining
@@ -44,7 +48,7 @@
 //   ELECTRUM_URLS  (comma-separated, comma+space optional; defaults to a
 //                   set of well-known public servers)
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -62,18 +66,30 @@ const PERIOD_LENGTH: u64 = 2016;
 // The top of the epoch must have at least this many blocks above it so the
 // epoch can no longer change in a reorg.
 const CONFIRMATIONS: u64 = 6;
-const ELECTRUM_TIMEOUT: Duration = Duration::from_secs(15);
+const ELECTRUM_TIMEOUT: Duration = Duration::from_secs(3);
+// Wall-clock cap for any single Electrum operation (across all failover
+// attempts), so a couple of dead connections can never stall the run.
+const CALL_DEADLINE: Duration = Duration::from_secs(6);
 
 // bitcoin block: height -> [32-byte hash][8-byte BE timestamp][1-byte flags][32-byte tag]
 // flags bit 0 = coinbase fetched this run, bit 1 = tag present.
 const EPOCH_BLOCK_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("epoch_block");
+// raw coinbase transaction: height -> serialized coinbase bytes (cached eagerly).
+const COINBASE_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("coinbase");
+// epoch difficulty: epoch-start height -> 8-byte BE f64 (constant per epoch).
+const EPOCH_DIFF_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("epoch_difficulty");
 
 fn default_servers() -> Vec<String> {
     [
         "ssl://electrum.blockstream.info:50002",
         "tcp://electrum.blockstream.info:50001",
+        "ssl://electrum.bitaroo.net:50002",
         "tcp://electrum.bitaroo.net:50001",
+        "ssl://electrum.emzy.de:50002",
+        "ssl://electrum.vom-stausee.de:50002",
         "ssl://electrum.diynodes.com:50002",
+        "ssl://electrums.bitcoin.de:50002",
+        "ssl://electrum.anduck.net:50002",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -85,6 +101,8 @@ fn main() -> Result<()> {
     let mut confirmations = CONFIRMATIONS;
     let mut concurrency = 16usize;
     let mut lookback_epochs = 24u64;
+    let mut threshold = 0.5f64;
+    let mut print_table_arg = false;
     let mut database_path = "epoch-tags.redb".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -110,6 +128,15 @@ fn main() -> Result<()> {
                     .context("--lookback-epochs needs a value")?
                     .parse()?
             }
+            "--threshold" => {
+                threshold = args.next().context("--threshold needs a value")?.parse()?
+            }
+            "--print-table" => {
+                print_table_arg = args
+                    .next()
+                    .context("--print-table needs a value")?
+                    .parse()?
+            }
             "--db" | "--cache" => database_path = args.next().context("--db needs a value")?,
             other => bail!("unknown argument: {other}"),
         }
@@ -131,7 +158,7 @@ fn main() -> Result<()> {
     for url in &server_urls {
         let config = ConfigBuilder::new()
             .timeout(Some(ELECTRUM_TIMEOUT))
-            .retry(2)
+            .retry(0)
             .build();
         match ElectrumClient::from_config(url, config) {
             Ok(client) => {
@@ -144,22 +171,15 @@ fn main() -> Result<()> {
             Err(e) => eprintln!("failed to connect {url}: {e}"),
         }
     }
-    // Replicate servers if we have fewer connections than desired concurrency.
-    for i in 0..concurrency.saturating_sub(clients.len()) {
-        if let Some(url) = server_urls.get(i % server_urls.len()) {
-            let config = ConfigBuilder::new()
-                .timeout(Some(ELECTRUM_TIMEOUT))
-                .retry(2)
-                .build();
-            if let Ok(client) = ElectrumClient::from_config(url, config) {
-                clients.push(client);
-            }
-        }
-    }
     if clients.is_empty() {
         bail!("no electrum servers connected");
     }
-    eprintln!("using {} electrum connections", clients.len());
+    // One connection per distinct server: replicating the same server into many
+    // connections hammers it (resets/EOFs) and only makes failover slower.
+    eprintln!(
+        "using {} electrum connections (one per server)",
+        clients.len()
+    );
     let pool = Arc::new(ClientPool {
         clients: Mutex::new(VecDeque::from(clients)),
     });
@@ -168,6 +188,8 @@ fn main() -> Result<()> {
     {
         let transaction = database.begin_write()?;
         transaction.open_table(EPOCH_BLOCK_TABLE)?;
+        transaction.open_table(COINBASE_TABLE)?;
+        transaction.open_table(EPOCH_DIFF_TABLE)?;
         transaction.commit()?;
     }
 
@@ -176,25 +198,87 @@ fn main() -> Result<()> {
     let confirmed_tip = bitcoin_tip.saturating_sub(confirmations);
     eprintln!("bitcoin tip = {bitcoin_tip}, confirmed tip = {confirmed_tip} (-{confirmations})");
 
-    // ---- Work-based epoch tail ---------------------------------------------
+    // ---- Work-based epoch tail (initial) ----------------------------------
     // Walk back epoch by epoch from the confirmed tip, fetching one header per
     // epoch to read its difficulty, so the scan is only as wide as the work
     // comparison actually needs (usually 1-3 epochs, not the full lookback).
-    let (tail_start, tail_work, prev_work) =
-        select_epoch_tail(&pool, period_length, confirmed_tip, lookback_epochs)?;
+    let (mut tail_start, tail_work, prev_work) = select_epoch_tail(
+        &pool,
+        &database,
+        period_length,
+        confirmed_tip,
+        lookback_epochs,
+    )?;
     let tail_len = confirmed_tip - tail_start + 1;
     eprintln!(
-        "epoch tail:  [{tail_start}..={confirmed_tip}] = {tail_len} blocks, \
+        "epoch tail (work): [{tail_start}..={confirmed_tip}] = {tail_len} blocks, \
          tail work {tail_work:.6e} vs previous epoch {prev_work:.6e}"
     );
 
-    // Fetch full headers (hash + timestamp) for the actual tail only, then
-    // analyze participation + CPV agreement over it.
+    // Fetch full headers (hash + timestamp) for the initial tail.
     let mut records = load_range(&database, tail_start, confirmed_tip)?;
     fetch_headers(&pool, &mut records, tail_start, confirmed_tip)?;
     store_range(&database, &records)?;
 
-    analyze_range(pool.clone(), &database, &mut records, tail_start, confirmed_tip)?;
+    // ---- Iterative statistical sufficiency ---------------------------------
+    // Measure t = participation x agreement over the current tail. If t > T we
+    // are done; otherwise extend the tail back one full epoch and re-measure.
+    eprintln!(
+        "success threshold T = {threshold} (t = participation x agreement); \
+         extending back one epoch while t <= T"
+    );
+    let mut iterations = 0u64;
+    let winning = loop {
+        iterations += 1;
+        // Download coinbases for the current tail, concurrently, out of order.
+        fetch_tags_parallel(
+            pool.clone(),
+            &database,
+            &mut records,
+            tail_start,
+            confirmed_tip,
+        )?;
+
+        let agg = compute_agreement(&records, tail_start, confirmed_tip);
+        let t = agg.participation * agg.agreement;
+        println!(
+            "tail t = {t:.3} (P {:.1}% x A {:.1}%)  {}  T = {threshold}",
+            agg.participation * 100.0,
+            agg.agreement * 100.0,
+            if t > threshold {
+                "SUCCESS"
+            } else {
+                "extending..."
+            }
+        );
+        print_summary(
+            &agg,
+            confirmed_tip - tail_start + 1,
+            t,
+            iterations,
+            threshold,
+        );
+
+        if t > threshold {
+            break agg;
+        }
+        if iterations >= lookback_epochs {
+            bail!("t = {t:.3} never exceeded T = {threshold} within {lookback_epochs} epochs");
+        }
+        if tail_start < period_length {
+            bail!("reached genesis before achieving t > T");
+        }
+        let new_start = tail_start - period_length;
+        eprintln!("t <= T; extending tail back one epoch -> [{new_start}..={confirmed_tip}]");
+        fetch_headers(&pool, &mut records, new_start, tail_start - 1)?;
+        store_range(&database, &records)?;
+        tail_start = new_start;
+    };
+
+    if print_table_arg {
+        let mut rows = build_rows(&records, tail_start, confirmed_tip, &winning.status)?;
+        print_table(&mut rows);
+    }
 
     Ok(())
 }
@@ -202,55 +286,103 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 // Tail selection (Bitcoin work-based)
 
-// Fetch all headers in [low..=hi] (electrum returns at most 2016 per call),
-// filling `records` with hash+timestamp. Used only for the final tail range.
+// Fetch only the headers in [low..=hi] that are not yet cached, filling
+// `records` with hash+timestamp. Missing heights are grouped into contiguous
+// runs and fetched as one batch each, so re-runs (where only the tip advanced)
+// fetch only the handful of new blocks.
 fn fetch_headers(
     pool: &ClientPool,
     records: &mut HashMap<u64, Record>,
     low: u64,
     hi: u64,
 ) -> Result<()> {
-    let mut start = low;
-    let mut total = 0u64;
-    while start <= hi {
-        let count = ((hi - start + 1) as usize).min(2016);
-        let res = pool.call(|c| c.block_headers(start as usize, count))?;
-        if res.headers.len() != count {
-            bail!(
-                "electrum returned {} of {count} headers at {start}",
-                res.headers.len()
-            );
+    // Contiguous runs of heights we have no cached header for.
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut height = low;
+    while height <= hi {
+        if records.contains_key(&height) {
+            height += 1;
+            continue;
         }
-        for (offset, header) in res.headers.iter().enumerate() {
-            let height = start + offset as u64;
-            records.entry(height).or_insert_with(|| Record {
-                hash: header.block_hash().to_string(),
-                timestamp: header_time(header) as u64,
-                fetched: false,
-                tag: None,
-            });
+        let run_start = height;
+        let mut run_len = 0u64;
+        while height <= hi && !records.contains_key(&height) {
+            run_len += 1;
+            height += 1;
         }
-        total += count as u64;
-        start += count as u64;
+        runs.push((run_start, run_len));
     }
-    eprintln!("fetched {total} headers for the tail");
+
+    let mut fetched = 0u64;
+    for (run_start, run_len) in &runs {
+        let mut start = *run_start;
+        let mut remaining = *run_len;
+        while remaining > 0 {
+            let count = remaining.min(2016) as usize;
+            let res = pool.call(|c| c.block_headers(start as usize, count))?;
+            if res.headers.len() != count {
+                bail!(
+                    "electrum returned {} of {count} headers at {start}",
+                    res.headers.len()
+                );
+            }
+            for (offset, header) in res.headers.iter().enumerate() {
+                let height = start + offset as u64;
+                records.entry(height).or_insert_with(|| Record {
+                    hash: header.block_hash().to_string(),
+                    timestamp: header_time(header) as u64,
+                    fetched: false,
+                    tag: None,
+                });
+            }
+            fetched += count as u64;
+            start += count as u64;
+            remaining -= count as u64;
+        }
+    }
+    let cached = (hi - low + 1).saturating_sub(fetched);
+    eprintln!("headers: {cached} from cache, {fetched} fetched");
     Ok(())
 }
 
 // The earliest epoch boundary such that everything from that boundary to the
 // confirmed tip has more work than the single preceding epoch. Difficulty is
-// read lazily from one header per epoch as we walk back, so the scan is no
-// wider than the work comparison actually needs.
+// read from the persistent per-epoch cache (one fetch per epoch, never
+// repeated across runs), so the scan is no wider than the work comparison needs.
 // Returns (tail_start, tail_work, previous_epoch_work).
 fn select_epoch_tail(
     pool: &ClientPool,
+    database: &Database,
     period_len: u64,
     confirmed_tip: u64,
     max_epochs: u64,
 ) -> Result<(u64, f64, f64)> {
-    // Difficulty of an epoch, read from its first block (constant per epoch).
-    let epoch_difficulty = |epoch_start: u64| {
-        pool.call(|c| c.block_header(epoch_start as usize).map(|h| h.difficulty_float()))
+    // Difficulty of an epoch, read from its first block (constant per epoch),
+    // cached in EPOCH_DIFF_TABLE so re-runs fetch nothing.
+    let epoch_difficulty = |epoch_start: u64| -> Result<f64> {
+        {
+            let transaction = database.begin_read()?;
+            let table = transaction.open_table(EPOCH_DIFF_TABLE)?;
+            if let Some(value) = table.get(epoch_start)? {
+                let bytes = value.value();
+                if bytes.len() == 8 {
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(bytes);
+                    return Ok(f64::from_be_bytes(buf));
+                }
+            }
+        }
+        let difficulty = pool.call(|c| {
+            c.block_header(epoch_start as usize)
+                .map(|h| h.difficulty_float())
+        })?;
+        let transaction = database.begin_write()?;
+        {
+            let mut table = transaction.open_table(EPOCH_DIFF_TABLE)?;
+            table.insert(epoch_start, &difficulty.to_be_bytes()[..])?;
+        }
+        transaction.commit()?;
+        Ok(difficulty)
     };
     let tip_epoch_start = (confirmed_tip / period_len) * period_len;
     let tip_epoch_diff = epoch_difficulty(tip_epoch_start)?;
@@ -275,18 +407,20 @@ fn select_epoch_tail(
 }
 
 // ---------------------------------------------------------------------------
-// Per-tail analysis: fetch coinbase tags, then participation + CPV agreement.
+// Per-tail analysis: participation + CPV agreement.
 
-fn analyze_range(
-    pool: Arc<ClientPool>,
-    database: &Database,
-    records: &mut HashMap<u64, Record>,
-    start: u64,
-    end: u64,
-) -> Result<()> {
-    fetch_tags_parallel(pool, database, records, start, end)?;
+struct Agreement {
+    tagged: u64,
+    neutral: u64,
+    participation: f64,
+    consistent: u64,
+    agreement: f64,
+    status: HashMap<u64, String>,
+    divergent_at: HashMap<u64, Vec<u64>>,
+}
 
-    let size = (end - start) + 1;
+fn compute_agreement(records: &HashMap<u64, Record>, start: u64, end: u64) -> Agreement {
+    let size = end - start + 1;
 
     // Collect every decoded tag in the tail.
     let mut tagged: Vec<(u64, Tag)> = Vec::new();
@@ -348,7 +482,24 @@ fn analyze_range(
         0.0
     };
 
-    let mut rows: Vec<Row> = (start..=end)
+    Agreement {
+        tagged: tagged_count,
+        neutral: neutral_count,
+        participation,
+        consistent: consistent_count,
+        agreement,
+        status,
+        divergent_at,
+    }
+}
+
+fn build_rows(
+    records: &HashMap<u64, Record>,
+    start: u64,
+    end: u64,
+    status: &HashMap<u64, String>,
+) -> Result<Vec<Row>> {
+    (start..=end)
         .map(|height| {
             let record = records.get(&height).context("record missing after fetch")?;
             let tag = record.tag.and_then(decode_tag);
@@ -364,19 +515,7 @@ fn analyze_range(
                 status,
             })
         })
-        .collect::<Result<_>>()?;
-
-    print_table(&mut rows);
-    print_summary(
-        size,
-        tagged_count,
-        neutral_count,
-        participation,
-        consistent_count,
-        agreement,
-        &divergent_at,
-    );
-    Ok(())
+        .collect()
 }
 
 // Fetch (and cache) coinbase tags for every not-yet-fetched height in
@@ -403,7 +542,7 @@ fn fetch_tags_parallel(
     let next = Arc::new(AtomicU64::new(start));
     let total = end - start + 1;
     let done = Arc::new(AtomicU64::new(0));
-    // Successful (or no-tag) fetches land here; failures are tracked separately.
+    // Extracted tags for already-fetched heights; failures are tracked separately.
     let results: Arc<Mutex<HashMap<u64, Option<[u8; 32]>>>> = Arc::new(Mutex::new(HashMap::new()));
     let failed: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let start_time = std::time::Instant::now();
@@ -411,11 +550,32 @@ fn fetch_tags_parallel(
     let worker_count = missing
         .len()
         .min(pool.clients.lock().map(|g| g.len()).unwrap_or(1));
-    thread::scope(|scope| {
+    // Heights whose coinbases are already cached, shared read-only by workers
+    // so they skip anything we already have (re-runs fetch only the new tail).
+    let already: Arc<HashSet<u64>> = Arc::new(
+        records
+            .iter()
+            .filter(|(_, r)| r.fetched)
+            .map(|(h, _)| *h)
+            .collect(),
+    );
+    // Raw coinbases flow to a single writer that persists them in batches, so
+    // even a cancelled run keeps everything flushed so far cached for the next
+    // run (up to one final un-flushed batch is lost).
+    let (write_tx, write_rx) = std::sync::mpsc::channel::<(u64, Vec<u8>)>();
+    const COINBASE_BATCH: usize = 200;
+    // Handles moved into the scoped threads; originals stay for use after the
+    // scope joins.
+    let failed_scope = failed.clone();
+    let results_scope = results.clone();
+
+    thread::scope(move |scope| {
         // Progress monitor so the run never looks silently stuck.
         let monitor_done = Arc::clone(&done);
-        let monitor_failed = Arc::clone(&failed);
+        let monitor_failed = Arc::clone(&failed_scope);
         scope.spawn(move || {
+            let mut last_done = u64::MAX;
+            let mut stall = 0u64;
             loop {
                 let d = monitor_done.load(Ordering::Relaxed);
                 if d >= total {
@@ -425,8 +585,25 @@ fn fetch_tags_parallel(
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .len();
+                // Note when no height has finished for a while so the run never
+                // looks silently frozen on a failing connection.
+                if d == last_done {
+                    stall += 1;
+                } else {
+                    stall = 0;
+                    last_done = d;
+                }
+                let stall_note = if stall >= 1 {
+                    format!(
+                        "  (no progress for {stall}s — waiting on {}/{} height(s), deadline-bound)",
+                        total - d,
+                        total
+                    )
+                } else {
+                    String::new()
+                };
                 eprintln!(
-                    "  progress: {d}/{total} heights scanned ({} failed), {}s elapsed",
+                    "  progress: {d}/{total} heights scanned ({} failed), {}s elapsed{stall_note}",
                     failed_count,
                     start_time.elapsed().as_secs()
                 );
@@ -434,17 +611,44 @@ fn fetch_tags_parallel(
             }
         });
 
+        // Incremental coinbase writer.
+        scope.spawn(move || {
+            let mut buffer: Vec<(u64, Vec<u8>)> = Vec::with_capacity(COINBASE_BATCH);
+            loop {
+                let received = write_rx.recv();
+                if let Ok(item) = &received {
+                    buffer.push(item.clone());
+                }
+                if buffer.len() >= COINBASE_BATCH || received.is_err() {
+                    if let Err(e) = write_coinbases(database, &buffer) {
+                        eprintln!("  WARNING: failed to cache coinbase chunk: {e:#}");
+                    }
+                    buffer.clear();
+                }
+                if received.is_err() {
+                    // All workers done and their senders dropped.
+                    break;
+                }
+            }
+        });
+
         for _ in 0..worker_count {
             let pool = pool.clone();
             let next = next.clone();
             let done = done.clone();
-            let results = results.clone();
-            let failed = failed.clone();
+            let results = results_scope.clone();
+            let failed = failed_scope.clone();
+            let already = already.clone();
+            let write_tx = write_tx.clone();
             scope.spawn(move || {
                 loop {
                     let height = next.fetch_add(1, Ordering::Relaxed);
                     if height > end {
                         break;
+                    }
+                    if already.contains(&height) {
+                        done.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
                     let outcome = pool
                         .call(|c| {
@@ -452,10 +656,11 @@ fn fetch_tags_parallel(
                             let raw = c.transaction_get_raw(&txid)?;
                             Ok::<Vec<u8>, electrum_client::Error>(raw)
                         })
-                        .map(|raw| extract_tag(&raw));
+                        .map(|raw| (extract_tag(&raw), raw));
                     done.fetch_add(1, Ordering::Relaxed);
                     match outcome {
-                        Ok(tag) => {
+                        Ok((tag, raw)) => {
+                            let _ = write_tx.send((height, raw));
                             results
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
@@ -472,18 +677,30 @@ fn fetch_tags_parallel(
                 }
             });
         }
+        // Release our own sender so the writer thread sees the channel close
+        // once every worker has finished (otherwise the writer parks on recv()
+        // forever and the scope never returns: a deadlock).
+        drop(write_tx);
     });
     eprintln!(
         "pass 2 complete in {}s",
         start_time.elapsed().as_secs_f64().round() as u64
     );
 
-    let failed = failed.lock().unwrap_or_else(|p| p.into_inner());
-    if !failed.is_empty() {
-        bail!(
-            "failed to fetch {} coinbase(s): {}",
-            failed.len(),
-            failed
+    let failed_heights = {
+        let failed = failed.lock().unwrap_or_else(|p| p.into_inner());
+        failed.clone()
+    };
+    // Fail fast: the parallel pass already tried every server for a height. A
+    // height that still failed is usually a tip-region block some servers
+    // haven't indexed yet; leave it uncached (a later run retries it) and just
+    // warn — it then counts as untagged, only slightly lowering participation.
+    let mut changed = false;
+    if !failed_heights.is_empty() {
+        eprintln!(
+            "WARNING: {} coinbase(s) could not be fetched and are EXCLUDED: {}",
+            failed_heights.len(),
+            failed_heights
                 .iter()
                 .take(10)
                 .map(|h| h.to_string())
@@ -493,7 +710,6 @@ fn fetch_tags_parallel(
     }
 
     let results = results.lock().unwrap_or_else(|p| p.into_inner());
-    let mut changed = false;
     for (height, tag) in results.iter() {
         let record = records.entry(*height).or_insert_with(|| Record {
             hash: String::new(),
@@ -509,7 +725,7 @@ fn fetch_tags_parallel(
     if changed {
         store_range(database, records)?;
     }
-    eprintln!("pass 2 done: coinbases cached for [{start}..={end}]");
+    eprintln!("pass 2 done: coinbase txns cached for [{start}..={end}]");
     Ok(())
 }
 
@@ -527,9 +743,11 @@ struct ClientPool {
 
 impl ClientPool {
     // Run `f` against one client. On error, round-robin to the next client and
-    // retry until all clients have been tried. Each client is held by a single
-    // caller at a time (it is removed from the pool for the duration of the
-    // call), so concurrent callers never share a socket.
+    // retry (each client once), with a short backoff between attempts and a
+    // wall-clock deadline so a run of dead connections can never stall the
+    // whole binary long. Each client is held by a single caller at a time (it
+    // is removed from the pool for the duration of the call), so concurrent
+    // callers never share a socket.
     fn call<T, F>(&self, f: F) -> Result<T>
     where
         F: Fn(&ElectrumClient) -> Result<T, electrum_client::Error>,
@@ -538,8 +756,15 @@ impl ClientPool {
         if pool_size == 0 {
             bail!("electrum client pool is empty");
         }
+        let deadline = std::time::Instant::now() + CALL_DEADLINE;
         let mut errors: Vec<electrum_client::Error> = Vec::new();
-        for _ in 0..pool_size * 2 {
+        for attempt in 0..pool_size {
+            if std::time::Instant::now() >= deadline {
+                errors.push(electrum_client::Error::Message(
+                    "electrum call deadline exceeded".to_string(),
+                ));
+                break;
+            }
             let client = self
                 .clients
                 .lock()
@@ -555,8 +780,15 @@ impl ClientPool {
                 Ok(value) => return Ok(value),
                 Err(e) => errors.push(e),
             }
+            if attempt + 1 < pool_size {
+                // Short backoff so we don't hammer the servers while failing over.
+                let backoff_ms = (1u64 << (attempt % 4).min(3)) * 200;
+                std::thread::sleep(Duration::from_millis(backoff_ms));
+            }
         }
-        Err(anyhow!("electrum call failed on all servers: {errors:?}"))
+        Err(anyhow!(
+            "electrum call failed on all {pool_size} server(s): {errors:?}"
+        ))
     }
 }
 
@@ -636,6 +868,7 @@ fn load_range(database: &Database, start: u64, end: u64) -> Result<HashMap<u64, 
     let mut out = HashMap::new();
     let transaction = database.begin_read()?;
     let table = transaction.open_table(EPOCH_BLOCK_TABLE)?;
+    let coinbases = transaction.open_table(COINBASE_TABLE)?;
     for entry in table.range(start..=end)? {
         let (key, value) = entry?;
         let height = key.value();
@@ -645,14 +878,27 @@ fn load_range(database: &Database, start: u64, end: u64) -> Result<HashMap<u64, 
         }
         let hash = hex::encode(&bytes[0..32]);
         let timestamp = u64::from_be_bytes(bytes[32..40].try_into().context("ts")?);
-        let flags = bytes[40];
-        let fetched = flags & 1 != 0;
-        let tag = if flags & 2 != 0 {
-            let mut tag = [0u8; 32];
-            tag.copy_from_slice(&bytes[41..73]);
-            Some(tag)
-        } else {
-            None
+        // A cached raw coinbase is authoritative: it means we've already fetched
+        // this block, so interrupted runs still skip everything that was cached
+        // before the crash. The stored flags/tag are only a legacy fallback for
+        // rows written by older versions without a COINBASE_TABLE entry.
+        let (fetched, tag) = match coinbases.get(height)? {
+            Some(raw) => {
+                let raw = raw.value();
+                (true, extract_tag(raw))
+            }
+            None => {
+                let flags = bytes[40];
+                let fetched = flags & 1 != 0;
+                let tag = if flags & 2 != 0 {
+                    let mut tag = [0u8; 32];
+                    tag.copy_from_slice(&bytes[41..73]);
+                    Some(tag)
+                } else {
+                    None
+                };
+                (fetched, tag)
+            }
         };
         if height >= start && height <= end {
             out.insert(
@@ -719,48 +965,46 @@ fn store_range(database: &Database, records: &HashMap<u64, Record>) -> Result<()
     Ok(())
 }
 
+// Persist raw coinbase transactions to COINBASE_TABLE in one write transaction.
+fn write_coinbases(database: &Database, batch: &[(u64, Vec<u8>)]) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let transaction = database.begin_write()?;
+    {
+        let mut table = transaction.open_table(COINBASE_TABLE)?;
+        for (height, raw) in batch {
+            table.insert(*height, raw.as_slice())?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Table output
 
-#[allow(clippy::too_many_arguments)]
-fn print_summary(
-    tail_size: u64,
-    tagged_count: u64,
-    neutral_count: u64,
-    participation: f64,
-    consistent_count: u64,
-    agreement: f64,
-    divergent_at: &HashMap<u64, Vec<u64>>,
-) {
+fn print_summary(agg: &Agreement, tail_size: u64, t: f64, iterations: u64, threshold: f64) {
     println!();
-    println!("================ CPV agreement (RSKIP110) ================");
-    println!("blocks in tail           : {tail_size}");
-    println!("rsk tagged (T)           : {tagged_count}");
-    println!("untagged (neutral)       : {neutral_count}");
+    println!("================ CPV agreement (RSKIP110) [iteration {iterations}] ================");
+    println!("blocks in tail        : {tail_size}");
+    println!("rsk tagged            : {}", agg.tagged);
+    println!("untagged (neutral)    : {}", agg.neutral);
+    println!("participation P       : {:.2}%", agg.participation * 100.0);
     println!(
-        "participation P          : {:.2}%  ({})",
-        participation * 100.0,
-        if participation >= 0.50 {
-            "OK >= 50%"
-        } else {
-            "FAIL < 50%"
-        }
+        "cpv-consistent tags   : {} / {}",
+        agg.consistent, agg.tagged
     );
-    println!("cpv-consistent tags      : {consistent_count} / {tagged_count}");
+    println!("agreement A           : {:.2}%", agg.agreement * 100.0);
     println!(
-        "agreement A              : {:.2}%  ({})",
-        agreement * 100.0,
-        if agreement >= 0.90 {
-            "OK >= 90%"
-        } else {
-            "FAIL < 90%"
-        }
+        "t = P x A             : {t:.3}   (T = {threshold}) {}",
+        if t > threshold { "PASS" } else { "FAIL" }
     );
-    if divergent_at.is_empty() {
-        println!("divergent tags           : none — all CPVs agree on a single chain");
+    if agg.divergent_at.is_empty() {
+        println!("divergent tags        : none — all CPVs agree on a single chain");
     } else {
-        println!("divergent tags           : {}", divergent_at.len());
-        let mut rows: Vec<(&u64, &Vec<u64>)> = divergent_at.iter().collect();
+        println!("divergent tags        : {}", agg.divergent_at.len());
+        let mut rows: Vec<(&u64, &Vec<u64>)> = agg.divergent_at.iter().collect();
         rows.sort_unstable_by_key(|(h, _)| **h);
         for (btc_height, heights) in rows {
             // Deepest disagreeing checkpoint = the smallest (oldest) height.
@@ -772,16 +1016,6 @@ fn print_summary(
             );
         }
     }
-    println!("-----------------------------------------------------------");
-    let confirmed = participation >= 0.50 && agreement >= 0.90;
-    println!(
-        "verdict                  : {}",
-        if confirmed {
-            "AGREEMENT CONFIRMED"
-        } else {
-            "AGREEMENT NOT CONFIRMED"
-        }
-    );
     println!();
 }
 
