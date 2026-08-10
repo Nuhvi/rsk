@@ -52,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
-        .user_agent("rsk-period-headers/0.1")
+        .user_agent("rsk/0.1")
         .build()?;
     let esplora = Esplora {
         client,

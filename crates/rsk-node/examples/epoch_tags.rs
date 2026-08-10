@@ -1,0 +1,679 @@
+// rsk-epoch-tags
+//
+// For the latest FULL Bitcoin difficulty epoch (a complete 2016-block period
+// whose top block has at least 6 confirmations above it), download every
+// block's header (for its timestamp) and its coinbase transaction, and log a
+// table of the merge-mining RSK tag found in each coinbase.
+//
+// The 32-byte tag (RSKIP110) is laid out as:
+//   [0..20]  PREFIX - 20-byte prefix of hashForMergedMining
+//   [20..27] CPV    - LSBs of the Bitcoin ids merge-mined with 7 RSK
+//                     "checkpoint" blocks (j = 0..6)
+//   [27]     NU     - number of uncles referenced in the last 32 RSK blocks
+//   [28..32] BN     - the RSK block height being mined (big endian)
+//
+// CPV checkpoint j corresponds to the RSK block at height
+//   base - j*64,  where base = ((BN - 1) / 64) * 64
+// (v(0) is the newest checkpoint). The table pairs each CPV byte with the RSK
+// block height it is claimed to be the LSB of, so you can go check that block.
+//
+// Data comes from Electrum (not a rate-limited HTTP API): the whole epoch's
+// headers arrive in one `blockchain.block.header` batch, and the ~2016
+// coinbases are fetched in parallel across many public Electrum servers (each
+// worker thread drives its own connection, failing over to the next server on
+// error). Everything is persisted to a redb cache so re-runs and interrupted
+// runs cost almost nothing.
+//
+// Usage:
+//   cargo run -p rsk-node --example epoch_tags \
+//       [--period-len N] [--confirmations N] [--concurrency N] [--db PATH]
+//
+// Environment:
+//   ELECTRUM_URLS  (comma-separated, comma+space optional; defaults to a
+//                   set of well-known public servers)
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use bitcoin::block::Header as BitcoinHeader;
+use electrum_client::{Client as ElectrumClient, ConfigBuilder, ElectrumApi};
+use redb::{Database, TableDefinition};
+
+const TAG_MAGIC: &[u8] = b"RSKBLOCK:";
+
+// Bitcoin's retarget interval; consensus-fixed at 2016.
+const PERIOD_LENGTH: u64 = 2016;
+// The top of the epoch must have at least this many blocks above it so the
+// epoch can no longer change in a reorg.
+const CONFIRMATIONS: u64 = 6;
+const ELECTRUM_TIMEOUT: Duration = Duration::from_secs(15);
+
+// bitcoin block: height -> [32-byte hash][8-byte BE timestamp][1-byte flags][32-byte tag]
+// flags bit 0 = coinbase fetched this run, bit 1 = tag present.
+const EPOCH_BLOCK_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("epoch_block");
+
+fn default_servers() -> Vec<String> {
+    [
+        "ssl://electrum.blockstream.info:50002",
+        "tcp://electrum.blockstream.info:50001",
+        "tcp://electrum.bitaroo.net:50001",
+        "ssl://electrum.diynodes.com:50002",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn main() -> Result<()> {
+    let mut period_length = PERIOD_LENGTH;
+    let mut confirmations = CONFIRMATIONS;
+    let mut concurrency = 16usize;
+    let mut database_path = "epoch-tags.redb".to_string();
+    let mut args = std::env::args().skip(1);
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--period-len" => {
+                period_length = args.next().context("--period-len needs a value")?.parse()?
+            }
+            "--confirmations" => {
+                confirmations = args
+                    .next()
+                    .context("--confirmations needs a value")?
+                    .parse()?
+            }
+            "--concurrency" => {
+                concurrency = args
+                    .next()
+                    .context("--concurrency needs a value")?
+                    .parse()?
+            }
+            "--db" | "--cache" => database_path = args.next().context("--db needs a value")?,
+            other => bail!("unknown argument: {other}"),
+        }
+    }
+
+    let server_urls: Vec<String> = std::env::var("ELECTRUM_URLS")
+        .map(|s| {
+            s.split(',')
+                .map(|part| part.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|_| default_servers());
+    if server_urls.is_empty() {
+        bail!("no electrum servers configured");
+    }
+
+    let mut clients: Vec<ElectrumClient> = Vec::new();
+    for url in &server_urls {
+        let config = ConfigBuilder::new()
+            .timeout(Some(ELECTRUM_TIMEOUT))
+            .retry(2)
+            .build();
+        match ElectrumClient::from_config(url, config) {
+            Ok(client) => {
+                eprintln!("connected: {url}");
+                clients.push(client);
+                if clients.len() >= concurrency {
+                    break;
+                }
+            }
+            Err(e) => eprintln!("failed to connect {url}: {e}"),
+        }
+    }
+    // Replicate servers if we have fewer connections than desired concurrency.
+    for i in 0..concurrency.saturating_sub(clients.len()) {
+        if let Some(url) = server_urls.get(i % server_urls.len()) {
+            let config = ConfigBuilder::new()
+                .timeout(Some(ELECTRUM_TIMEOUT))
+                .retry(2)
+                .build();
+            if let Ok(client) = ElectrumClient::from_config(url, config) {
+                clients.push(client);
+            }
+        }
+    }
+    if clients.is_empty() {
+        bail!("no electrum servers connected");
+    }
+    eprintln!("using {} electrum connections", clients.len());
+    let pool = Arc::new(ClientPool {
+        clients: Mutex::new(VecDeque::from(clients)),
+    });
+
+    let database = Database::create(&database_path)?;
+    {
+        let transaction = database.begin_write()?;
+        transaction.open_table(EPOCH_BLOCK_TABLE)?;
+        transaction.commit()?;
+    }
+
+    // Tip height from any server.
+    let bitcoin_tip = pool.call(|c| c.block_headers_subscribe().map(|h| h.height as u64))?;
+    eprintln!("bitcoin tip = {bitcoin_tip}");
+
+    // Latest full epoch with `confirmations` blocks confirmed above it:
+    // find the largest multiple `M` of period_length with M <= tip - (conf-1);
+    // the epoch spans blocks [M - period_length, M - 1].
+    let mut boundary = (bitcoin_tip / period_length) * period_length;
+    while boundary > bitcoin_tip.saturating_sub(confirmations - 1) {
+        boundary = boundary.saturating_sub(period_length);
+    }
+    let epoch_start = boundary.saturating_sub(period_length);
+    let epoch_end = boundary.saturating_sub(1);
+    let epoch_size = (epoch_end - epoch_start) as usize + 1;
+    eprintln!(
+        "latest full epoch ({period_length} blocks, {confirmations} confirmations above) = \
+         {epoch_start}..={epoch_end}"
+    );
+
+    let mut records = load_range(&database, epoch_start, epoch_end)?;
+    let missing_headers: Vec<u64> = (epoch_start..=epoch_end)
+        .filter(|h| !records.contains_key(h))
+        .collect();
+
+    // ---- Pass 1: headers (one batch call, no parallelism needed) -----------
+    if !missing_headers.is_empty() {
+        eprintln!("pass 1: fetching {epoch_size} headers (one batch call)");
+        // block_headers returns at most 2016 contiguous headers starting at
+        // start_height, which exactly covers the epoch.
+        let res = pool.call(|c| c.block_headers(epoch_start as usize, epoch_size))?;
+        if res.headers.len() != epoch_size {
+            bail!(
+                "electrum returned {} of {epoch_size} headers",
+                res.headers.len()
+            );
+        }
+        for (offset, header) in res.headers.iter().enumerate() {
+            let height = epoch_start + offset as u64;
+            records.insert(
+                height,
+                Record {
+                    hash: header.block_hash().to_string(),
+                    timestamp: header_time(header) as u64,
+                    fetched: false,
+                    tag: None,
+                },
+            );
+        }
+        store_range(&database, &records)?;
+        eprintln!("pass 1 done: headers cached for all heights");
+    }
+
+    // ---- Pass 2: coinbases -> tags, in parallel across servers -------------
+    let missing_tags: Vec<u64> = (epoch_start..=epoch_end)
+        .filter(|h| records.get(h).map(|r| !r.fetched).unwrap_or(false))
+        .collect();
+    if !missing_tags.is_empty() {
+        eprintln!(
+            "pass 2: fetching {} coinbases (concurrency {})",
+            missing_tags.len(),
+            pool.clients.lock().unwrap_or_else(|p| p.into_inner()).len()
+        );
+
+        let next = Arc::new(AtomicU64::new(epoch_start));
+        let end = epoch_end;
+        let total = missing_tags.len() as u64;
+        let done = Arc::new(AtomicU64::new(0));
+        let results: Arc<Mutex<HashMap<u64, Option<[u8; 32]>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let failed: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let start_time = std::time::Instant::now();
+
+        let worker_count = missing_tags
+            .len()
+            .min(pool.clients.lock().map(|g| g.len()).unwrap_or(1));
+        thread::scope(|scope| {
+            // Progress monitor: reports every second so the run never looks
+            // silently stuck.
+            let monitor_done = Arc::clone(&done);
+            let monitor_failed = Arc::clone(&failed);
+            scope.spawn(move || loop {
+                let d = monitor_done.load(Ordering::Relaxed);
+                if d >= total {
+                    break;
+                }
+                let failed_count = monitor_failed
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .len();
+                let rate = d as f64 / start_time.elapsed().as_secs_f64().max(0.001);
+                eprintln!(
+                    "  progress: {d}/{total} coinbases ({} failed), {rate:.0}/s, {}s elapsed",
+                    failed_count,
+                    start_time.elapsed().as_secs()
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            });
+
+            for _ in 0..worker_count {
+                let pool = pool.clone();
+                let next = next.clone();
+                let done = done.clone();
+                let results = results.clone();
+                let failed = failed.clone();
+                scope.spawn(move || {
+                    loop {
+                        let height = next.fetch_add(1, Ordering::Relaxed);
+                        if height > end {
+                            break;
+                        }
+                        let outcome = pool
+                            .call(|c| {
+                                let txid = c.txid_from_pos(height as usize, 0)?;
+                                let raw = c.transaction_get_raw(&txid)?;
+                                Ok::<Vec<u8>, electrum_client::Error>(raw)
+                            })
+                            .map(|raw| extract_tag(&raw));
+                        done.fetch_add(1, Ordering::Relaxed);
+                        match outcome {
+                            Ok(tag) => {
+                                results
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .insert(height, tag);
+                            }
+                            Err(e) => {
+                                failed
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .push(height);
+                                eprintln!("  coinbase {height} failed on all servers: {e:#}");
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        eprintln!(
+            "pass 2 complete in {}s",
+            start_time.elapsed().as_secs_f64().round() as u64
+        );
+
+        let failed = failed.lock().unwrap_or_else(|p| p.into_inner());
+        if !failed.is_empty() {
+            bail!(
+                "failed to fetch {} coinbase(s): {}",
+                failed.len(),
+                failed
+                    .iter()
+                    .take(10)
+                    .map(|h| h.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        let results = results.lock().unwrap_or_else(|p| p.into_inner());
+        for (height, tag) in results.iter() {
+            let record = records.entry(*height).or_insert_with(|| Record {
+                hash: String::new(),
+                timestamp: 0,
+                fetched: false,
+                tag: None,
+            });
+            record.fetched = true;
+            record.tag = *tag;
+        }
+        drop(results);
+        store_range(&database, &records)?;
+        eprintln!("pass 2 done: coinbases cached for all heights");
+    }
+
+    // ---- Render table -----------------------------------------------------
+    let mut rows: Vec<Row> = (epoch_start..=epoch_end)
+        .map(|height| {
+            let record = records.get(&height).context("record missing after fetch")?;
+            Ok(Row {
+                height,
+                timestamp: record.timestamp,
+                tag: record.tag.and_then(decode_tag),
+            })
+        })
+        .collect::<Result<_>>()?;
+    print_table(&mut rows);
+    Ok(())
+}
+
+// bitcoin Header.time is a u32 (seconds since epoch).
+fn header_time(header: &BitcoinHeader) -> u32 {
+    header.time
+}
+
+// ---------------------------------------------------------------------------
+// Electrum client pool with round-robin failover.
+
+struct ClientPool {
+    clients: Mutex<VecDeque<ElectrumClient>>,
+}
+
+impl ClientPool {
+    // Run `f` against one client. On error, round-robin to the next client and
+    // retry until all clients have been tried. Each client is held by a single
+    // caller at a time (it is removed from the pool for the duration of the
+    // call), so concurrent callers never share a socket.
+    fn call<T, F>(&self, f: F) -> Result<T>
+    where
+        F: Fn(&ElectrumClient) -> Result<T, electrum_client::Error>,
+    {
+        let pool_size = self.clients.lock().unwrap_or_else(|p| p.into_inner()).len();
+        if pool_size == 0 {
+            bail!("electrum client pool is empty");
+        }
+        let mut errors: Vec<electrum_client::Error> = Vec::new();
+        for _ in 0..pool_size * 2 {
+            let client = self
+                .clients
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop_front()
+                .context("electrum pool empty")?;
+            let outcome = f(&client);
+            self.clients
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push_back(client);
+            match outcome {
+                Ok(value) => return Ok(value),
+                Err(e) => errors.push(e),
+            }
+        }
+        Err(anyhow!("electrum call failed on all servers: {errors:?}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-block data
+
+struct Row {
+    height: u64,
+    timestamp: u64,
+    tag: Option<Tag>,
+}
+
+struct Tag {
+    prefix: [u8; 20],
+    // (RSK checkpoint block height, claimed LSB byte) for j = 0..=6.
+    cpv: Vec<(u64, u8)>,
+    // Uncles referenced in the last 32 RSK blocks.
+    recent_uncles: u8,
+    // RSK block height being mined (bytes 28..32, big endian).
+    block_number: u64,
+}
+
+fn decode_tag(raw: [u8; 32]) -> Option<Tag> {
+    let mut prefix = [0u8; 20];
+    prefix.copy_from_slice(&raw[0..20]);
+    let block_number = u32::from_be_bytes([raw[28], raw[29], raw[30], raw[31]]) as u64;
+    let base = ((block_number.saturating_sub(1)) / 64) * 64;
+    let mut cpv = Vec::with_capacity(7);
+    for j in 0..7u64 {
+        // Checkpoint j is the LSB of the bitcoin id merge-mined with the RSK
+        // block at height base - j*64 (v(0) newest). Clamp at genesis.
+        let checkpoint_height = base.saturating_sub(j * 64);
+        cpv.push((checkpoint_height, raw[20 + j as usize]));
+    }
+    Some(Tag {
+        prefix,
+        cpv,
+        recent_uncles: raw[27],
+        block_number,
+    })
+}
+
+// The merge-mining spec requires the tag in the tail of the serialized
+// coinbase, so take the LAST occurrence of the magic bytes.
+fn extract_tag(raw: &[u8]) -> Option<[u8; 32]> {
+    let mut position = None;
+    let mut i = 0usize;
+    while i + TAG_MAGIC.len() <= raw.len() {
+        if &raw[i..i + TAG_MAGIC.len()] == TAG_MAGIC {
+            position = Some(i);
+        }
+        i += 1;
+    }
+    let start = position? + TAG_MAGIC.len();
+    if start + 32 > raw.len() {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw[start..start + 32]);
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// redb caching
+
+#[derive(Clone)]
+struct Record {
+    hash: String,
+    timestamp: u64,
+    fetched: bool,
+    tag: Option<[u8; 32]>,
+}
+
+fn load_range(database: &Database, start: u64, end: u64) -> Result<HashMap<u64, Record>> {
+    let mut out = HashMap::new();
+    let transaction = database.begin_read()?;
+    let table = transaction.open_table(EPOCH_BLOCK_TABLE)?;
+    for entry in table.range(start..=end)? {
+        let (key, value) = entry?;
+        let height = key.value();
+        let bytes = value.value();
+        if bytes.len() < 41 {
+            bail!("corrupt epoch record at {height}");
+        }
+        let hash = hex::encode(&bytes[0..32]);
+        let timestamp = u64::from_be_bytes(bytes[32..40].try_into().context("ts")?);
+        let flags = bytes[40];
+        let fetched = flags & 1 != 0;
+        let tag = if flags & 2 != 0 {
+            let mut tag = [0u8; 32];
+            tag.copy_from_slice(&bytes[41..73]);
+            Some(tag)
+        } else {
+            None
+        };
+        if height >= start && height <= end {
+            out.insert(
+                height,
+                Record {
+                    hash,
+                    timestamp,
+                    fetched,
+                    tag,
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
+fn store_range(database: &Database, records: &HashMap<u64, Record>) -> Result<()> {
+    let transaction = database.begin_write()?;
+    {
+        let mut table = transaction.open_table(EPOCH_BLOCK_TABLE)?;
+        let mut entries: Vec<(u64, &Record)> = records.iter().map(|(h, r)| (*h, r)).collect();
+        entries.sort_unstable_by_key(|(h, _)| *h);
+        for (height, record) in entries {
+            let hash = hex::decode(&record.hash).context("decoding stored hash")?;
+            if hash.len() != 32 {
+                // Legacy/unknown hash: store zeros rather than corrupting.
+                let mut bytes = Vec::with_capacity(73);
+                bytes.extend_from_slice(&[0u8; 32]);
+                bytes.extend_from_slice(&record.timestamp.to_be_bytes());
+                let mut flags = 0u8;
+                if record.fetched {
+                    flags |= 1;
+                }
+                if let Some(tag) = &record.tag {
+                    flags |= 2;
+                    bytes.push(flags);
+                    bytes.extend_from_slice(tag);
+                } else {
+                    bytes.push(flags);
+                    bytes.extend_from_slice(&[0u8; 32]);
+                }
+                table.insert(height, &bytes[..])?;
+                continue;
+            }
+            let mut bytes = Vec::with_capacity(73);
+            bytes.extend_from_slice(&hash);
+            bytes.extend_from_slice(&record.timestamp.to_be_bytes());
+            let mut flags = 0u8;
+            if record.fetched {
+                flags |= 1;
+            }
+            if let Some(tag) = &record.tag {
+                flags |= 2;
+                bytes.push(flags);
+                bytes.extend_from_slice(tag);
+            } else {
+                bytes.push(flags);
+                bytes.extend_from_slice(&[0u8; 32]);
+            }
+            table.insert(height, &bytes[..])?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Table output
+
+fn print_table(rows: &mut [Row]) {
+    enum Cell {
+        Single(String),
+        Multi(Vec<String>),
+    }
+
+    rows.sort_unstable_by_key(|r| r.height);
+
+    let mut table: Vec<Vec<Cell>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let timestamp = format!("{:<10}  {}", row.timestamp, utc(row.timestamp));
+        let (bn, prefix, cpv, nu) = match &row.tag {
+            None => (
+                String::from("-"),
+                String::from("-"),
+                String::from("-"),
+                String::from("-"),
+            ),
+            Some(tag) => {
+                let bn = tag.block_number.to_string();
+                let prefix = format!("0x{}", hex::encode(tag.prefix));
+                let nu = format!("{}", tag.recent_uncles);
+                let cpv: Vec<String> = tag
+                    .cpv
+                    .iter()
+                    .enumerate()
+                    .map(|(j, (height, byte))| format!("j{j}: rsk#{height}=0x{byte:02x}"))
+                    .collect();
+                (bn, prefix, cpv.join(", "), nu)
+            }
+        };
+        table.push(vec![
+            Cell::Single(row.height.to_string()),
+            Cell::Single(bn),
+            Cell::Single(prefix),
+            Cell::Single(nu),
+            Cell::Multi(cpv.split(", ").map(|s| s.to_string()).collect()),
+            Cell::Single(timestamp),
+        ]);
+    }
+
+    let headers = [
+        "btc block",
+        "RSK BN",
+        "RSK prefix (20B)",
+        "NU",
+        "RSK CPV (rsk#ht=claimed LSB)",
+        "btc timestamp",
+    ];
+
+    // Widths are the tallest cell or header per column.
+    let mut col_widths = [0usize; 6];
+    for (col, header) in headers.iter().enumerate() {
+        col_widths[col] = header.len();
+    }
+    for row_cells in &table {
+        for (col, cell) in row_cells.iter().enumerate() {
+            let text = match cell {
+                Cell::Single(s) => vec![s.clone()],
+                Cell::Multi(lines) => lines.clone(),
+            };
+            for line in text {
+                col_widths[col] = col_widths[col].max(line.len());
+            }
+        }
+    }
+
+    println!();
+    {
+        let mut line = String::new();
+        for (i, (header, width)) in headers.iter().zip(col_widths.iter()).enumerate() {
+            if i > 0 {
+                line.push_str("  ");
+            }
+            line.push_str(&format!("{header:<width$}"));
+        }
+        println!("{line}");
+        let mut sep = String::new();
+        for (i, width) in col_widths.iter().enumerate() {
+            if i > 0 {
+                sep.push_str("  ");
+            }
+            sep.push_str(&"-".repeat(*width));
+        }
+        println!("{sep}");
+    }
+
+    for row_cells in &table {
+        let line_count = row_cells
+            .iter()
+            .map(|cell| match cell {
+                Cell::Single(_) => 1,
+                Cell::Multi(lines) => lines.len(),
+            })
+            .max()
+            .unwrap_or(1);
+        for line_idx in 0..line_count {
+            let mut out = String::new();
+            for (col, cell) in row_cells.iter().enumerate() {
+                let value = match cell {
+                    Cell::Single(s) => {
+                        if line_idx == 0 {
+                            s.clone()
+                        } else {
+                            String::new()
+                        }
+                    }
+                    Cell::Multi(lines) => lines.get(line_idx).cloned().unwrap_or_default(),
+                };
+                if col > 0 {
+                    out.push_str("  ");
+                }
+                if col == 4 {
+                    let fill = col_widths[col].saturating_sub(value.len());
+                    out.push_str(&value);
+                    out.push_str(&" ".repeat(fill));
+                } else {
+                    out.push_str(&format!("{value:<width$}", width = col_widths[col]));
+                }
+            }
+            println!("{out}");
+        }
+    }
+    println!();
+}
+
+fn utc(unix_seconds: u64) -> String {
+    chrono::DateTime::from_timestamp(unix_seconds as i64, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
