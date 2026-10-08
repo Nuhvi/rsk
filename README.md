@@ -15,10 +15,20 @@ notes on next steps.
   validated), starting from a difficulty-period checkpoint.
 - RSK headers + merge-mining data sync from an RSK **JSON-RPC** endpoint
   (backward/forward walk) into redb.
-- **Next milestone (M1):** vendored `rsk-consensus` + `rsk-p2p` crates (from
-  rustock, MIT) and a working example that connects to a mainnet bootnode,
-  completes the RLPx / `rsk/62` handshake, and reads the peer's status — the
-  first step toward P2P header sync.
+- **Milestone 1 done:** `rsk-consensus` (vendored from rustock) provides the full
+  RSK header type + `HeaderVerifier` consensus rules + the cumulative-difficulty
+  checkpoint gate; `rsk-p2p` (vendored from rustock) provides the RLPx / devp2p /
+  `rsk/62` stack, the rsk subprotocol messages and UDP discovery. The
+  `connect` example dials a real mainnet bootnode, verifies genesis and prints
+  the peer's status — the first step toward P2P header sync:
+
+  ```sh
+  cargo run -p rsk-p2p --example connect -- --host bootstrap12.rsk.co:5050
+  # … peer status: block 9307795, td 61329131479833386325493975807 …
+  ```
+
+- **Next (M2):** port rustock's skeleton `HeaderWalk` as `rsk-sync` to pull
+  headers over P2P into redb.
 
 ## Project Structure
 
@@ -28,8 +38,8 @@ crates/
   rsk-store/     — Persistent storage for Bitcoin and RSK headers (redb). Shared between node and client.
   rsk-node/      — Binary crate (header sync orchestration, Electrum + RSK RPC)
   bitcoin-spv/   — Bitcoin SPV helpers + difficulty-period checkpoint dump
-  rsk-consensus/ — [planned] vendored rustock consensus: Header, HeaderVerifier, ChainConfig, checkpoint
-  rsk-p2p/       — [planned] vendored rustock RLPx networking + rsk subprotocol
+  rsk-consensus/ — vendored rustock consensus: Header, HeaderVerifier, ChainConfig, checkpoint (88 tests)
+  rsk-p2p/       — vendored rustock RLPx networking + rsk subprotocol + discovery (80 tests)
 ```
 
 ### `rsk-store` (library, usable by both node and client)

@@ -48,18 +48,39 @@ the descendant downloads; the chunks are trusted only because they **link**
 - [x] `docs/ROADMAP.md` — this file.
 - [x] README updated to point at the new direction.
 
-### M1 — Vendored P2P + connect example (next)
-- [ ] `crates/rsk-consensus` — vendor rustock-core subset (Header,
-  HeaderVerifier, ChainConfig, checkpoint), drop the `trie` dep. Port its tests.
-- [ ] `crates/rsk-p2p` — vendor rustock-networking subset (RLPx ecies/frame/
-  handshake, devp2p Hello, rsk subprotocol messages), trimmed for a light client
-  (no tx relay, no body/snap serving, no scoring at first).
-- [ ] Example/phase: **connect** — resolve a mainnet bootnode
-  (`bootstrap01.rsk.co:5050`), RLPx handshake, `Hello` with `rsk/62`, exchange
-  `Status`, verify the peer's genesis hash is mainnet
-  (`0xf88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0`),
-  ping/pong for a while, print `{best_block_number, best_block_hash,
-  total_difficulty}`.
+### M1 — Vendored P2P + connect example (done ✅)
+- [x] `crates/rsk-consensus` — vendored rustock-core subset (`Header`,
+  `HeaderVerifier` + all rules, `ChainConfig`, `DifficultyCheckpoint` gate,
+  `Block`/`Transaction`), `trie` dep dropped. 88 vendored tests pass
+  (genesis hashes, RSKIP92 header hashing vs real mainnet blocks, merged-mining
+  PoW, checkpoint ceiling/refusal on real sampled chain).
+- [x] `crates/rsk-p2p` — vendored rustock-networking subset: RLPx
+  (`ecies`/`frame`/`handshake`/`codec`, EIP-8, multi-frame chunking), devp2p
+  `Hello`/`Ping`/`Pong`, `eth`+`rsk` subprotocol messages, and the UDP
+  discovery `Ping`/`Pong`/`FindNode`/`Neighbors` packets. Trimmed to a light
+  client (no tx relay, no body/snap serving, no scoring). 80 vendored tests
+  pass, incl. a full local RLPx initiator↔responder handshake.
+- [x] Example: `crates/rsk-p2p/examples/connect.rs` — resolves a bootnode,
+  learns its node ID via a signed UDP discovery ping (bootnode DNS entries
+  carry no pubkey), then does RLPx + `rsk/62` handshake, verifies the peer's
+  genesis hash against mainnet, prints
+  `{best_block_number, best_block_hash, total_difficulty}` and proves the
+  session with a Ping/Pong and `NewBlockHashes`.
+
+  Verified against live mainnet (bootnode 12):
+  ```text
+  discovered node id: 0x81471846e79afde2…
+  connected to peer:  0x81471846e79afde2…
+  negotiated:         rsk/62 (snap: false)
+  peer status:        block 9307795 0x237c0f22f7ec1e24…
+  peer total difficulty:  61329131479833386325493975807
+  got Pong ✓
+  NewBlockHashes: …  block 9307796
+  ```
+
+  Note: not every bootnode answers UDP discovery (several were silent on a
+  first try); `bootstrap12.rsk.co` responded reliably. A real client should
+  try the whole bootnode list and rotate.
 - [ ] Wire as a `--p2p` mode or probe command in `rsk-node`.
 
 ### M2 — Parallel header walk into redb
