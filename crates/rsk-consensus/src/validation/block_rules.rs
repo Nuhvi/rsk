@@ -162,7 +162,11 @@ impl PrevMinGasPriceRule {
 }
 
 impl ParentHeaderValidator for PrevMinGasPriceRule {
-    fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
+    fn validate_with_parent(
+        &self,
+        header: &Header,
+        parent: &Header,
+    ) -> Result<(), ValidationError> {
         if header.number == 0 {
             return Ok(());
         }
@@ -242,7 +246,11 @@ mod tests {
     fn block_at(number: u64, min_gas_price: u64, txs: Vec<Transaction>) -> Block {
         let mut header = bare_header(number);
         header.minimum_gas_price = U256::from(min_gas_price);
-        Block { header, transactions: txs, ommers: vec![] }
+        Block {
+            header,
+            transactions: txs,
+            ommers: vec![],
+        }
     }
 
     /// rskj `TxsMinGasPriceRule`.
@@ -265,7 +273,9 @@ mod tests {
     /// rskj `BlockTxsMaxGasPriceRule` + `TxGasPriceCap.FOR_BLOCK` (RSKIP252).
     #[test]
     fn block_txs_max_gas_price_enforces_the_100x_cap_from_rskip252() {
-        let rule = BlockTxsMaxGasPriceRule { rskip252_height: 5_468_000 };
+        let rule = BlockTxsMaxGasPriceRule {
+            rskip252_height: 5_468_000,
+        };
 
         // At the cap exactly: allowed (`compareTo(cap) > 0`).
         let at_cap = block_at(9_000_000, 100, vec![user_tx(10_000), remasc_tx()]);

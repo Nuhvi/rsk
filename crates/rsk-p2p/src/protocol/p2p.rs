@@ -1,7 +1,7 @@
-use alloy_rlp::{RlpDecodable, RlpEncodable};
-use alloy_primitives::{B512, Bytes};
 use crate::protocol::eth::EthStatus;
 use crate::protocol::rsk::RskMessage;
+use alloy_primitives::{Bytes, B512};
+use alloy_rlp::{RlpDecodable, RlpEncodable};
 
 #[derive(Debug, Clone, RlpEncodable, RlpDecodable)]
 pub struct HelloMessage {
@@ -39,11 +39,11 @@ impl P2pMessage {
     pub const PONG_ID: u8 = 0x03;
     pub const GET_PEERS_ID: u8 = 0x04;
     pub const PEERS_ID: u8 = 0x05;
-    
+
     pub const SUB_PROTOCOL_OFFSET: u8 = 0x10;
 }
 
-use alloy_rlp::{Encodable, Decodable};
+use alloy_rlp::{Decodable, Encodable};
 
 impl Encodable for P2pMessage {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
@@ -58,15 +58,27 @@ impl Encodable for P2pMessage {
             }
             P2pMessage::Ping => {
                 out.put_u8(Self::PING_ID);
-                alloy_rlp::Header { list: true, payload_length: 0 }.encode(out);
+                alloy_rlp::Header {
+                    list: true,
+                    payload_length: 0,
+                }
+                .encode(out);
             }
             P2pMessage::Pong => {
                 out.put_u8(Self::PONG_ID);
-                alloy_rlp::Header { list: true, payload_length: 0 }.encode(out);
+                alloy_rlp::Header {
+                    list: true,
+                    payload_length: 0,
+                }
+                .encode(out);
             }
             P2pMessage::GetPeers => {
                 out.put_u8(Self::GET_PEERS_ID);
-                alloy_rlp::Header { list: true, payload_length: 0 }.encode(out);
+                alloy_rlp::Header {
+                    list: true,
+                    payload_length: 0,
+                }
+                .encode(out);
             }
             P2pMessage::Peers(peers) => {
                 out.put_u8(Self::PEERS_ID);
@@ -107,7 +119,9 @@ impl Decodable for P2pMessage {
             Self::HELLO_ID => Ok(P2pMessage::Hello(HelloMessage::decode(buf)?)),
             Self::DISCONNECT_ID => {
                 let reasons: Vec<u64> = Vec::decode(buf)?;
-                Ok(P2pMessage::Disconnect(reasons.first().cloned().unwrap_or(0)))
+                Ok(P2pMessage::Disconnect(
+                    reasons.first().cloned().unwrap_or(0),
+                ))
             }
             Self::PING_ID => {
                 let _ = alloy_rlp::Header::decode(buf)?;
@@ -122,7 +136,7 @@ impl Decodable for P2pMessage {
                 Ok(P2pMessage::GetPeers)
             }
             Self::PEERS_ID => Ok(P2pMessage::Peers(Vec::<PeerInfo>::decode(buf)?)),
-            
+
             // Sub-protocol range
             code if code >= Self::SUB_PROTOCOL_OFFSET => {
                 let sub_id = code - Self::SUB_PROTOCOL_OFFSET;
@@ -132,7 +146,7 @@ impl Decodable for P2pMessage {
                     _ => Err(alloy_rlp::Error::Custom("Unknown sub-protocol message ID")),
                 }
             }
-            
+
             _ => Err(alloy_rlp::Error::Custom("Unknown message ID")),
         }
     }

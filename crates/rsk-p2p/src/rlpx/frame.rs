@@ -1,11 +1,11 @@
-use anyhow::{Result};
-use aes::Aes256;
-use aes::cipher::{BlockEncrypt, KeyInit, KeyIvInit, StreamCipher};
-use sha3::{Keccak256, Digest};
-use bytes::{BytesMut, Buf};
-use alloy_rlp::{Encodable, Decodable};
-use alloy_primitives::{B256};
 use crate::rlpx::ecies::RLPxSecrets;
+use aes::cipher::{BlockEncrypt, KeyInit, KeyIvInit, StreamCipher};
+use aes::Aes256;
+use alloy_primitives::B256;
+use alloy_rlp::{Decodable, Encodable};
+use anyhow::Result;
+use bytes::{Buf, BytesMut};
+use sha3::{Digest, Keccak256};
 
 type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 
@@ -28,7 +28,10 @@ enum FrameType {
     /// Normal single-frame message: header-data = rlp([0])
     Normal,
     /// First frame of a chunked message: header-data = rlp([0, contextId, totalFrameSize])
-    ChunkedFirst { _context_id: usize, total_size: usize },
+    ChunkedFirst {
+        _context_id: usize,
+        total_size: usize,
+    },
     /// Continuation frame: header-data = rlp([0, contextId])
     ChunkedContinuation { _context_id: usize },
 }
@@ -54,7 +57,7 @@ impl FrameCodec {
         let iv = [0u8; 16];
         let enc = Aes256Ctr::new(&secrets.aes.0.into(), &iv.into());
         let dec = Aes256Ctr::new(&secrets.aes.0.into(), &iv.into());
-        
+
         Self {
             enc,
             dec,
@@ -74,21 +77,22 @@ impl FrameCodec {
     pub fn encode_frame(&mut self, protocol_id: u8, payload: &[u8]) -> Result<Vec<u8>> {
         let mut header_data = Vec::new();
         alloy_rlp::encode_list(&[0u8], &mut header_data);
-        
+
         let mut head_buffer = [0u8; 32];
         let mut proto_rlp = Vec::new();
         protocol_id.encode(&mut proto_rlp);
         let actual_total_size = payload.len() + proto_rlp.len();
-        
+
         head_buffer[0] = (actual_total_size >> 16) as u8;
         head_buffer[1] = (actual_total_size >> 8) as u8;
         head_buffer[2] = actual_total_size as u8;
-        
-        head_buffer[3..3+header_data.len()].copy_from_slice(&header_data);
+
+        head_buffer[3..3 + header_data.len()].copy_from_slice(&header_data);
 
         self.enc.apply_keystream(&mut head_buffer[0..16]);
 
-        let mac = Self::update_mac_static(&self.mac_secret, &mut self.egress_mac, &head_buffer[0..16])?;
+        let mac =
+            Self::update_mac_static(&self.mac_secret, &mut self.egress_mac, &head_buffer[0..16])?;
         head_buffer[16..32].copy_from_slice(&mac[0..16]);
 
         let mut out = Vec::with_capacity(32 + actual_total_size + 16 + 16);
@@ -97,7 +101,7 @@ impl FrameCodec {
         let mut body = Vec::new();
         body.extend_from_slice(&proto_rlp);
         body.extend_from_slice(payload);
-        
+
         let padding = 16 - (body.len() % 16);
         let actual_padding = if padding == 16 { 0 } else { padding };
         if actual_padding > 0 {
@@ -105,11 +109,12 @@ impl FrameCodec {
         }
 
         self.enc.apply_keystream(&mut body);
-        
+
         self.egress_mac.update(&body);
         let fmac_seed = Self::do_sum_static(&self.egress_mac);
-        let fmac = Self::update_mac_static(&self.mac_secret, &mut self.egress_mac, &fmac_seed[0..16])?;
-        
+        let fmac =
+            Self::update_mac_static(&self.mac_secret, &mut self.egress_mac, &fmac_seed[0..16])?;
+
         out.extend_from_slice(&body);
         out.extend_from_slice(&fmac[0..16]);
 
@@ -125,13 +130,19 @@ impl FrameCodec {
             let mut head_buffer = [0u8; 32];
             head_buffer.copy_from_slice(&src[0..32]);
 
-            let expected_mac = Self::update_mac_static(&self.mac_secret, &mut self.ingress_mac, &head_buffer[0..16])?;
+            let expected_mac = Self::update_mac_static(
+                &self.mac_secret,
+                &mut self.ingress_mac,
+                &head_buffer[0..16],
+            )?;
             if head_buffer[16..32] != expected_mac[0..16] {
                 return Err(anyhow::anyhow!("RLPx Header MAC mismatch"));
             }
 
             self.dec.apply_keystream(&mut head_buffer[0..16]);
-            self.total_body_size = ((head_buffer[0] as usize) << 16) | ((head_buffer[1] as usize) << 8) | (head_buffer[2] as usize);
+            self.total_body_size = ((head_buffer[0] as usize) << 16)
+                | ((head_buffer[1] as usize) << 8)
+                | (head_buffer[2] as usize);
             self.current_frame_type = Self::parse_header_data(&head_buffer[3..16]);
             self.is_head_read = true;
             src.advance(32);
@@ -140,7 +151,7 @@ impl FrameCodec {
         let padding = 16 - (self.total_body_size % 16);
         let actual_padding = if padding == 16 { 0 } else { padding };
         let body_and_mac_size = self.total_body_size + actual_padding + 16;
-        
+
         if src.len() < body_and_mac_size {
             return Ok(None);
         }
@@ -150,8 +161,9 @@ impl FrameCodec {
 
         self.ingress_mac.update(&body);
         let fmac_seed = Self::do_sum_static(&self.ingress_mac);
-        let fmac = Self::update_mac_static(&self.mac_secret, &mut self.ingress_mac, &fmac_seed[0..16])?;
-        
+        let fmac =
+            Self::update_mac_static(&self.mac_secret, &mut self.ingress_mac, &fmac_seed[0..16])?;
+
         if provided_fmac != fmac[0..16] {
             return Err(anyhow::anyhow!("RLPx Frame MAC mismatch"));
         }
@@ -257,7 +269,9 @@ impl FrameCodec {
     ///   Chunked-N:    rlp([0, contextId])                — 2 elements
     fn parse_header_data(data: &[u8]) -> FrameType {
         // data is bytes 3..16 of the decrypted header (with zero padding)
-        if data.is_empty() { return FrameType::Normal; }
+        if data.is_empty() {
+            return FrameType::Normal;
+        }
 
         // Decode outer RLP list header
         let prefix = data[0];
@@ -270,9 +284,13 @@ impl FrameCodec {
             (1usize, (prefix - 0xc0) as usize)
         } else {
             let ll = (prefix - 0xf7) as usize;
-            if data.len() < 1 + ll { return FrameType::Normal; }
+            if data.len() < 1 + ll {
+                return FrameType::Normal;
+            }
             let mut len: usize = 0;
-            for i in 0..ll { len = (len << 8) | (data[1 + i] as usize); }
+            for i in 0..ll {
+                len = (len << 8) | (data[1 + i] as usize);
+            }
             (1 + ll, len)
         };
 
@@ -294,9 +312,13 @@ impl FrameCodec {
             } else if b <= 0xb7 {
                 // Short string encoding for larger integers
                 let slen = (b - 0x80) as usize;
-                if pos + 1 + slen > list_data.len() { break; }
+                if pos + 1 + slen > list_data.len() {
+                    break;
+                }
                 let mut val: usize = 0;
-                for i in 0..slen { val = (val << 8) | (list_data[pos + 1 + i] as usize); }
+                for i in 0..slen {
+                    val = (val << 8) | (list_data[pos + 1 + i] as usize);
+                }
                 elems.push(val);
                 pos += 1 + slen;
             } else {
@@ -305,8 +327,13 @@ impl FrameCodec {
         }
 
         match elems.len() {
-            3 => FrameType::ChunkedFirst { _context_id: elems[1], total_size: elems[2] },
-            2 => FrameType::ChunkedContinuation { _context_id: elems[1] },
+            3 => FrameType::ChunkedFirst {
+                _context_id: elems[1],
+                total_size: elems[2],
+            },
+            2 => FrameType::ChunkedContinuation {
+                _context_id: elems[1],
+            },
             _ => FrameType::Normal,
         }
     }
@@ -314,13 +341,13 @@ impl FrameCodec {
     fn update_mac_static(mac_secret: &B256, mac: &mut Keccak256, seed: &[u8]) -> Result<[u8; 32]> {
         let mut aes_block = Self::do_sum_static(mac);
         let cipher = Aes256::new(&mac_secret.0.into());
-        
-        // RLPx updateMac uses only 16 bytes for the block encryption? 
+
+        // RLPx updateMac uses only 16 bytes for the block encryption?
         // No, Aes256 uses 16 byte blocks.
         let mut block = [0u8; 16];
         block.copy_from_slice(&aes_block[0..16]);
         cipher.encrypt_block((&mut block).into());
-        
+
         for i in 0..16 {
             aes_block[i] = block[i] ^ seed[i];
         }
@@ -350,7 +377,10 @@ mod tests {
     }
 
     fn make_codec_pair() -> (FrameCodec, FrameCodec) {
-        (FrameCodec::new(make_secrets()), FrameCodec::new(make_secrets()))
+        (
+            FrameCodec::new(make_secrets()),
+            FrameCodec::new(make_secrets()),
+        )
     }
 
     // ---- parse_header_data tests ----
@@ -362,7 +392,10 @@ mod tests {
         let mut data = [0u8; 13];
         data[0] = 0xc1;
         data[1] = 0x80;
-        assert!(matches!(FrameCodec::parse_header_data(&data), FrameType::Normal));
+        assert!(matches!(
+            FrameCodec::parse_header_data(&data),
+            FrameType::Normal
+        ));
     }
 
     #[test]
@@ -376,7 +409,10 @@ mod tests {
         data[2] = 0x01; // int 1
         data[3] = 0x64; // int 100
         match FrameCodec::parse_header_data(&data) {
-            FrameType::ChunkedFirst { _context_id, total_size } => {
+            FrameType::ChunkedFirst {
+                _context_id,
+                total_size,
+            } => {
                 assert_eq!(_context_id, 1);
                 assert_eq!(total_size, 100);
             }
@@ -399,7 +435,10 @@ mod tests {
         data[5] = 0xAB;
         data[6] = 0x2B;
         match FrameCodec::parse_header_data(&data) {
-            FrameType::ChunkedFirst { _context_id, total_size } => {
+            FrameType::ChunkedFirst {
+                _context_id,
+                total_size,
+            } => {
                 assert_eq!(_context_id, 5);
                 assert_eq!(total_size, 109355);
             }
@@ -426,14 +465,20 @@ mod tests {
 
     #[test]
     fn test_parse_header_data_empty() {
-        assert!(matches!(FrameCodec::parse_header_data(&[]), FrameType::Normal));
+        assert!(matches!(
+            FrameCodec::parse_header_data(&[]),
+            FrameType::Normal
+        ));
     }
 
     #[test]
     fn test_parse_header_data_not_a_list() {
         // A string prefix instead of a list — should fall back to Normal
         let data = [0x83, 0x01, 0x02, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert!(matches!(FrameCodec::parse_header_data(&data), FrameType::Normal));
+        assert!(matches!(
+            FrameCodec::parse_header_data(&data),
+            FrameType::Normal
+        ));
     }
 
     // ---- Normal single-frame roundtrip ----
@@ -444,10 +489,10 @@ mod tests {
 
         let protocol_id = 0x01;
         let payload = b"Hello RLPx Frame!";
-        
+
         let encoded = encoder.encode_frame(protocol_id, payload).unwrap();
         let mut src = BytesMut::from(&encoded[..]);
-        
+
         let decoded = decoder.decode_frame(&mut src).unwrap().unwrap();
         assert_eq!(decoded.0, protocol_id);
         assert_eq!(decoded.1, payload);
@@ -478,7 +523,12 @@ mod tests {
         head_buffer[3..3 + hd_len].copy_from_slice(&header_data[..hd_len]);
 
         codec.enc.apply_keystream(&mut head_buffer[0..16]);
-        let mac = FrameCodec::update_mac_static(&codec.mac_secret, &mut codec.egress_mac, &head_buffer[0..16]).unwrap();
+        let mac = FrameCodec::update_mac_static(
+            &codec.mac_secret,
+            &mut codec.egress_mac,
+            &head_buffer[0..16],
+        )
+        .unwrap();
         head_buffer[16..32].copy_from_slice(&mac[0..16]);
 
         let mut body = Vec::new();
@@ -492,7 +542,12 @@ mod tests {
         codec.enc.apply_keystream(&mut body);
         codec.egress_mac.update(&body);
         let fmac_seed = FrameCodec::do_sum_static(&codec.egress_mac);
-        let fmac = FrameCodec::update_mac_static(&codec.mac_secret, &mut codec.egress_mac, &fmac_seed[0..16]).unwrap();
+        let fmac = FrameCodec::update_mac_static(
+            &codec.mac_secret,
+            &mut codec.egress_mac,
+            &fmac_seed[0..16],
+        )
+        .unwrap();
 
         let mut out = Vec::new();
         out.extend_from_slice(&head_buffer);
@@ -513,11 +568,15 @@ mod tests {
     fn header_data_chunked_first(context_id: u8, total_frame_size: usize) -> Vec<u8> {
         // Manually build: list([encode_int(0), encode_int(ctx), encode_int(total)])
         let mut elems = Vec::new();
-        0u8.encode(&mut elems);  // RLP for 0 → 0x80
+        0u8.encode(&mut elems); // RLP for 0 → 0x80
         context_id.encode(&mut elems);
         (total_frame_size as u64).encode(&mut elems);
         let mut out = Vec::new();
-        alloy_rlp::Header { list: true, payload_length: elems.len() }.encode(&mut out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: elems.len(),
+        }
+        .encode(&mut out);
         out.extend_from_slice(&elems);
         out
     }
@@ -528,7 +587,11 @@ mod tests {
         0u8.encode(&mut elems);
         context_id.encode(&mut elems);
         let mut out = Vec::new();
-        alloy_rlp::Header { list: true, payload_length: elems.len() }.encode(&mut out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: elems.len(),
+        }
+        .encode(&mut out);
         out.extend_from_slice(&elems);
         out
     }
@@ -672,7 +735,8 @@ mod tests {
 
         // Now a normal frame
         let normal_payload = b"normal message";
-        let normal_frame = encode_java_frame(&mut encoder, 0x01, normal_payload, &header_data_normal());
+        let normal_frame =
+            encode_java_frame(&mut encoder, 0x01, normal_payload, &header_data_normal());
 
         let mut src = BytesMut::new();
         src.extend_from_slice(&frame1);

@@ -253,10 +253,16 @@ pub struct CheckpointDefence {
 
 impl CheckpointDefence {
     /// Neither switch: the node makes no use of a checkpoint.
-    pub const NONE: Self = Self { verify_hash: false, bound_work: false };
+    pub const NONE: Self = Self {
+        verify_hash: false,
+        bound_work: false,
+    };
 
     /// Both switches.
-    pub const FULL: Self = Self { verify_hash: true, bound_work: true };
+    pub const FULL: Self = Self {
+        verify_hash: true,
+        bound_work: true,
+    };
 
     /// Whether anything at all is enabled.
     pub fn any(&self) -> bool {
@@ -359,12 +365,21 @@ pub fn uncle_allowance_per_mille(samples: &[Sample]) -> u64 {
     }
 
     // Everything in thousandths, so the arithmetic stays in integers.
-    let counts: Vec<u128> = samples.iter().map(|s| s.uncle_count as u128 * 1_000).collect();
+    let counts: Vec<u128> = samples
+        .iter()
+        .map(|s| s.uncle_count as u128 * 1_000)
+        .collect();
     let total: u128 = counts.iter().sum();
     let mean = total / k;
 
     // Unbiased sample variance, in (thousandths)^2.
-    let ss: u128 = counts.iter().map(|&c| { let d = c.abs_diff(mean); d * d }).sum();
+    let ss: u128 = counts
+        .iter()
+        .map(|&c| {
+            let d = c.abs_diff(mean);
+            d * d
+        })
+        .sum();
     let variance = ss / (k - 1);
 
     let l = LN_3_OVER_DELTA_PER_MILLE;
@@ -376,7 +391,9 @@ pub fn uncle_allowance_per_mille(samples: &[Sample]) -> u64 {
     // 3 * R * L / k, with R in thousandths.
     let range_term = 3 * (UNCLE_LIST_LIMIT as u128 * 1_000) * l / (1_000 * k);
 
-    let uncles = mean.saturating_add(variance_term).saturating_add(range_term);
+    let uncles = mean
+        .saturating_add(variance_term)
+        .saturating_add(range_term);
     (1_000u128 + uncles).min(cap as u128) as u64
 }
 
@@ -409,9 +426,8 @@ pub fn ceiling_for(
     min_difficulty: U256,
 ) -> U256 {
     let allowance = uncle_allowance_per_mille(samples);
-    let scale = |work: U256| -> U256 {
-        work.saturating_mul(U256::from(allowance)) / U256::from(1_000u64)
-    };
+    let scale =
+        |work: U256| -> U256 { work.saturating_mul(U256::from(allowance)) / U256::from(1_000u64) };
     let mut total = checkpoint.cumulative_difficulty;
     let mut at = checkpoint.number;
     let mut difficulty = checkpoint.difficulty;
@@ -550,7 +566,11 @@ mod tests {
     #[test]
     fn a_claim_above_the_ceiling_is_refused() {
         let cp = MAINNET_CHECKPOINT;
-        let samples = [Sample { number: cp.number + 768, difficulty: cp.difficulty, uncle_count: 0 }];
+        let samples = [Sample {
+            number: cp.number + 768,
+            difficulty: cp.difficulty,
+            uncle_count: 0,
+        }];
         let head = cp.number + 768;
         let ceiling = ceiling_for(&cp, &samples, head, DIV, MIN);
 
@@ -568,8 +588,13 @@ mod tests {
     #[test]
     fn a_wildly_inflated_claim_is_refused() {
         let cp = MAINNET_CHECKPOINT;
-        let samples: Vec<Sample> =
-            (1..=341).map(|i| Sample { number: cp.number + i * 768, difficulty: cp.difficulty, uncle_count: 0 }).collect();
+        let samples: Vec<Sample> = (1..=341)
+            .map(|i| Sample {
+                number: cp.number + i * 768,
+                difficulty: cp.difficulty,
+                uncle_count: 0,
+            })
+            .collect();
         let head = cp.number + 341 * 768;
         let absurd = cp.cumulative_difficulty * U256::from(1000u64);
         match judge(&cp, absurd, &samples, head, DIV, MIN) {
@@ -584,8 +609,13 @@ mod tests {
     fn an_honest_flat_chain_passes() {
         let cp = MAINNET_CHECKPOINT;
         let n = 341u64;
-        let samples: Vec<Sample> =
-            (1..=n).map(|i| Sample { number: cp.number + i * 768, difficulty: cp.difficulty, uncle_count: 0 }).collect();
+        let samples: Vec<Sample> = (1..=n)
+            .map(|i| Sample {
+                number: cp.number + i * 768,
+                difficulty: cp.difficulty,
+                uncle_count: 0,
+            })
+            .collect();
         let head = cp.number + n * 768;
         let honest = cp.cumulative_difficulty + cp.difficulty * U256::from(n * 768);
         match judge(&cp, honest, &samples, head, DIV, MIN) {
@@ -1049,7 +1079,12 @@ mod real_chain_tests {
     #[test]
     fn an_honest_peer_on_the_real_chain_is_plausible() {
         let verdict = judge(
-            &MAINNET_CHECKPOINT, parse(REAL_TD_AT_HEAD), &samples(), HEAD, DIV, MIN,
+            &MAINNET_CHECKPOINT,
+            parse(REAL_TD_AT_HEAD),
+            &samples(),
+            HEAD,
+            DIV,
+            MIN,
         );
         assert!(
             matches!(verdict, CheckpointVerdict::Plausible { .. }),
@@ -1177,7 +1212,10 @@ mod real_chain_tests {
     #[test]
     fn the_real_chain_does_not_contradict_the_checkpoint() {
         assert_eq!(
-            audit_own_chain(&MAINNET_CHECKPOINT, MAINNET_CHECKPOINT.cumulative_difficulty),
+            audit_own_chain(
+                &MAINNET_CHECKPOINT,
+                MAINNET_CHECKPOINT.cumulative_difficulty
+            ),
             None
         );
     }

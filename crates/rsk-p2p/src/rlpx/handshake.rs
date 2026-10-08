@@ -1,12 +1,12 @@
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use anyhow::{Result};
+use crate::config::NodeConfig;
 use crate::rlpx::ecies::{AuthInitiate, AuthResponse, ECIES};
 use crate::rlpx::frame::FrameCodec;
-use crate::config::NodeConfig;
-use k256::SecretKey;
-use alloy_rlp::{Encodable, Decodable};
 use alloy_primitives::{B256, B512};
+use alloy_rlp::{Decodable, Encodable};
+use anyhow::Result;
+use k256::SecretKey;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 pub struct RLPxHandshake {
     stream: TcpStream,
@@ -16,7 +16,11 @@ pub struct RLPxHandshake {
 
 impl RLPxHandshake {
     pub fn new(stream: TcpStream, config: NodeConfig, remote_pk: B512) -> Self {
-        Self { stream, config, remote_pk }
+        Self {
+            stream,
+            config,
+            remote_pk,
+        }
     }
 
     pub async fn run_initiator(mut self) -> Result<(B512, FrameCodec, TcpStream)> {
@@ -34,7 +38,7 @@ impl RLPxHandshake {
         let auth_init = AuthInitiate::new(&my_sk, &self.remote_pk, &my_ephemeral_sk, my_nonce)?;
         let mut auth_init_rlp = Vec::new();
         auth_init.encode(&mut auth_init_rlp);
-        
+
         // Pad for EIP-8 Distinguishability (100-300 bytes)
         let pad_len = (rng.next_u32() % 200 + 100) as usize;
         let mut padded = vec![0u8; auth_init_rlp.len() + pad_len];
@@ -45,13 +49,14 @@ impl RLPxHandshake {
         let overhead = 65 + 16 + 32; // PubKey + IV + MAC
         let encrypted_size = (padded.len() + overhead) as u16;
         let prefix_bytes = encrypted_size.to_be_bytes();
-        
-        let encrypted_auth_init = ECIES::encrypt(&self.remote_pk, &padded, None, Some(&prefix_bytes))?;
-        
+
+        let encrypted_auth_init =
+            ECIES::encrypt(&self.remote_pk, &padded, None, Some(&prefix_bytes))?;
+
         let mut packet = Vec::new();
         packet.extend_from_slice(&prefix_bytes);
         packet.extend_from_slice(&encrypted_auth_init);
-        
+
         self.stream.write_all(&packet).await?;
 
         // 2. Receive AuthResponse
@@ -59,10 +64,10 @@ impl RLPxHandshake {
         let mut prefix = [0u8; 2];
         self.stream.read_exact(&mut prefix).await?;
         let resp_size = u16::from_be_bytes(prefix) as usize;
-        
+
         let mut encrypted_resp = vec![0u8; resp_size];
         self.stream.read_exact(&mut encrypted_resp).await?;
-        
+
         let my_sk_key = SecretKey::from_slice(&self.config.secret_key)?;
         let resp_packet = ECIES::decrypt(&my_sk_key, &encrypted_resp, None, Some(&prefix))?;
         let auth_resp = AuthResponse::decode(&mut &resp_packet[..])?;
@@ -125,7 +130,8 @@ impl RLPxHandshake {
         let encrypted_size = (padded.len() + overhead) as u16;
         let resp_prefix = encrypted_size.to_be_bytes();
 
-        let encrypted_auth_resp = ECIES::encrypt(&auth_init.public_key, &padded, None, Some(&resp_prefix))?;
+        let encrypted_auth_resp =
+            ECIES::encrypt(&auth_init.public_key, &padded, None, Some(&resp_prefix))?;
         let response_packet = [resp_prefix.as_slice(), encrypted_auth_resp.as_slice()].concat();
 
         self.stream.write_all(&response_packet).await?;
@@ -142,7 +148,7 @@ impl RLPxHandshake {
             &initiate_packet,
             &response_packet,
         )?;
-        
+
         let frame_codec = FrameCodec::new(secrets);
         Ok((auth_init.public_key, frame_codec, self.stream))
     }
@@ -151,11 +157,11 @@ impl RLPxHandshake {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
     use crate::config::NodeConfig;
     use alloy_primitives::U256;
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
     use bytes::BytesMut;
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use tokio::net::TcpListener;
 
     fn mock_config(sk: [u8; 32]) -> NodeConfig {
         NodeConfig {
@@ -170,7 +176,7 @@ mod tests {
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
             closed_network: false,
-        read_only: false,
+            read_only: false,
             secret_key: sk,
             discovery_port: 0,
             data_dir: ".".to_string(),
@@ -180,9 +186,9 @@ mod tests {
             max_inbound_per_ip: 4,
             max_inbound_per_cidr: 16,
             inbound_cidr_prefix: 24,
-        best_block_parent_hash: None,
-        earliest_block: 0,
-        snap_capability: false,
+            best_block_parent_hash: None,
+            earliest_block: 0,
+            snap_capability: false,
         }
     }
 
@@ -190,10 +196,10 @@ mod tests {
     async fn test_rlpx_handshake_end_to_end() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        
+
         let sk1 = [0x11; 32];
         let sk2 = [0x22; 32];
-        
+
         let pk1 = {
             let sk = SecretKey::from_slice(&sk1).unwrap();
             let pk_encoded = sk.public_key().to_encoded_point(false);
@@ -225,7 +231,7 @@ mod tests {
         let (res1, res2) = tokio::join!(client_task, server_task);
         let (responder_static_pk, mut client_codec, _client_stream) = res1.unwrap().unwrap();
         let (initiator_static_pk, mut server_codec, _server_stream) = res2.unwrap().unwrap();
-        
+
         assert_eq!(initiator_static_pk, pk1);
         assert_eq!(responder_static_pk, pk2);
 
@@ -234,7 +240,7 @@ mod tests {
         let encoded = client_codec.encode_frame(0, msg).unwrap();
         let mut src = BytesMut::from(&encoded[..]);
         let decoded = server_codec.decode_frame(&mut src).unwrap().unwrap();
-        
+
         assert_eq!(decoded.0, 0);
         assert_eq!(decoded.1, msg);
     }

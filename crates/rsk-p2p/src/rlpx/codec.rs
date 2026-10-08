@@ -1,10 +1,10 @@
+use crate::codec::P2pCodecTrait;
 use crate::protocol::P2pMessage;
 use crate::rlpx::frame::FrameCodec;
-use bytes::{BytesMut};
-use tokio_util::codec::{Decoder, Encoder};
-use anyhow::Result;
 use alloy_rlp::{Decodable, Encodable};
-use crate::codec::P2pCodecTrait;
+use anyhow::Result;
+use bytes::BytesMut;
+use tokio_util::codec::{Decoder, Encoder};
 
 pub struct RLPxCodec {
     frame_codec: FrameCodec,
@@ -31,7 +31,7 @@ impl Decoder for RLPxCodec {
                 let mut data = Vec::with_capacity(payload.len() + 1);
                 data.push(protocol_id);
                 data.extend_from_slice(&payload);
-                
+
                 let mut ptr = &data[..];
                 match P2pMessage::decode(&mut ptr) {
                     Ok(msg) => Ok(Some(msg)),
@@ -48,14 +48,14 @@ impl Encoder<P2pMessage> for RLPxCodec {
     fn encode(&mut self, item: P2pMessage, dst: &mut BytesMut) -> Result<()> {
         let mut buffer = Vec::new();
         item.encode(&mut buffer);
-        
+
         if buffer.is_empty() {
             return Err(anyhow::anyhow!("Cannot encode empty P2P message"));
         }
-        
+
         let protocol_id = buffer[0];
         let payload = &buffer[1..];
-        
+
         let frame = self.frame_codec.encode_frame(protocol_id, payload)?;
         dst.extend_from_slice(&frame);
         Ok(())

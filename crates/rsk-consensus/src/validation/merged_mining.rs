@@ -1,6 +1,6 @@
 use super::{HeaderValidator, ValidationError};
-use crate::types::header::Header;
 use crate::config::ChainConfig;
+use crate::types::header::Header;
 
 /// The marker a merged-mining coinbase carries, immediately followed by the
 /// RSK block's merged-mining hash. rskj `RskMiningConstants.RSK_TAG`.
@@ -31,16 +31,18 @@ pub struct MergedMiningRule {
 
 impl HeaderValidator for MergedMiningRule {
     fn validate(&self, header: &Header) -> Result<(), ValidationError> {
-        use bitcoin::consensus::Decodable;
-        use bitcoin::block::Header as BtcHeader;
-        use bitcoin::hashes::Hash;
         use alloy_primitives::{B256, U256};
+        use bitcoin::block::Header as BtcHeader;
+        use bitcoin::consensus::Decodable;
+        use bitcoin::hashes::Hash;
 
         if header.number < self.config.activation_heights.orchid {
             return Ok(());
         }
 
-        let btc_header_bytes = header.bitcoin_merged_mining_header.as_ref()
+        let btc_header_bytes = header
+            .bitcoin_merged_mining_header
+            .as_ref()
             .ok_or(ValidationError::BitcoinHeaderDecodeError)?;
         let mut reader = &btc_header_bytes[..];
         let btc_header: BtcHeader = Decodable::consensus_decode(&mut reader)
@@ -49,7 +51,7 @@ impl HeaderValidator for MergedMiningRule {
         // 1. Bitcoin PoW vs RSK difficulty
         let difficulty = header.difficulty;
         if difficulty.is_zero() {
-             return Err(ValidationError::DifficultyZero);
+            return Err(ValidationError::DifficultyZero);
         }
         let target = if difficulty > U256::MAX {
             U256::ZERO
@@ -66,7 +68,9 @@ impl HeaderValidator for MergedMiningRule {
         }
 
         // 2. Validate compressed coinbase RSK tag
-        let compressed = header.bitcoin_merged_mining_coinbase_transaction.as_ref()
+        let compressed = header
+            .bitcoin_merged_mining_coinbase_transaction
+            .as_ref()
             .ok_or(ValidationError::BitcoinCoinbaseDecodeError)?;
 
         if compressed.len() < MIDSTATE_SIZE_TRIMMED + 1 {
@@ -79,7 +83,11 @@ impl HeaderValidator for MergedMiningRule {
 
         let include_fork_detection = header.number >= self.config.activation_heights.wasabi100;
         let expected_tag: Vec<u8> = if include_fork_detection {
-            [RSK_TAG, &rsk_hash.as_slice()[..HASH_FOR_MERGED_MINING_PREFIX_LENGTH]].concat()
+            [
+                RSK_TAG,
+                &rsk_hash.as_slice()[..HASH_FOR_MERGED_MINING_PREFIX_LENGTH],
+            ]
+            .concat()
         } else {
             [RSK_TAG, rsk_hash.as_slice()].concat()
         };
@@ -108,7 +116,9 @@ impl HeaderValidator for MergedMiningRule {
         // 3. Compute coinbase hash from SHA-256 midstate + tail, verify Merkle proof
         let coinbase_hash = compute_coinbase_hash(compressed);
 
-        let merkle_proof_bytes = header.bitcoin_merged_mining_merkle_proof.as_ref()
+        let merkle_proof_bytes = header
+            .bitcoin_merged_mining_merkle_proof
+            .as_ref()
             .ok_or(ValidationError::BitcoinMerkleProofDecodeError)?;
 
         // RSKIP180 (iris300): rskj `Rskip92MerkleProofValidator` rejects a
@@ -181,8 +191,7 @@ pub fn find_last_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.len() > haystack.len() {
         return None;
     }
-    haystack.windows(needle.len())
-        .rposition(|w| w == needle)
+    haystack.windows(needle.len()).rposition(|w| w == needle)
 }
 
 /// Computes the coinbase transaction hash from the compressed coinbase.
@@ -218,7 +227,7 @@ pub fn compute_coinbase_hash(compressed: &[u8]) -> [u8; 32] {
 
     let one_round = sha256_from_midstate(state, byte_count, tail);
 
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let second_round = Sha256::digest(one_round);
 
     let mut result = [0u8; 32];
@@ -316,8 +325,7 @@ pub fn compress_coinbase(
 
 /// The SHA-256 IV, the state a digest starts from before absorbing anything.
 pub const SHA256_INITIAL_STATE: [u32; 8] = [
-    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
 pub fn find_first_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -370,7 +378,7 @@ pub fn rskip92_merkle_root(coinbase_hash: &[u8; 32], proof_bytes: &[u8]) -> [u8;
 /// Matches rskj's MerkleTreeUtils.combineLeftRight:
 ///   reverseBytes(left) || reverseBytes(right) → SHA256d → wrapReversed
 pub fn combine_left_right(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     let mut left_rev = *left;
     let mut right_rev = *right;
@@ -419,7 +427,10 @@ pub fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
     for i in 16..64 {
         let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
         let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
     }
 
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
@@ -427,7 +438,11 @@ pub fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
     for i in 0..64 {
         let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
         let ch = (e & f) ^ ((!e) & g);
-        let temp1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(K256[i]).wrapping_add(w[i]);
+        let temp1 = h
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(K256[i])
+            .wrapping_add(w[i]);
         let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
         let maj = (a & b) ^ (a & c) ^ (b & c);
         let temp2 = s0.wrapping_add(maj);
@@ -455,7 +470,7 @@ pub fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     /// A coinbase-shaped buffer with the tag at a chosen offset.
     fn coinbase_with_tag_at(tag_offset: usize, trailing: usize) -> Vec<u8> {
@@ -527,7 +542,10 @@ mod tests {
         coinbase.extend_from_slice(&[0xCD; 31]);
         assert_eq!(
             compress_coinbase(&coinbase, true),
-            Err(CoinbaseCompressionError::HashTruncated { available: 31, needed: 32 })
+            Err(CoinbaseCompressionError::HashTruncated {
+                available: 31,
+                needed: 32
+            })
         );
     }
 
@@ -539,7 +557,10 @@ mod tests {
         assert!(compress_coinbase(&coinbase_with_tag_at(10, 128), true).is_ok());
         assert_eq!(
             compress_coinbase(&coinbase_with_tag_at(10, 129), true),
-            Err(CoinbaseCompressionError::TooMuchTrailingData { trailing: 129, max: 128 })
+            Err(CoinbaseCompressionError::TooMuchTrailingData {
+                trailing: 129,
+                max: 128
+            })
         );
     }
 
@@ -607,8 +628,8 @@ mod tests {
         let expected = Sha256::digest(input);
 
         let state: [u32; 8] = [
-            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
         ];
         let result = sha256_from_midstate(state, 0, input);
         assert_eq!(&result[..], &expected[..]);
@@ -621,8 +642,8 @@ mod tests {
 
         // Process first block normally to get midstate
         let mut state: [u32; 8] = [
-            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
         ];
         let block: &[u8; 64] = data[..64].try_into().unwrap();
         sha256_compress(&mut state, block);

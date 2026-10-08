@@ -1,7 +1,7 @@
-use alloy_primitives::{Address, Bloom, B256, U256, Bytes};
+use crate::rlp_compat::{decode_u256_lenient, decode_u64_lenient};
+use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
 use alloy_rlp::Encodable;
 use serde::{Deserialize, Serialize};
-use crate::rlp_compat::{decode_u64_lenient, decode_u256_lenient};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Header {
@@ -21,12 +21,12 @@ pub struct Header {
     pub gas_used: u64,
     pub timestamp: u64,
     pub extra_data: Bytes,
-    
+
     // RSK Specific Fields
     pub paid_fees: U256,
     pub minimum_gas_price: U256,
     pub uncle_count: u64,
-    
+
     // Optional / Advanced RSK fields (Merged Mining)
     pub umm_root: Option<Bytes>,
     pub bitcoin_merged_mining_header: Option<Bytes>,
@@ -92,7 +92,9 @@ impl Header {
         self.timestamp.encode(list);
         self.extra_data.encode(list);
         self.paid_fees.encode(list);
-        java_signed_bytes(&self.minimum_gas_price).as_slice().encode(list);
+        java_signed_bytes(&self.minimum_gas_price)
+            .as_slice()
+            .encode(list);
         self.uncle_count.encode(list);
     }
 
@@ -129,7 +131,11 @@ impl Header {
 impl Encodable for Header {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
         let list = self.encode_payload(true);
-        alloy_rlp::Header { list: true, payload_length: list.len() }.encode(out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: list.len(),
+        }
+        .encode(out);
         out.put_slice(&list);
     }
 
@@ -143,7 +149,9 @@ impl Encodable for Header {
 impl alloy_rlp::Decodable for Header {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         let h = alloy_rlp::Header::decode(buf)?;
-        if !h.list { return Err(alloy_rlp::Error::UnexpectedString); }
+        if !h.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
         let mut body = &buf[..h.payload_length];
         *buf = &buf[h.payload_length..];
 
@@ -209,7 +217,9 @@ impl alloy_rlp::Decodable for Header {
             while !rest.is_empty() {
                 let mut temp = rest;
                 if let Ok(h) = alloy_rlp::Header::decode(&mut temp) {
-                    if h.payload_length > temp.len() { break; }
+                    if h.payload_length > temp.len() {
+                        break;
+                    }
                     rest = &temp[h.payload_length..];
                     count += 1;
                 } else {
@@ -231,7 +241,7 @@ impl alloy_rlp::Decodable for Header {
         if !body.is_empty() {
             header.bitcoin_merged_mining_coinbase_transaction = Some(Bytes::decode(&mut body)?);
         }
-        
+
         Ok(header)
     }
 }
@@ -250,7 +260,11 @@ impl Header {
         }
         let payload = self.encode_payload(!self.rskip92_active());
         let mut buffer = Vec::with_capacity(payload.len() + 4);
-        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut buffer);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut buffer);
         buffer.extend_from_slice(&payload);
         alloy_primitives::keccak256(&buffer)
     }
@@ -277,7 +291,11 @@ impl Header {
         }
         let payload = &body[..ends[ends.len() - 3]];
         let mut buf = Vec::with_capacity(payload.len() + 4);
-        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut buf);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut buf);
         buf.extend_from_slice(payload);
         Some(alloy_primitives::keccak256(&buf))
     }
@@ -309,10 +327,14 @@ impl Header {
             let body = &parse[..list_h.payload_length];
             let mut cursor = body;
             for _ in 0..16 {
-                if cursor.is_empty() { break; }
+                if cursor.is_empty() {
+                    break;
+                }
                 let mut temp = cursor;
                 if let Ok(item_h) = alloy_rlp::Header::decode(&mut temp) {
-                    if item_h.payload_length > temp.len() { break; }
+                    if item_h.payload_length > temp.len() {
+                        break;
+                    }
                     cursor = &temp[item_h.payload_length..];
                 } else {
                     break;
@@ -339,7 +361,10 @@ impl Header {
                     }
                 }
                 let mm_payload = &body[..mm_end_with_umm];
-                let mm_list_h = alloy_rlp::Header { list: true, payload_length: mm_payload.len() };
+                let mm_list_h = alloy_rlp::Header {
+                    list: true,
+                    payload_length: mm_payload.len(),
+                };
                 let mut mm_buf = Vec::with_capacity(mm_list_h.length() + mm_payload.len());
                 mm_list_h.encode(&mut mm_buf);
                 mm_buf.extend_from_slice(mm_payload);
@@ -359,7 +384,10 @@ impl Header {
             } else {
                 // No ummRoot in the RLP at all: hash of fields 0-15 only
                 let mm_payload = &body[..mm_end];
-                let mm_list_h = alloy_rlp::Header { list: true, payload_length: mm_payload.len() };
+                let mm_list_h = alloy_rlp::Header {
+                    list: true,
+                    payload_length: mm_payload.len(),
+                };
                 let mut mm_buf = Vec::with_capacity(mm_list_h.length() + mm_payload.len());
                 mm_list_h.encode(&mut mm_buf);
                 mm_buf.extend_from_slice(mm_payload);
@@ -394,7 +422,11 @@ impl Header {
         }
 
         let mut out = Vec::new();
-        alloy_rlp::Header { list: true, payload_length: payload.len() }.encode(&mut out);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut out);
         out.extend_from_slice(&payload);
 
         let base_hash = alloy_primitives::keccak256(&out);
@@ -414,7 +446,7 @@ impl Header {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, B256, U256, Bytes, keccak256, b256, address, hex};
+    use alloy_primitives::{address, b256, hex, keccak256, Address, Bytes, B256, U256};
     use alloy_rlp::{Decodable, Encodable};
 
     fn standard_test_header() -> Header {
@@ -454,11 +486,12 @@ mod tests {
         header.encode(&mut buffer);
 
         // Decode
-        let decoded_header = Header::decode(&mut buffer.as_slice()).expect("Failed to decode header");
+        let decoded_header =
+            Header::decode(&mut buffer.as_slice()).expect("Failed to decode header");
 
         // Assert
         assert_eq!(header, decoded_header);
-        
+
         // Hash check (just to ensure it doesn't panic)
         let hash = header.hash();
         assert_ne!(hash, B256::ZERO);
@@ -579,7 +612,10 @@ mod tests {
         // What the miner actually committed to, read back out of the coinbase
         // this block carries: `RSKBLOCK:` then 20 bytes of merged-mining hash
         // and 12 of RSKIP110 fork-detection data.
-        let coinbase = header.bitcoin_merged_mining_coinbase_transaction.clone().unwrap();
+        let coinbase = header
+            .bitcoin_merged_mining_coinbase_transaction
+            .clone()
+            .unwrap();
         let tag = b"RSKBLOCK:";
         let position = coinbase.windows(tag.len()).rposition(|w| w == tag).unwrap();
         let committed = &coinbase[position + tag.len()..position + tag.len() + 32];
@@ -591,12 +627,22 @@ mod tests {
         );
         // The remaining 12 bytes are not hash at all: seven bytes of
         // commit-to-parents vector, one uncle count, then the height.
-        assert_eq!(&committed[28..32], &9_257_552u32.to_be_bytes(), "height in fork-detection data");
+        assert_eq!(
+            &committed[28..32],
+            &9_257_552u32.to_be_bytes(),
+            "height in fork-detection data"
+        );
 
         // Omitting ummRoot is the mistake worth failing loudly on.
-        let without_umm = Header { umm_root: None, ..header.clone() };
+        let without_umm = Header {
+            umm_root: None,
+            ..header.clone()
+        };
         assert_ne!(without_umm.hash(), header.hash());
-        assert_ne!(without_umm.hash_for_merged_mining(), header.hash_for_merged_mining());
+        assert_ne!(
+            without_umm.hash_for_merged_mining(),
+            header.hash_for_merged_mining()
+        );
     }
 
     #[test]
@@ -669,15 +715,27 @@ mod tests {
         let mut encoded = Vec::new();
         header.encode(&mut encoded);
         let expected_hash: B256 =
-            "0xc1a82a82e999490d8570ae9b80a3dcd29d143a65241d02db30e3d174988353d4".parse().unwrap();
+            "0xc1a82a82e999490d8570ae9b80a3dcd29d143a65241d02db30e3d174988353d4"
+                .parse()
+                .unwrap();
         assert_eq!(keccak256(&encoded), expected_hash, "uncle header hash");
 
         // sha3Uncles of block #3397 = keccak(RLP([uncle_full_encoding]))
         let mut uncles_list = Vec::new();
-        alloy_rlp::Header { list: true, payload_length: encoded.len() }.encode(&mut uncles_list);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: encoded.len(),
+        }
+        .encode(&mut uncles_list);
         uncles_list.extend_from_slice(&encoded);
         let expected_sha3_uncles: B256 =
-            "0xed488b69222610bae4c438b50d2472019e3efed77c654771025775d19d2ec648".parse().unwrap();
-        assert_eq!(keccak256(&uncles_list), expected_sha3_uncles, "block #3397 sha3Uncles");
+            "0xed488b69222610bae4c438b50d2472019e3efed77c654771025775d19d2ec648"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            keccak256(&uncles_list),
+            expected_sha3_uncles,
+            "block #3397 sha3Uncles"
+        );
     }
 }

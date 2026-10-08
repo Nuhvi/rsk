@@ -1,9 +1,9 @@
-use alloy_primitives::{Address, B256, U256, Bytes};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rlp::{Decodable, Encodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 
-use crate::rlp_compat::{decode_u64_lenient, decode_u256_lenient};
+use crate::rlp_compat::{decode_u256_lenient, decode_u64_lenient};
 
 #[derive(Clone, Debug, Serialize, Deserialize, RlpEncodable)]
 pub struct Transaction {
@@ -173,7 +173,11 @@ impl Transaction {
 
     fn rlp_wrap_and_hash(inner: &[u8]) -> B256 {
         let mut buf = Vec::with_capacity(inner.len() + 5);
-        alloy_rlp::Header { list: true, payload_length: inner.len() }.encode(&mut buf);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: inner.len(),
+        }
+        .encode(&mut buf);
         buf.extend_from_slice(inner);
         B256::from_slice(&Keccak256::digest(&buf))
     }
@@ -194,7 +198,6 @@ fn take_rlp_item<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
 }
 
 impl Transaction {
-
     /// Recover the sender address from the transaction signature.
     ///
     /// RSK chain IDs: mainnet=30, testnet=31, regtest=33.
@@ -204,7 +207,11 @@ impl Transaction {
         let recovery_id = if self.is_eip155(chain_id) {
             let rid = self.v as i64 - chain_id as i64 * 2 - 35;
             if !(0..=1).contains(&rid) {
-                anyhow::bail!("invalid EIP-155 v value: {} for chain_id {}", self.v, chain_id);
+                anyhow::bail!(
+                    "invalid EIP-155 v value: {} for chain_id {}",
+                    self.v,
+                    chain_id
+                );
             }
             rid as u8
         } else {
@@ -223,8 +230,9 @@ impl Transaction {
         let recid = k256::ecdsa::RecoveryId::from_byte(recovery_id)
             .ok_or_else(|| anyhow::anyhow!("invalid recovery id: {recovery_id}"))?;
 
-        let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(hash.as_slice(), &signature, recid)
-            .map_err(|e| anyhow::anyhow!("ECDSA recovery failed: {e}"))?;
+        let vk =
+            k256::ecdsa::VerifyingKey::recover_from_prehash(hash.as_slice(), &signature, recid)
+                .map_err(|e| anyhow::anyhow!("ECDSA recovery failed: {e}"))?;
 
         let pubkey_bytes = vk.to_encoded_point(false);
         let pubkey_hash = Keccak256::digest(&pubkey_bytes.as_bytes()[1..]);
@@ -246,10 +254,14 @@ impl Transaction {
 
         let recovery_id = if self.is_eip155(chain_id) {
             let rid = self.v as i64 - chain_id as i64 * 2 - 35;
-            if !(0..=1).contains(&rid) { return None; }
+            if !(0..=1).contains(&rid) {
+                return None;
+            }
             rid as u8
         } else {
-            if self.v != 27 && self.v != 28 { return None; }
+            if self.v != 27 && self.v != 28 {
+                return None;
+            }
             (self.v - 27) as u8
         };
 
@@ -260,11 +272,9 @@ impl Transaction {
         let signature = k256::ecdsa::Signature::from_slice(&sig_bytes).ok()?;
         let recid = k256::ecdsa::RecoveryId::from_byte(recovery_id)?;
 
-        let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(
-            hash.as_slice(),
-            &signature,
-            recid,
-        ).ok()?;
+        let vk =
+            k256::ecdsa::VerifyingKey::recover_from_prehash(hash.as_slice(), &signature, recid)
+                .ok()?;
 
         let compressed = vk.to_encoded_point(true);
         let mut arr = [0u8; 33];
@@ -319,7 +329,8 @@ mod tests {
         let mut buffer = Vec::new();
         tx.encode(&mut buffer);
 
-        let decoded = Transaction::decode(&mut buffer.as_slice()).expect("Failed to decode transaction");
+        let decoded =
+            Transaction::decode(&mut buffer.as_slice()).expect("Failed to decode transaction");
         assert_eq!(tx, decoded);
     }
 
@@ -344,7 +355,10 @@ mod tests {
         assert_eq!(hash1, hash2, "signing hash should be deterministic");
 
         let hash_direct = tx.signing_hash_eip155(31);
-        assert_ne!(hash1, hash_direct, "different chain_id should produce different hash");
+        assert_ne!(
+            hash1, hash_direct,
+            "different chain_id should produce different hash"
+        );
 
         let legacy = tx.signing_hash_legacy();
         assert_ne!(hash1, legacy, "EIP-155 hash differs from legacy hash");
@@ -406,11 +420,12 @@ mod tests {
 
         let vk = signing_key.verifying_key();
         let pubkey = vk.to_encoded_point(false);
-        let expected_addr = Address::from_slice(
-            &Keccak256::digest(&pubkey.as_bytes()[1..])[12..],
-        );
+        let expected_addr = Address::from_slice(&Keccak256::digest(&pubkey.as_bytes()[1..])[12..]);
 
-        assert_eq!(recovered, expected_addr, "recovered sender should match signing key");
+        assert_eq!(
+            recovered, expected_addr,
+            "recovered sender should match signing key"
+        );
     }
 
     /// Regression for mainnet block #457: rskj signs over the ORIGINAL field
@@ -430,7 +445,11 @@ mod tests {
         let mut sign_inner = fields.clone();
         sign_inner.extend_from_slice(&[30, 0x80, 0x80]);
         let mut sign_buf = Vec::new();
-        alloy_rlp::Header { list: true, payload_length: sign_inner.len() }.encode(&mut sign_buf);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: sign_inner.len(),
+        }
+        .encode(&mut sign_buf);
         sign_buf.extend_from_slice(&sign_inner);
         let sign_hash: [u8; 32] = Keccak256::digest(&sign_buf).into();
 
@@ -447,13 +466,22 @@ mod tests {
         U256::from_be_slice(&sig.r().to_bytes()).encode(&mut inner);
         U256::from_be_slice(&sig.s().to_bytes()).encode(&mut inner);
         let mut raw = Vec::new();
-        alloy_rlp::Header { list: true, payload_length: inner.len() }.encode(&mut raw);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: inner.len(),
+        }
+        .encode(&mut raw);
         raw.extend_from_slice(&inner);
 
         let tx = Transaction::decode(&mut raw.as_slice()).unwrap();
         assert_eq!(tx.gas_limit, U256::ZERO);
         let sender = tx.recover_sender(30).unwrap();
-        let expected: Address = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf".parse().unwrap();
-        assert_eq!(sender, expected, "sender must recover from the original encoding");
+        let expected: Address = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            sender, expected,
+            "sender must recover from the original encoding"
+        );
     }
 }

@@ -1,13 +1,13 @@
 use super::*;
 use crate::types::header::Header;
-use alloy_primitives::{Address, B256, U256, Bytes};
-use bitcoin::consensus::Encodable;
+use alloy_primitives::{Address, Bytes, B256, U256};
 use bitcoin::block::Header as BtcHeader;
-use bitcoin::transaction::{Transaction as BtcTransaction, TxOut, TxIn, OutPoint, Version};
+use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
 use bitcoin::script::PushBytes;
+use bitcoin::transaction::{OutPoint, Transaction as BtcTransaction, TxIn, TxOut, Version};
 use bitcoin::ScriptBuf;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 fn create_dummy_header(number: u64, timestamp: u64, parent_hash: B256) -> Header {
@@ -42,7 +42,11 @@ fn create_dummy_header(number: u64, timestamp: u64, parent_hash: B256) -> Header
 ///
 /// Returns (btc_header_bytes, compressed_coinbase, rskip92_merkle_proof).
 /// For a single-transaction block the Merkle proof is empty.
-fn build_mm_proof(header: &Header, btc_bits: u32, rsk_tag_hash: Option<B256>) -> (Bytes, Bytes, Bytes) {
+fn build_mm_proof(
+    header: &Header,
+    btc_bits: u32,
+    rsk_tag_hash: Option<B256>,
+) -> (Bytes, Bytes, Bytes) {
     let rsk_tag_hash = rsk_tag_hash.unwrap_or_else(|| header.hash_for_merged_mining());
     let mut rsk_tag = b"RSKBLOCK:".to_vec();
     rsk_tag.extend_from_slice(rsk_tag_hash.as_slice());
@@ -70,8 +74,8 @@ fn build_mm_proof(header: &Header, btc_bits: u32, rsk_tag_hash: Option<B256>) ->
     // Use split_point = 0 so midstate is initial SHA-256 state and tail = full tx bytes.
     let byte_count: u64 = 0;
     let init_state: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
     let mut compressed = Vec::with_capacity(40 + coinbase_bytes.len());
     compressed.extend_from_slice(&byte_count.to_be_bytes());
@@ -103,17 +107,21 @@ fn build_mm_proof(header: &Header, btc_bits: u32, rsk_tag_hash: Option<B256>) ->
     // Single-tx block: RSKIP92 proof is empty (no sibling hashes).
     let merkle_proof = Bytes::new();
 
-    (Bytes::from(btc_header_bytes), Bytes::from(compressed), merkle_proof)
+    (
+        Bytes::from(btc_header_bytes),
+        Bytes::from(compressed),
+        merkle_proof,
+    )
 }
 
 #[test]
 fn test_block_number_rule() {
     let parent = create_dummy_header(10, 100, B256::ZERO);
     let rule = BlockNumberRule;
-    
+
     let header = create_dummy_header(11, 101, parent.hash());
     assert!(rule.validate_with_parent(&header, &parent).is_ok());
-    
+
     let header = create_dummy_header(12, 101, parent.hash());
     assert!(rule.validate_with_parent(&header, &parent).is_err());
 }
@@ -123,10 +131,10 @@ fn test_parent_hash_rule() {
     let parent = create_dummy_header(10, 100, B256::ZERO);
     let rule = ParentHashRule;
     let parent_hash = parent.hash();
-    
+
     let header = create_dummy_header(11, 101, parent_hash);
     assert!(rule.validate_with_parent(&header, &parent).is_ok());
-    
+
     let header = create_dummy_header(11, 101, B256::repeat_byte(0x99));
     assert!(rule.validate_with_parent(&header, &parent).is_err());
 }
@@ -135,12 +143,15 @@ fn test_parent_hash_rule() {
 fn test_timestamp_rule() {
     let parent = create_dummy_header(10, 1000, B256::ZERO);
     let rule = TimestampRule::new(15);
-    
+
     let header = create_dummy_header(11, 1001, parent.hash());
     assert!(rule.validate_with_parent(&header, &parent).is_ok());
-    
+
     let header = create_dummy_header(11, 999, parent.hash());
-    assert!(matches!(rule.validate_with_parent(&header, &parent), Err(ValidationError::TimestampOlderThanParent { .. })));
+    assert!(matches!(
+        rule.validate_with_parent(&header, &parent),
+        Err(ValidationError::TimestampOlderThanParent { .. })
+    ));
 }
 
 #[test]
@@ -148,12 +159,15 @@ fn test_gas_used_rule() {
     let rule = GasUsedRule;
     let mut header = create_dummy_header(10, 100, B256::ZERO);
     header.gas_limit = U256::from(100);
-    
+
     header.gas_used = 90;
     assert!(rule.validate(&header).is_ok());
-    
+
     header.gas_used = 110;
-    assert!(matches!(rule.validate(&header), Err(ValidationError::GasUsedExceedsLimit { .. })));
+    assert!(matches!(
+        rule.validate(&header),
+        Err(ValidationError::GasUsedExceedsLimit { .. })
+    ));
 }
 
 #[test]
@@ -161,20 +175,20 @@ fn test_header_verifier() {
     let mut verifier = HeaderVerifier::new();
     verifier = verifier.with_static_rule(GasUsedRule);
     verifier = verifier.with_parent_rule(BlockNumberRule);
-    
+
     let parent = create_dummy_header(10, 100, B256::ZERO);
     let mut header = create_dummy_header(11, 101, parent.hash());
     header.gas_limit = U256::from(100);
     header.gas_used = 50;
-    
+
     // Fully valid
     assert!(verifier.verify(&header, Some(&parent)).is_ok());
-    
+
     // Static rule fails
     header.gas_used = 150;
     assert!(verifier.verify(&header, Some(&parent)).is_err());
     header.gas_used = 50;
-    
+
     // Parent rule fails
     header.number = 15;
     assert!(verifier.verify(&header, Some(&parent)).is_err());
@@ -184,15 +198,15 @@ fn test_header_verifier() {
 fn test_difficulty_rule() {
     let config = Arc::new(crate::config::ChainConfig::regtest());
     let rule = DifficultyRule { config };
-    
+
     let mut parent = create_dummy_header(10, 1000, B256::ZERO);
     parent.difficulty = U256::from(20480);
-    
+
     // Scenario 1: Quick block (delta < duration_limit) -> increase difficulty
     let mut header = create_dummy_header(11, 1005, parent.hash());
     header.difficulty = U256::from(20480 + (20480 / 2048));
     assert!(rule.validate_with_parent(&header, &parent).is_ok());
-    
+
     // Scenario 2: Slow block (delta > duration_limit) -> decrease difficulty
     let mut header = create_dummy_header(11, 1015, parent.hash());
     header.difficulty = U256::from(20480 - (20480 / 2048));
@@ -203,17 +217,17 @@ fn test_difficulty_rule() {
 fn test_gas_limit_rule() {
     let config = Arc::new(crate::config::ChainConfig::regtest());
     let rule = BlockParentGasLimitRule { config };
-    
+
     let mut parent = create_dummy_header(10, 1000, B256::ZERO);
-    parent.gas_limit = U256::from(102400); 
-    
+    parent.gas_limit = U256::from(102400);
+
     let mut header = create_dummy_header(11, 1010, parent.hash());
     header.gas_limit = U256::from(102400);
     assert!(rule.validate_with_parent(&header, &parent).is_ok());
-    
+
     header.gas_limit = U256::from(102500);
     assert!(rule.validate_with_parent(&header, &parent).is_ok());
-    
+
     header.gas_limit = U256::from(102501);
     assert!(rule.validate_with_parent(&header, &parent).is_err());
 }
@@ -224,12 +238,12 @@ fn test_merged_mining_rule_success() {
     let rule = MergedMiningRule { config };
     let mut header = create_dummy_header(10, 1000, B256::ZERO);
     header.difficulty = U256::from(1);
-    
+
     let (btc_h, btc_cb, btc_m) = build_mm_proof(&header, 0x207fffff, None);
     header.bitcoin_merged_mining_header = Some(btc_h);
     header.bitcoin_merged_mining_coinbase_transaction = Some(btc_cb);
     header.bitcoin_merged_mining_merkle_proof = Some(btc_m);
-    
+
     assert!(rule.validate(&header).is_ok());
 }
 
@@ -238,15 +252,18 @@ fn test_merged_mining_rule_invalid_pow() {
     let config = Arc::new(crate::config::ChainConfig::regtest());
     let rule = MergedMiningRule { config };
     let mut header = create_dummy_header(10, 1000, B256::ZERO);
-    header.difficulty = U256::MAX; 
-    
+    header.difficulty = U256::MAX;
+
     let (btc_h, btc_cb, btc_m) = build_mm_proof(&header, 0x207fffff, None);
     header.bitcoin_merged_mining_header = Some(btc_h);
     header.bitcoin_merged_mining_coinbase_transaction = Some(btc_cb);
     header.bitcoin_merged_mining_merkle_proof = Some(btc_m);
-    
+
     let res = rule.validate(&header);
-    assert!(matches!(res, Err(ValidationError::BitcoinPowInvalid { .. })));
+    assert!(matches!(
+        res,
+        Err(ValidationError::BitcoinPowInvalid { .. })
+    ));
 }
 
 #[test]
@@ -255,15 +272,18 @@ fn test_merged_mining_rule_invalid_merkle() {
     let rule = MergedMiningRule { config };
     let mut header = create_dummy_header(10, 1000, B256::ZERO);
     header.difficulty = U256::from(1);
-    
+
     let (btc_h, btc_cb, _) = build_mm_proof(&header, 0x207fffff, None);
     header.bitcoin_merged_mining_header = Some(btc_h);
     header.bitcoin_merged_mining_coinbase_transaction = Some(btc_cb);
     // Odd length (not multiple of 32) triggers decode error
     header.bitcoin_merged_mining_merkle_proof = Some(Bytes::from(vec![0u8; 33]));
-    
+
     let res = rule.validate(&header);
-    assert!(matches!(res, Err(ValidationError::BitcoinMerkleProofDecodeError)));
+    assert!(matches!(
+        res,
+        Err(ValidationError::BitcoinMerkleProofDecodeError)
+    ));
 }
 
 #[test]
@@ -272,14 +292,17 @@ fn test_merged_mining_rule_wrong_tag() {
     let rule = MergedMiningRule { config };
     let mut header = create_dummy_header(10, 1000, B256::ZERO);
     header.difficulty = U256::from(1);
-    
+
     let (btc_h, btc_cb, btc_m) = build_mm_proof(&header, 0x207fffff, Some(B256::repeat_byte(0xee)));
     header.bitcoin_merged_mining_header = Some(btc_h);
     header.bitcoin_merged_mining_coinbase_transaction = Some(btc_cb);
     header.bitcoin_merged_mining_merkle_proof = Some(btc_m);
-    
+
     let res = rule.validate(&header);
-    assert!(matches!(res, Err(ValidationError::BitcoinCoinbaseTagInvalid)));
+    assert!(matches!(
+        res,
+        Err(ValidationError::BitcoinCoinbaseTagInvalid)
+    ));
 }
 
 // --- Difficulty rule tests (mainnet) ---
@@ -355,7 +378,9 @@ fn test_difficulty_equal_timestamps_increases() {
     // Java's DifficultyCalculator: when curBlockTS == parentBlockTS, delta = 0.
     // calcDur = (1 + uncleCount) * duration > 0 = delta → sign = 1 → increase.
     let config = Arc::new(crate::config::ChainConfig::regtest());
-    let rule = DifficultyRule { config: config.clone() };
+    let rule = DifficultyRule {
+        config: config.clone(),
+    };
 
     let mut parent = create_dummy_header(10, 1000, B256::ZERO);
     parent.difficulty = U256::from(20480);

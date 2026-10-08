@@ -83,20 +83,41 @@ the descendant downloads; the chunks are trusted only because they **link**
   try the whole bootnode list and rotate.
 - [ ] Wire as a `--p2p` mode or probe command in `rsk-node`.
 
-### M2 — Parallel header walk into redb
-- [ ] Port `HeaderWalk` as `rsk-sync`, storing verified headers in
-  `rsk-store::Store` (raw RLP bytes keyed by height + embedded BTC header hash).
-- [ ] Validate every header with `HeaderVerifier`; sum difficulty; honour the
-  checkpoint gate against the peer's claimed TD.
-- [ ] `BlockHashRequest` connection-point logic when starting from a height we
-  don't hold.
+### M2 — Parallel header walk into redb (done ✅)
+- [x] `crates/rsk-sync` — port of rustock's `HeaderWalk` (`walk.rs`): skeleton
+  grid → parallel descending `BlockHeadersRequest` pipeline → full
+  `HeaderVerifier` rules on every header → redb via a `HeaderStore` trait
+  (`store.rs`, adapter over `rsk-store`).
+- [x] Trust model: the walk seeds the store's **canonical index** with the
+  checkpoint (#9,020,000) and takes a **floor** there, so it anchors at the
+  checkpoint (or at a previously-verified grid boundary on resume) instead of
+  re-downloading genesis. The canonical index is deliberately separate from the
+  raw header table so a walk can never satisfy its own anchor. Verified
+  stretches are promoted to canonical only after the walk links (`canonicalize_above_checkpoint`).
+- [x] Checkpoint gate: peer's claimed total difficulty is bounded against the
+  checkpoint before download (loose no-sample ceiling) and audited again after
+  the walk with real sampled headers (`judge`, ~376 samples). Refuses
+  impossible claims.
+- [x] Resume: a second run against the same store connected, walked only the
+  `9308100 − 9308030 = 132`-header delta and re-anchored on the canonical tip.
+- [x] Verified live on mainnet: **288,062 headers walked/verified/stored**
+  (top 9,308,030 → anchor 9,019,968), canonicalized 288,030, gate `plausible`
+  (established 6.142e28 vs peer-claimed 6.133e28, ceiling 7.08e28). Debug
+  build, single peer, ~10 min; a release build with several peers is far faster
+  than rskj's serial walk (48k sequential round trips).
+- [x] Offline regression tests: walk floor-anchor + below-floor filtering,
+  resume-anchor on an existing canonical head, `total_difficulty` summation,
+  canonicalization (4 tests).
+- Streams ahead of the completed M2 fix: batched redb header writes (one write
+  txn per 192-header run), top-down skeleton ordering ("the top unblocks the
+  walk"), correct `tip_height` maintenance across descending batches.
 
 ### M3 — Bitcoin cross-link, follow mode, proofs
-- [ ] Cross-check each stored RSK header's embedded 80-byte BTC header lies on
-  the Electrum-synced Bitcoin chain (`prevHash` linkage) — this is what makes
-  header-only RSK data probative (the *ephemeral sidechain* argument).
-- [ ] Follow mode: `NewBlockHashes` + status polls near the tip; reorgs via
-  last-common-ancestor truncation.
+- [ ] Follow new blocks near the tip: status polls + `NewBlockHashes`, reorgs
+  via last-common-ancestor truncation.
+- [ ] Bitcoin cross-link: validate each stored RSK header's embedded 80-byte BTC
+  header lies on the Electrum-synced chain (`prevHash` linkage) — makes
+  header-only RSK data probative (ephemeral sidechains).
 - [ ] Merge-mining proof components (coinbase + Merkle proof): from JSON-RPC
   today, RSKIP-698 `BlockHeadersWithUncles` (`rsk/63`) later.
 

@@ -1,6 +1,6 @@
-use alloy_rlp::{Encodable, Decodable, Header as RlpHeader};
 use alloy_primitives::{B256, U256};
-use rsk_consensus::rlp_compat::{decode_u32_lenient, decode_u64_lenient, decode_u256_lenient};
+use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
+use rsk_consensus::rlp_compat::{decode_u256_lenient, decode_u32_lenient, decode_u64_lenient};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EthStatus {
@@ -23,22 +23,35 @@ impl Encodable for EthStatus {
         self.total_difficulty.encode(&mut list);
         self.best_hash.encode(&mut list);
         self.genesis_hash.encode(&mut list);
-        RlpHeader { list: true, payload_length: list.len() }.encode(out);
+        RlpHeader {
+            list: true,
+            payload_length: list.len(),
+        }
+        .encode(out);
         out.put_slice(&list);
     }
 
     fn length(&self) -> usize {
-        let len = self.protocol_version.length() + self.network_id.length() +
-                  self.total_difficulty.length() + self.best_hash.length() +
-                  self.genesis_hash.length();
-        RlpHeader { list: true, payload_length: len }.length() + len
+        let len = self.protocol_version.length()
+            + self.network_id.length()
+            + self.total_difficulty.length()
+            + self.best_hash.length()
+            + self.genesis_hash.length();
+        RlpHeader {
+            list: true,
+            payload_length: len,
+        }
+        .length()
+            + len
     }
 }
 
 impl Decodable for EthStatus {
     fn decode(buf: &mut &[u8]) -> alloy_rlp::Result<Self> {
         let h = RlpHeader::decode(buf)?;
-        if !h.list { return Err(alloy_rlp::Error::UnexpectedString); }
+        if !h.list {
+            return Err(alloy_rlp::Error::UnexpectedString);
+        }
         let mut body = &buf[..h.payload_length];
         *buf = &buf[h.payload_length..];
 

@@ -31,7 +31,7 @@
 
 use alloy_primitives::{Bytes, B256, U256};
 use alloy_rlp::{Decodable, Encodable, Header as RlpHeader};
-use rsk_consensus::rlp_compat::{decode_u64_lenient, decode_u256_lenient};
+use rsk_consensus::rlp_compat::{decode_u256_lenient, decode_u64_lenient};
 use rsk_consensus::{Block, Header, Transaction};
 
 /// Snap message type numbers, as rskj assigns them.
@@ -105,7 +105,10 @@ pub struct SnapEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChunkPayload {
     /// Consensus-form nodes plus the witness that anchors them to the root.
-    Proved { entries: Vec<SnapEntry>, witness: Vec<Bytes> },
+    Proved {
+        entries: Vec<SnapEntry>,
+        witness: Vec<Bytes>,
+    },
     /// rskj's stripped-node blob, kept undecoded. Recognised so the peer can
     /// be told apart rather than misread.
     Legacy(Bytes),
@@ -154,7 +157,10 @@ impl Refusal {
     /// whether the peer can help with anything else. A grid disagreement is
     /// about the request, not the peer, so it is the one worth retrying.
     pub fn worth_asking_again(self) -> bool {
-        matches!(self, Refusal::None | Refusal::OffsetNotOnGrid | Refusal::PastTheEnd)
+        matches!(
+            self,
+            Refusal::None | Refusal::OffsetNotOnGrid | Refusal::PastTheEnd
+        )
     }
 }
 
@@ -196,7 +202,11 @@ pub struct SnapBlocksResponse {
 
 /// Wraps an already-encoded payload in an RLP list header.
 fn as_list(payload: &[u8], out: &mut Vec<u8>) {
-    RlpHeader { list: true, payload_length: payload.len() }.encode(out);
+    RlpHeader {
+        list: true,
+        payload_length: payload.len(),
+    }
+    .encode(out);
     out.extend_from_slice(payload);
 }
 
@@ -263,14 +273,14 @@ pub fn decode_block(buf: &mut &[u8]) -> alloy_rlp::Result<Block> {
         ommers.push(Header::decode_with_hash(&mut uncles_body)?);
     }
 
-    Ok(Block { header, transactions, ommers })
+    Ok(Block {
+        header,
+        transactions,
+        ommers,
+    })
 }
 
-fn encode_blocks_and_difficulties(
-    blocks: &[Block],
-    difficulties: &[U256],
-    out: &mut Vec<u8>,
-) {
+fn encode_blocks_and_difficulties(blocks: &[Block], difficulties: &[U256], out: &mut Vec<u8>) {
     let mut blocks_payload = Vec::new();
     for block in blocks {
         // rskj wraps each encoded block in an RLP string, so the list holds
@@ -289,9 +299,7 @@ fn encode_blocks_and_difficulties(
     as_list(&diffs_payload, out);
 }
 
-fn decode_blocks_and_difficulties(
-    buf: &mut &[u8],
-) -> alloy_rlp::Result<(Vec<Block>, Vec<U256>)> {
+fn decode_blocks_and_difficulties(buf: &mut &[u8]) -> alloy_rlp::Result<(Vec<Block>, Vec<U256>)> {
     let blocks_h = RlpHeader::decode(buf)?;
     if buf.len() < blocks_h.payload_length {
         return Err(alloy_rlp::Error::Custom("malformed block list"));
@@ -405,9 +413,23 @@ impl SnapStatusResponse {
         let mut body = &p[..h.payload_length.min(p.len())];
 
         let (blocks, difficulties) = decode_blocks_and_difficulties(&mut body)?;
-        let trie_size = if body.is_empty() { 0 } else { decode_u64_lenient(&mut body)? };
-        let chunk_grid = if body.is_empty() { 0 } else { decode_u64_lenient(&mut body)? };
-        Ok(Self { id, blocks, difficulties, trie_size, chunk_grid })
+        let trie_size = if body.is_empty() {
+            0
+        } else {
+            decode_u64_lenient(&mut body)?
+        };
+        let chunk_grid = if body.is_empty() {
+            0
+        } else {
+            decode_u64_lenient(&mut body)?
+        };
+        Ok(Self {
+            id,
+            blocks,
+            difficulties,
+            trie_size,
+            chunk_grid,
+        })
     }
 }
 
@@ -434,10 +456,24 @@ impl SnapChunkRequest {
 
         let block_number = decode_u64_lenient(&mut body)?;
         let from = decode_u64_lenient(&mut body)?;
-        let chunk_size = if body.is_empty() { 0 } else { decode_u64_lenient(&mut body)? };
-        let state_root = if body.is_empty() { None } else { Some(B256::decode(&mut body)?) };
+        let chunk_size = if body.is_empty() {
+            0
+        } else {
+            decode_u64_lenient(&mut body)?
+        };
+        let state_root = if body.is_empty() {
+            None
+        } else {
+            Some(B256::decode(&mut body)?)
+        };
 
-        Ok(Self { id, block_number, from, chunk_size, state_root })
+        Ok(Self {
+            id,
+            block_number,
+            from,
+            chunk_size,
+            state_root,
+        })
     }
 }
 
@@ -523,7 +559,10 @@ impl ChunkPayload {
             while !values_body.is_empty() {
                 long_values.push(Bytes::decode(&mut values_body)?);
             }
-            entries.push(SnapEntry { message, long_values });
+            entries.push(SnapEntry {
+                message,
+                long_values,
+            });
         }
 
         let w_h = RlpHeader::decode(&mut body)?;
@@ -571,7 +610,15 @@ impl SnapChunkResponse {
             Refusal::from_code(decode_u64_lenient(&mut body)?)
         };
 
-        Ok(Self { id, payload, block_number, from, to, complete, refusal })
+        Ok(Self {
+            id,
+            payload,
+            block_number,
+            from,
+            to,
+            complete,
+            refusal,
+        })
     }
 }
 
@@ -605,7 +652,11 @@ impl SnapBlocksResponse {
         let h = RlpHeader::decode(&mut p)?;
         let mut body = &p[..h.payload_length.min(p.len())];
         let (blocks, difficulties) = decode_blocks_and_difficulties(&mut body)?;
-        Ok(Self { id, blocks, difficulties })
+        Ok(Self {
+            id,
+            blocks,
+            difficulties,
+        })
     }
 }
 
@@ -643,10 +694,10 @@ mod tests {
         }
     }
 
-#[test]
+    #[test]
     fn a_remasc_body_survives_the_snap_wire() {
-        use rsk_consensus::Transaction;
         use alloy_rlp::Decodable;
+        use rsk_consensus::Transaction;
 
         // The REMASC transaction as rskj puts it on the wire: every numeric field
         // zero, and gasPrice/gasLimit/value written as a literal 0x00 byte rather
@@ -657,7 +708,11 @@ mod tests {
         inner.extend_from_slice(&hex_lit("0000000000000000000000000000000001000008"));
         inner.extend_from_slice(&[0x00, 0x80, 0x00, 0x00, 0x00]);
         let mut raw = Vec::new();
-        alloy_rlp::Header { list: true, payload_length: inner.len() }.encode(&mut raw);
+        alloy_rlp::Header {
+            list: true,
+            payload_length: inner.len(),
+        }
+        .encode(&mut raw);
         raw.extend_from_slice(&inner);
 
         let tx = Transaction::decode(&mut raw.as_slice()).unwrap();
@@ -674,12 +729,18 @@ mod tests {
 
         // The original bytes survive the round trip; there is no trie vendored
         // here, so the root assertion reduces to byte fidelity.
-        assert_eq!(decoded.transactions[0].rlp_for_trie(), block.transactions[0].rlp_for_trie());
+        assert_eq!(
+            decoded.transactions[0].rlp_for_trie(),
+            block.transactions[0].rlp_for_trie()
+        );
     }
 
-fn hex_lit(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
-}
+    fn hex_lit(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
 
     fn roundtrip(sub: RskSubMessage) -> RskSubMessage {
         let mut buf = Vec::new();
@@ -691,7 +752,9 @@ fn hex_lit(s: &str) -> Vec<u8> {
 
     #[test]
     fn a_status_request_survives_the_wire() {
-        let out = roundtrip(RskSubMessage::SnapStatusRequest(SnapStatusRequest { id: 42 }));
+        let out = roundtrip(RskSubMessage::SnapStatusRequest(SnapStatusRequest {
+            id: 42,
+        }));
         match out {
             RskSubMessage::SnapStatusRequest(r) => assert_eq!(r.id, 42),
             other => panic!("decoded as {other:?}"),
@@ -773,7 +836,10 @@ fn hex_lit(s: &str) -> Vec<u8> {
                 message: Bytes::from_static(&[0x40, 0x01, 0x02]),
                 long_values: vec![Bytes::from(vec![0xAA; 64])],
             },
-            SnapEntry { message: Bytes::from(vec![0x41; 70]), long_values: Vec::new() },
+            SnapEntry {
+                message: Bytes::from(vec![0x41; 70]),
+                long_values: Vec::new(),
+            },
             SnapEntry {
                 message: Bytes::from(vec![0x42; 5]),
                 long_values: vec![Bytes::from(vec![1u8; 40]), Bytes::from(vec![2u8; 33])],
@@ -782,7 +848,10 @@ fn hex_lit(s: &str) -> Vec<u8> {
         let witness = vec![Bytes::from(vec![0x50; 80]), Bytes::from(vec![0x51; 44])];
         let sent = SnapChunkResponse {
             id: 3,
-            payload: ChunkPayload::Proved { entries: entries.clone(), witness: witness.clone() },
+            payload: ChunkPayload::Proved {
+                entries: entries.clone(),
+                witness: witness.clone(),
+            },
             block_number: 9_268_363,
             from: 1024,
             to: 2048,
@@ -800,7 +869,10 @@ fn hex_lit(s: &str) -> Vec<u8> {
     fn an_empty_chunk_survives_the_wire() {
         let sent = SnapChunkResponse {
             id: 4,
-            payload: ChunkPayload::Proved { entries: Vec::new(), witness: Vec::new() },
+            payload: ChunkPayload::Proved {
+                entries: Vec::new(),
+                witness: Vec::new(),
+            },
             block_number: 1,
             from: 0,
             to: 0,
@@ -839,14 +911,21 @@ fn hex_lit(s: &str) -> Vec<u8> {
 
     #[test]
     fn snap_blocks_survive_the_wire() {
-        let request = SnapBlocksRequest { id: 11, block_number: 9_000_000 };
+        let request = SnapBlocksRequest {
+            id: 11,
+            block_number: 9_000_000,
+        };
         match roundtrip(RskSubMessage::SnapBlocksRequest(request.clone())) {
             RskSubMessage::SnapBlocksRequest(got) => assert_eq!(got, request),
             other => panic!("decoded as {other:?}"),
         }
 
         let blocks: Vec<Block> = (1..=2)
-            .map(|n| Block { header: header(n), transactions: Vec::new(), ommers: Vec::new() })
+            .map(|n| Block {
+                header: header(n),
+                transactions: Vec::new(),
+                ommers: Vec::new(),
+            })
             .collect();
         let response = SnapBlocksResponse {
             id: 12,
@@ -899,7 +978,11 @@ mod rskj_wire_tests {
         id.encode(&mut body);
         body.push(0xc0);
         let mut out = Vec::new();
-        RlpHeader { list: true, payload_length: body.len() }.encode(&mut out);
+        RlpHeader {
+            list: true,
+            payload_length: body.len(),
+        }
+        .encode(&mut out);
         out.extend_from_slice(&body);
         out
     }
@@ -909,10 +992,18 @@ mod rskj_wire_tests {
         let params = vec![0xc0u8];
         let mut body = Vec::new();
         id.encode(&mut body);
-        RlpHeader { list: false, payload_length: params.len() }.encode(&mut body);
+        RlpHeader {
+            list: false,
+            payload_length: params.len(),
+        }
+        .encode(&mut body);
         body.extend_from_slice(&params);
         let mut out = Vec::new();
-        RlpHeader { list: true, payload_length: body.len() }.encode(&mut out);
+        RlpHeader {
+            list: true,
+            payload_length: body.len(),
+        }
+        .encode(&mut out);
         out.extend_from_slice(&body);
         out
     }
@@ -965,9 +1056,15 @@ mod rskj_wire_tests {
         };
         let mut buf = req.encode_body();
         let back = SnapChunkRequest::decode_body(&mut buf.as_slice()).expect("chunk request");
-        assert_eq!((back.id, back.block_number, back.from), (3, 9_275_000, 1024));
+        assert_eq!(
+            (back.id, back.block_number, back.from),
+            (3, 9_275_000, 1024)
+        );
 
-        let blocks = SnapBlocksRequest { id: 5, block_number: 9_274_000 };
+        let blocks = SnapBlocksRequest {
+            id: 5,
+            block_number: 9_274_000,
+        };
         buf = blocks.encode_body();
         let back = SnapBlocksRequest::decode_body(&mut buf.as_slice()).expect("blocks request");
         assert_eq!((back.id, back.block_number), (5, 9_274_000));
@@ -975,7 +1072,9 @@ mod rskj_wire_tests {
         let status = SnapStatusRequest { id: 11 };
         buf = status.encode_body();
         assert_eq!(
-            SnapStatusRequest::decode_body(&mut buf.as_slice()).expect("status").id,
+            SnapStatusRequest::decode_body(&mut buf.as_slice())
+                .expect("status")
+                .id,
             11
         );
     }

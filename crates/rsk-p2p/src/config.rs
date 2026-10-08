@@ -1,4 +1,4 @@
-use alloy_primitives::{B512, B256, U256};
+use alloy_primitives::{B256, B512, U256};
 
 /// Configuration for a P2P connection.
 ///

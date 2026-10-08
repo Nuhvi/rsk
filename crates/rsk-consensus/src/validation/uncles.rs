@@ -5,7 +5,7 @@
 //! header field. That says nothing about whether the uncles themselves are
 //! admissible, which is what this rule decides.
 
-use super::{ValidationError, HeaderValidator, ParentHeaderValidator};
+use super::{HeaderValidator, ParentHeaderValidator, ValidationError};
 use crate::types::block::Block;
 use crate::types::header::Header;
 use alloy_primitives::B256;
@@ -37,7 +37,9 @@ pub fn ancestors<S: AncestorSource + ?Sized>(
     let floor = block_number.saturating_sub(limit);
     let mut cursor = Some(parent_hash);
     while let Some(hash) = cursor {
-        let Some(header) = store.header(hash) else { break };
+        let Some(header) = store.header(hash) else {
+            break;
+        };
         if header.number < floor {
             break;
         }
@@ -62,7 +64,9 @@ pub fn used_uncles<S: AncestorSource + ?Sized>(
     let floor = block_number.saturating_sub(limit);
     let mut cursor = Some(parent_hash);
     while let Some(hash) = cursor {
-        let Some(header) = store.header(hash) else { break };
+        let Some(header) = store.header(hash) else {
+            break;
+        };
         if header.number < floor {
             break;
         }

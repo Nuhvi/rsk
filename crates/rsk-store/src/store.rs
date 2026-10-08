@@ -18,6 +18,13 @@ const BTC_META: TableDefinition<&str, &[u8]> = TableDefinition::new("btc_meta");
 const RSK_HEADERS: TableDefinition<u64, &[u8]> = TableDefinition::new("rsk_headers");
 const RSK_MERGE_MINING: TableDefinition<u64, &[u8]> = TableDefinition::new("rsk_merge_mining");
 const RSK_META: TableDefinition<&str, &[u8]> = TableDefinition::new("rsk_meta");
+/// The canonical RSK chain a syncer has *accepted*: height -> block hash.
+///
+/// Deliberately separate from `rsk_headers` (which holds every downloaded
+/// header, verified or not): the header walk considers a block "ours" only if
+/// it is in this index, so a walk can never satisfy its own anchor by storing
+/// headers. A refresh writes the old tip into it once a walk links to it.
+const RSK_CANONICAL: TableDefinition<u64, &[u8; 32]> = TableDefinition::new("rsk_canonical");
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MergeMiningData {
@@ -56,6 +63,7 @@ impl Store {
         txn.open_table(RSK_HEADERS)?;
         txn.open_table(RSK_MERGE_MINING)?;
         txn.open_table(RSK_META)?;
+        txn.open_table(RSK_CANONICAL)?;
         txn.commit()?;
         Ok(Self { db })
     }
@@ -317,12 +325,78 @@ impl Store {
         Ok(())
     }
 
+    /// Store a run of RSK headers (no merge-mining data) in a single write
+    /// txn. Batches arrive top-down (the walk descends), so the tip only ever
+    /// moves up: it is the max of the existing tip and this batch.
+    pub fn rsk_store_headers_batch(&self, entries: &[(u64, &[u8])]) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let current_tip = self.rsk_get_tip_height()?.unwrap_or(0);
+        let txn = self.db.begin_write()?;
+        let mut tip = current_tip;
+        {
+            let mut headers = txn.open_table(RSK_HEADERS)?;
+            for (height, raw) in entries {
+                headers.insert(*height, *raw)?;
+                tip = (*height).max(tip);
+            }
+        }
+        {
+            let mut meta = txn.open_table(RSK_META)?;
+            if tip > current_tip {
+                meta.insert("tip_height", tip.to_be_bytes().as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Update the lowest validated RSK height.
     pub fn rsk_set_lowest_validated_height(&self, height: u64) -> Result<(), StoreError> {
         let txn = self.db.begin_write()?;
         {
             let mut meta = txn.open_table(RSK_META)?;
             meta.insert("lowest_validated_height", height.to_be_bytes().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Write an arbitrary RSK meta key (blob). The sync layer uses this to
+    /// cache cumulative difficulty and the canonical sync anchor.
+    pub fn rsk_set_meta(&self, key: &str, value: &[u8]) -> Result<(), StoreError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut meta = txn.open_table(RSK_META)?;
+            meta.insert(key, value)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Read an arbitrary RSK meta key.
+    pub fn rsk_get_meta(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(RSK_META)?;
+        Ok(table.get(key)?.map(|v| v.value().to_vec()))
+    }
+
+    /// The block hash this node accepts as canonical at `height`, if any.
+    pub fn rsk_canonical_get(&self, height: u64) -> Result<Option<[u8; 32]>, StoreError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(RSK_CANONICAL)?;
+        Ok(table.get(height)?.map(|v| *v.value()))
+    }
+
+    /// Record a stretch of accepted headers as canonical, in one write txn.
+    pub fn rsk_canonical_set_batch(&self, entries: &[(u64, [u8; 32])]) -> Result<(), StoreError> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(RSK_CANONICAL)?;
+            for (height, hash) in entries {
+                table.insert(*height, hash)?;
+            }
         }
         txn.commit()?;
         Ok(())

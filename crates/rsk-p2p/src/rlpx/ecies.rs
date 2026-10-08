@@ -1,15 +1,15 @@
+use aes::Aes128;
 use alloy_primitives::{B256, B512};
 use alloy_rlp::{RlpDecodable, RlpEncodable};
-use k256::{SecretKey, PublicKey};
-use k256::ecdsa::{SigningKey};
-use k256::elliptic_curve::sec1::ToEncodedPoint;
-use anyhow::{Result, Context};
-use sha2::{Sha256};
-use sha3::{Keccak256, Digest};
-use aes::Aes128;
+use anyhow::{Context, Result};
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use hmac::{Hmac, Mac};
+use k256::ecdsa::SigningKey;
 use k256::elliptic_curve::rand_core::RngCore;
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::{PublicKey, SecretKey};
+use sha2::Sha256;
+use sha3::{Digest, Keccak256};
 
 type HmacSha256 = Hmac<Sha256>;
 type Aes128Ctr = ctr::Ctr128BE<Aes128>;
@@ -17,13 +17,18 @@ type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 #[derive(Debug, Clone, RlpEncodable, RlpDecodable)]
 pub struct AuthInitiate {
     pub signature: alloy_rlp::Bytes, // 65 bytes: [R(32), S(32), V(1)]
-    pub public_key: B512,           // 64 bytes
-    pub nonce: B256,                // 32 bytes
-    pub version: u64,               // Typically 4
+    pub public_key: B512,            // 64 bytes
+    pub nonce: B256,                 // 32 bytes
+    pub version: u64,                // Typically 4
 }
 
 impl AuthInitiate {
-    pub fn new(my_sk: &SecretKey, remote_pk: &B512, my_ephemeral_sk: &SecretKey, nonce: B256) -> Result<Self> {
+    pub fn new(
+        my_sk: &SecretKey,
+        remote_pk: &B512,
+        my_ephemeral_sk: &SecretKey,
+        nonce: B256,
+    ) -> Result<Self> {
         let mut pub_bytes = [0u8; 65];
         pub_bytes[0] = 0x04;
         pub_bytes[1..].copy_from_slice(remote_pk.as_slice());
@@ -32,10 +37,10 @@ impl AuthInitiate {
 
         let shared_secret = k256::elliptic_curve::ecdh::diffie_hellman(
             my_sk.to_nonzero_scalar(),
-            receiver_pk.as_affine()
+            receiver_pk.as_affine(),
         );
         let token = shared_secret.raw_secret_bytes();
-        
+
         let mut signed_data = [0u8; 32];
         for i in 0..32 {
             signed_data[i] = token[i] ^ nonce[i];
@@ -43,9 +48,10 @@ impl AuthInitiate {
 
         // Sign with ephemeral key
         let signing_key = SigningKey::from(my_ephemeral_sk);
-        let (signature, recovery_id) = signing_key.sign_prehash_recoverable(&signed_data)
+        let (signature, recovery_id) = signing_key
+            .sign_prehash_recoverable(&signed_data)
             .map_err(|e| anyhow::anyhow!("Failed to sign auth initiate: {:?}", e))?;
-        
+
         // signature is [R(32), S(32), V(1)]
         let mut sig_bytes = Vec::with_capacity(65);
         sig_bytes.extend_from_slice(&signature.to_bytes());
@@ -73,10 +79,10 @@ impl AuthInitiate {
 
         let shared_secret = k256::elliptic_curve::ecdh::diffie_hellman(
             my_sk.to_nonzero_scalar(),
-            initiator_static_pk.as_affine()
+            initiator_static_pk.as_affine(),
         );
         let token = shared_secret.raw_secret_bytes();
-        
+
         let mut signed_data = [0u8; 32];
         for i in 0..32 {
             signed_data[i] = token[i] ^ self.nonce[i];
@@ -87,10 +93,14 @@ impl AuthInitiate {
             .map_err(|e| anyhow::anyhow!("Invalid signature format: {:?}", e))?;
         let recovery_id = k256::ecdsa::RecoveryId::from_byte(self.signature[64])
             .ok_or_else(|| anyhow::anyhow!("Invalid recovery ID"))?;
-            
-        let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(&signed_data, &signature_bytes, recovery_id)
-            .map_err(|e| anyhow::anyhow!("Failed to recover ephemeral public key: {:?}", e))?;
-            
+
+        let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(
+            &signed_data,
+            &signature_bytes,
+            recovery_id,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to recover ephemeral public key: {:?}", e))?;
+
         let mut pk_64 = [0u8; 64];
         pk_64.copy_from_slice(&vk.to_encoded_point(false).as_bytes()[1..]);
         Ok(B512::from_slice(&pk_64))
@@ -99,8 +109,8 @@ impl AuthInitiate {
 
 #[derive(Debug, Clone, RlpEncodable, RlpDecodable)]
 pub struct AuthResponse {
-    pub public_key: B512,           // 64 bytes (ephemeral)
-    pub nonce: B256,                // 32 bytes
+    pub public_key: B512, // 64 bytes (ephemeral)
+    pub nonce: B256,      // 32 bytes
     pub version: u64,
 }
 
@@ -142,7 +152,7 @@ impl ECIES {
 
         let agreed_secret = k256::elliptic_curve::ecdh::diffie_hellman(
             my_ephemeral_sk.to_nonzero_scalar(),
-            eph_pub.as_affine()
+            eph_pub.as_affine(),
         );
         let z = agreed_secret.raw_secret_bytes();
 
@@ -211,11 +221,16 @@ impl ECIES {
     /// Encrypts a message using ECIES.
     /// `s1` is additional KDF data (typically None for EIP-8).
     /// `s2` is additional HMAC data (typically the 2-byte size prefix for EIP-8).
-    pub fn encrypt(receiver_pub: &B512, msg: &[u8], s1: Option<&[u8]>, s2: Option<&[u8]>) -> Result<Vec<u8>> {
+    pub fn encrypt(
+        receiver_pub: &B512,
+        msg: &[u8],
+        s1: Option<&[u8]>,
+        s2: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
         let mut rng = k256::elliptic_curve::rand_core::OsRng;
         let ephemeral_sk = SecretKey::random(&mut rng);
         let ephemeral_pk = ephemeral_sk.public_key();
-        
+
         // Convert B512 to PublicKey
         let mut pub_bytes = [0u8; 65];
         pub_bytes[0] = 0x04;
@@ -226,10 +241,10 @@ impl ECIES {
         // ECDH
         let shared_secret = k256::elliptic_curve::ecdh::diffie_hellman(
             ephemeral_sk.to_nonzero_scalar(),
-            receiver_pk.as_affine()
+            receiver_pk.as_affine(),
         );
         let z = shared_secret.raw_secret_bytes();
-        
+
         // KDF (Concat KDF NIST SP 800-56A)
         // Order: counter || z || s1
         let mut kdf_bytes = [0u8; 32];
@@ -243,7 +258,7 @@ impl ECIES {
 
         let encryption_key = &kdf_bytes[0..16];
         let mac_key_raw = &kdf_bytes[16..32];
-        
+
         // Ethereum hashes the MAC key before use
         let mut mac_key = [0u8; 32];
         let mut hasher = Sha256::new();
@@ -281,7 +296,12 @@ impl ECIES {
     /// Decrypts an ECIES-encrypted message.
     /// `s1` is additional KDF data (typically None for EIP-8).
     /// `s2` is additional HMAC data (typically the 2-byte size prefix for EIP-8).
-    pub fn decrypt(my_sk: &SecretKey, data: &[u8], s1: Option<&[u8]>, s2: Option<&[u8]>) -> Result<Vec<u8>> {
+    pub fn decrypt(
+        my_sk: &SecretKey,
+        data: &[u8],
+        s1: Option<&[u8]>,
+        s2: Option<&[u8]>,
+    ) -> Result<Vec<u8>> {
         if data.len() < 65 + 16 + 32 {
             return Err(anyhow::anyhow!("Data too short for ECIES decrypt"));
         }
@@ -298,7 +318,7 @@ impl ECIES {
         // ECDH
         let shared_secret = k256::elliptic_curve::ecdh::diffie_hellman(
             my_sk.to_nonzero_scalar(),
-            eph_pub.as_affine()
+            eph_pub.as_affine(),
         );
         let z = shared_secret.raw_secret_bytes();
 
@@ -328,7 +348,8 @@ impl ECIES {
         if let Some(info) = s2 {
             hmac.update(info);
         }
-        hmac.verify_slice(provided_mac).context("HMAC verification failed")?;
+        hmac.verify_slice(provided_mac)
+            .context("HMAC verification failed")?;
 
         // AES-CTR Decrypt
         let encryption_key: &[u8; 16] = encryption_key.try_into()?;
@@ -356,10 +377,11 @@ mod tests {
 
         let msg = b"Hello RLPx!";
         let shared_info = Some(b"RSK-V1");
-        
+
         let encrypted = ECIES::encrypt(&pk, msg, None, shared_info.map(|s| s.as_slice())).unwrap();
-        let decrypted = ECIES::decrypt(&sk, &encrypted, None, shared_info.map(|s| s.as_slice())).unwrap();
-        
+        let decrypted =
+            ECIES::decrypt(&sk, &encrypted, None, shared_info.map(|s| s.as_slice())).unwrap();
+
         assert_eq!(msg, decrypted.as_slice());
     }
 
@@ -368,7 +390,7 @@ mod tests {
         let mut rng = k256::elliptic_curve::rand_core::OsRng;
         let my_sk = SecretKey::random(&mut rng);
         let my_ephemeral_sk = SecretKey::random(&mut rng);
-        
+
         let remote_sk = SecretKey::random(&mut rng);
         let remote_pk_encoded = remote_sk.public_key().to_encoded_point(false);
         let mut remote_pk_64 = [0u8; 64];
@@ -380,12 +402,12 @@ mod tests {
         let auth_init = AuthInitiate::new(&my_sk, &remote_pk, &my_ephemeral_sk, nonce).unwrap();
         assert_eq!(auth_init.version, 4);
         assert_eq!(auth_init.nonce, nonce);
-        
+
         let my_ephemeral_pk_encoded = my_ephemeral_sk.public_key().to_encoded_point(false);
         let mut my_ephemeral_pk_64 = [0u8; 64];
         my_ephemeral_pk_64.copy_from_slice(&my_ephemeral_pk_encoded.as_bytes()[1..]);
         let my_ephemeral_pk = B512::from_slice(&my_ephemeral_pk_64);
-        
+
         let auth_resp = AuthResponse::new(&my_ephemeral_pk, nonce);
         assert_eq!(auth_resp.public_key, my_ephemeral_pk);
     }

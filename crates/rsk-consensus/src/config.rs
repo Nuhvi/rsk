@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, B256, Bytes, U256, address};
+use alloy_primitives::{address, Address, Bytes, B256, U256};
 
 use crate::types::header::Header;
 
@@ -151,16 +151,30 @@ impl ChainConfig {
     /// from standard encoding, producing a different hash.
     pub fn known_genesis_hash(&self) -> Option<B256> {
         match self.chain_id {
-            30 => Some("0xf88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0".parse().unwrap()),
-            31 => Some("0xcabb7fbe88cd6d922042a32ffc08ce8b1fbb37d650b9d4e7dbfe2a7469adfa42".parse().unwrap()),
+            30 => Some(
+                "0xf88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0"
+                    .parse()
+                    .unwrap(),
+            ),
+            31 => Some(
+                "0xcabb7fbe88cd6d922042a32ffc08ce8b1fbb37d650b9d4e7dbfe2a7469adfa42"
+                    .parse()
+                    .unwrap(),
+            ),
             _ => None,
         }
     }
 
     /// Constructs the genesis header for this network.
     pub fn genesis_header(&self) -> Header {
-        let empty_list_hash: B256 = "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347".parse().unwrap();
-        let empty_trie_hash: B256 = "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421".parse().unwrap();
+        let empty_list_hash: B256 =
+            "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"
+                .parse()
+                .unwrap();
+        let empty_trie_hash: B256 =
+            "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421"
+                .parse()
+                .unwrap();
 
         match self.chain_id {
             30 => Header {
@@ -249,7 +263,8 @@ impl ChainConfig {
     pub fn genesis_alloc(&self) -> Vec<GenesisAlloc> {
         const BRIDGE: Address = address!("0000000000000000000000000000000001000006");
         // 21_000_000 RBTC = 21_000_000 * 10^18 wei
-        let twenty_one_million_rbtc = U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
+        let twenty_one_million_rbtc =
+            U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
 
         match self.chain_id {
             30 | 31 => vec![GenesisAlloc {
@@ -277,7 +292,8 @@ impl ChainConfig {
 
                 // Default locking cap: 21M RBTC in wei
                 let locking_cap_key = bridge_storage_key_ascii("lockingCap");
-                let locking_cap_value = U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
+                let locking_cap_value =
+                    U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
 
                 vec![
                     (fee_per_kb_key, u256_to_storage_bytes(fee_per_kb_value)),
@@ -293,8 +309,12 @@ impl ChainConfig {
     /// Node IDs are not known upfront; discovery learns them from signed pongs.
     pub fn bootnodes(&self) -> Vec<String> {
         match self.chain_id {
-            30 => (1..=16).map(|n| format!("bootstrap{n:02}.rsk.co:5050")).collect(),
-            31 => (1..=8).map(|n| format!("bootstrap{n:02}.testnet.rsk.co:50505")).collect(),
+            30 => (1..=16)
+                .map(|n| format!("bootstrap{n:02}.rsk.co:5050"))
+                .collect(),
+            31 => (1..=8)
+                .map(|n| format!("bootstrap{n:02}.testnet.rsk.co:50505"))
+                .collect(),
             _ => vec![],
         }
     }
@@ -449,15 +469,24 @@ mod tests {
         let config = ChainConfig::mainnet();
         let alloc = config.genesis_alloc();
 
-        assert_eq!(alloc.len(), 1, "mainnet genesis should have exactly 1 allocation");
+        assert_eq!(
+            alloc.len(),
+            1,
+            "mainnet genesis should have exactly 1 allocation"
+        );
 
         let bridge = &alloc[0];
         let expected_addr: Address = address!("0000000000000000000000000000000001000006");
-        assert_eq!(bridge.address, expected_addr, "allocation should go to Bridge");
+        assert_eq!(
+            bridge.address, expected_addr,
+            "allocation should go to Bridge"
+        );
 
         let expected_balance = U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
-        assert_eq!(bridge.balance, expected_balance,
-            "Bridge should receive 21000000000000000000000000 wei (21M RBTC)");
+        assert_eq!(
+            bridge.balance, expected_balance,
+            "Bridge should receive 21000000000000000000000000 wei (21M RBTC)"
+        );
         assert_eq!(bridge.nonce, U256::ZERO);
     }
 
@@ -478,7 +507,10 @@ mod tests {
     fn rskj_genesis_regtest_no_alloc() {
         let config = ChainConfig::regtest();
         let alloc = config.genesis_alloc();
-        assert!(alloc.is_empty(), "regtest should have no genesis allocations");
+        assert!(
+            alloc.is_empty(),
+            "regtest should have no genesis allocations"
+        );
     }
 
     /// Ported from rskj: genesis Bridge storage includes feePerKb and lockingCap.
@@ -490,30 +522,45 @@ mod tests {
         assert_eq!(storage.len(), 2, "should have feePerKb and lockingCap");
 
         let fee_per_kb_value = U256::from_be_slice(&storage[0].1);
-        assert_eq!(fee_per_kb_value, U256::from(10_000u64),
-            "feePerKb should be 10000 satoshis");
+        assert_eq!(
+            fee_per_kb_value,
+            U256::from(10_000u64),
+            "feePerKb should be 10000 satoshis"
+        );
 
         let locking_cap_value = U256::from_be_slice(&storage[1].1);
         let expected_cap = U256::from(21_000_000u64) * U256::from(10u64).pow(U256::from(18));
-        assert_eq!(locking_cap_value, expected_cap,
-            "lockingCap should be 21M RBTC in wei");
+        assert_eq!(
+            locking_cap_value, expected_cap,
+            "lockingCap should be 21M RBTC in wei"
+        );
     }
 
     /// Ported from rskj GenesisHashesTest: verify known mainnet genesis hash.
     #[test]
     fn rskj_known_mainnet_genesis_hash() {
         let config = ChainConfig::mainnet();
-        let expected: B256 = "0xf88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0".parse().unwrap();
-        assert_eq!(config.known_genesis_hash(), Some(expected),
-            "mainnet genesis hash must match rskj GenesisHashesTest");
+        let expected: B256 = "0xf88529d4ab262c0f4d042e9d8d3f2472848eaafe1a9b7213f57617eb40a9f9e0"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            config.known_genesis_hash(),
+            Some(expected),
+            "mainnet genesis hash must match rskj GenesisHashesTest"
+        );
     }
 
     /// Ported from rskj GenesisHashesTest: verify known testnet genesis hash.
     #[test]
     fn rskj_known_testnet_genesis_hash() {
         let config = ChainConfig::testnet();
-        let expected: B256 = "0xcabb7fbe88cd6d922042a32ffc08ce8b1fbb37d650b9d4e7dbfe2a7469adfa42".parse().unwrap();
-        assert_eq!(config.known_genesis_hash(), Some(expected),
-            "testnet genesis hash must match rskj GenesisHashesTest");
+        let expected: B256 = "0xcabb7fbe88cd6d922042a32ffc08ce8b1fbb37d650b9d4e7dbfe2a7469adfa42"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            config.known_genesis_hash(),
+            Some(expected),
+            "testnet genesis hash must match rskj GenesisHashesTest"
+        );
     }
 }

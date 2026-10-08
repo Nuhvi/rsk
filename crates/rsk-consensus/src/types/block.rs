@@ -1,7 +1,7 @@
 use crate::types::header::Header;
 use crate::types::transaction::Transaction;
-use alloy_rlp::{RlpDecodable, RlpEncodable};
 use alloy_primitives::B256;
+use alloy_rlp::{RlpDecodable, RlpEncodable};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, RlpDecodable, RlpEncodable)]
@@ -22,7 +22,7 @@ mod tests {
     use super::*;
     use crate::types::header::Header;
     use crate::types::transaction::Transaction;
-    use alloy_primitives::{Address, B256, U256, Bytes};
+    use alloy_primitives::{Address, Bytes, B256, U256};
     use alloy_rlp::{Decodable, Encodable};
 
     #[test]

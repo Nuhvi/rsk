@@ -1,5 +1,5 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use alloy_primitives::Bytes;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Converts a byte slice to an IpAddr.
 pub fn bytes_to_ip(bytes: &[u8]) -> Option<IpAddr> {

@@ -1,18 +1,18 @@
 use crate::types::header::Header;
-use thiserror::Error;
 use alloy_primitives::{B256, U256};
+use thiserror::Error;
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum ValidationError {
     #[error("Block number is invalid: expected {expected}, got {got}")]
     InvalidBlockNumber { expected: u64, got: u64 },
-    
+
     #[error("Parent hash mismatch: expected {expected}, got {got}")]
     ParentHashMismatch { expected: B256, got: B256 },
-    
+
     #[error("Timestamp is in the future: current {current}, got {got}")]
     TimestampInFuture { current: u64, got: u64 },
-    
+
     #[error("Timestamp is older than parent: parent {parent}, got {got}")]
     TimestampOlderThanParent { parent: u64, got: u64 },
 
@@ -59,7 +59,10 @@ pub enum ValidationError {
     MerkleProofTooLarge { max: usize, got: usize },
 
     #[error("Tx gas price {tx_gas_price} is below the block minimum {block_minimum}")]
-    TxGasPriceBelowMinimum { tx_gas_price: U256, block_minimum: U256 },
+    TxGasPriceBelowMinimum {
+        tx_gas_price: U256,
+        block_minimum: U256,
+    },
 
     #[error("Tx gas price {tx_gas_price} is above the cap {cap}")]
     TxGasPriceAboveCap { tx_gas_price: U256, cap: U256 },
@@ -106,7 +109,8 @@ pub trait HeaderValidator: Send + Sync {
 }
 
 pub trait ParentHeaderValidator: Send + Sync {
-    fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError>;
+    fn validate_with_parent(&self, header: &Header, parent: &Header)
+        -> Result<(), ValidationError>;
 }
 
 /// A rule that needs the block body — transactions or uncles — and not just
@@ -189,15 +193,19 @@ impl HeaderVerifier {
     pub fn default_rsk(config: std::sync::Arc<crate::config::ChainConfig>) -> Self {
         Self::new()
             .with_static_rule(GasUsedRule)
-            .with_static_rule(GasLimitBoundsRule { 
-                min_gas_limit: config.min_gas_limit, 
-                max_gas_limit: config.max_gas_limit 
+            .with_static_rule(GasLimitBoundsRule {
+                min_gas_limit: config.min_gas_limit,
+                max_gas_limit: config.max_gas_limit,
             })
-            .with_static_rule(MergedMiningRule { config: config.clone() })
+            .with_static_rule(MergedMiningRule {
+                config: config.clone(),
+            })
             .with_static_rule(block_rules::ExtraDataRule::default())
             .with_parent_rule(BlockNumberRule)
             .with_parent_rule(TimestampRule::new(15)) // 15s drift
-            .with_parent_rule(BlockParentGasLimitRule { config: config.clone() })
+            .with_parent_rule(BlockParentGasLimitRule {
+                config: config.clone(),
+            })
             .with_parent_rule(block_rules::PrevMinGasPriceRule)
             .with_parent_rule(DifficultyRule { config })
     }
@@ -259,19 +267,22 @@ impl HeaderVerifier {
 }
 
 pub mod block_rules;
-pub mod fork_detection;
-pub mod uncles;
-pub mod header_rules;
 pub mod difficulty;
+pub mod fork_detection;
+pub mod header_rules;
 pub mod merged_mining;
+pub mod uncles;
 
-pub use header_rules::{BlockNumberRule, ParentHashRule, TimestampRule, GasUsedRule, GasLimitBoundsRule, BlockParentGasLimitRule};
-pub use difficulty::DifficultyRule;
-pub use merged_mining::MergedMiningRule;
 pub use block_rules::{
     BlockTxsMaxGasPriceRule, ExtraDataRule, PrevMinGasPriceRule, RemascValidationRule,
     TxsMinGasPriceRule,
 };
+pub use difficulty::DifficultyRule;
+pub use header_rules::{
+    BlockNumberRule, BlockParentGasLimitRule, GasLimitBoundsRule, GasUsedRule, ParentHashRule,
+    TimestampRule,
+};
+pub use merged_mining::MergedMiningRule;
 
 #[cfg(test)]
 mod tests;

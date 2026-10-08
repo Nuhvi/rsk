@@ -1,10 +1,13 @@
 use crate::protocol::P2pMessage;
 use alloy_rlp::{Decodable, Encodable};
+use anyhow::Result;
 use bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
-use anyhow::Result;
 
-pub trait P2pCodecTrait: Encoder<P2pMessage, Error = anyhow::Error> + Decoder<Item = P2pMessage, Error = anyhow::Error> {}
+pub trait P2pCodecTrait:
+    Encoder<P2pMessage, Error = anyhow::Error> + Decoder<Item = P2pMessage, Error = anyhow::Error>
+{
+}
 impl P2pCodecTrait for P2pCodec {}
 
 pub struct P2pCodec;
@@ -45,12 +48,12 @@ impl Encoder<P2pMessage> for P2pCodec {
 mod tests {
     use super::*;
     use crate::protocol::P2pMessage;
-    
+
     #[test]
     fn test_codec_ping_pong() {
         let mut codec = P2pCodec;
         let mut dst = BytesMut::new();
-        
+
         // Encode Ping
         codec.encode(P2pMessage::Ping, &mut dst).unwrap();
         assert!(!dst.is_empty());
@@ -65,16 +68,16 @@ mod tests {
     fn test_codec_partial_decode() {
         let mut codec = P2pCodec;
         let mut dst = BytesMut::new();
-        
+
         // Encode Ping
         codec.encode(P2pMessage::Ping, &mut dst).unwrap();
-        
+
         // Split into partials
         let mut partial = dst.split_to(1); // Just the ID
         let res = codec.decode(&mut partial).unwrap();
         assert!(res.is_none());
         assert_eq!(partial.len(), 1); // Should not advance if incomplete
-        
+
         // Add back the rest
         partial.extend_from_slice(&dst);
         let res = codec.decode(&mut partial).unwrap().unwrap();

@@ -23,16 +23,14 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use alloy_primitives::{B256, B512, U256};
+use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
-use k256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
+use k256::{elliptic_curve::sec1::ToEncodedPoint, SecretKey};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 
-use rsk_p2p::discovery::{
-    DiscoveryEndpoint, DiscoveryPacket, DiscoveryPayload, PingMessage,
-};
+use rsk_p2p::discovery::{DiscoveryEndpoint, DiscoveryPacket, DiscoveryPayload, PingMessage};
 use rsk_p2p::protocol::{P2pMessage, RskSubMessage};
 use rsk_p2p::{Handshake, NodeConfig};
 
@@ -128,41 +126,41 @@ async fn discover_node_id(sk_bytes: &[u8; 32], addr: SocketAddr) -> Result<B512>
                 break;
             }
             match timeout(remaining, socket.recv_from(&mut buf)).await {
-                Ok(Ok((len, from))) if from == addr => {
-                    match DiscoveryPacket::decode(&buf[..len]) {
-                        Ok(packet) => match packet.payload {
-                            DiscoveryPayload::Pong(_) => {
-                                return packet
-                                    .recover_id()
-                                    .with_context(|| "recovering node id from pong");
-                            }
-                            DiscoveryPayload::Ping(_) => {
-                                let pong = DiscoveryEndpoint {
-                                    ip: ping.from.ip.clone(),
-                                    udp_port: ping.from.udp_port,
-                                    tcp_port: ping.from.tcp_port,
-                                };
-                                let reply = DiscoveryPacket::create(
-                                    DiscoveryPayload::Pong(rsk_p2p::discovery::PongMessage {
-                                        from: pong.clone(),
-                                        to: ping.to.clone(),
-                                        message_id: message_id.clone(),
-                                        network_id: 775,
-                                    }),
-                                    &key,
-                                )?;
-                                let _ = socket.send_to(&reply.encode(), addr).await;
-                            }
-                            _ => {}
-                        },
-                        Err(e) => eprintln!("  discovery decode error: {e}"),
-                    }
-                }
+                Ok(Ok((len, from))) if from == addr => match DiscoveryPacket::decode(&buf[..len]) {
+                    Ok(packet) => match packet.payload {
+                        DiscoveryPayload::Pong(_) => {
+                            return packet
+                                .recover_id()
+                                .with_context(|| "recovering node id from pong");
+                        }
+                        DiscoveryPayload::Ping(_) => {
+                            let pong = DiscoveryEndpoint {
+                                ip: ping.from.ip.clone(),
+                                udp_port: ping.from.udp_port,
+                                tcp_port: ping.from.tcp_port,
+                            };
+                            let reply = DiscoveryPacket::create(
+                                DiscoveryPayload::Pong(rsk_p2p::discovery::PongMessage {
+                                    from: pong.clone(),
+                                    to: ping.to.clone(),
+                                    message_id: message_id.clone(),
+                                    network_id: 775,
+                                }),
+                                &key,
+                            )?;
+                            let _ = socket.send_to(&reply.encode(), addr).await;
+                        }
+                        _ => {}
+                    },
+                    Err(e) => eprintln!("  discovery decode error: {e}"),
+                },
                 _ => break,
             }
         }
     }
-    Err(anyhow::anyhow!("could not learn {addr}'s node id over discovery"))
+    Err(anyhow::anyhow!(
+        "could not learn {addr}'s node id over discovery"
+    ))
 }
 
 fn addr_to_endpoint(addr: SocketAddr) -> DiscoveryEndpoint {
@@ -185,10 +183,7 @@ async fn run(host: &str, chain: Chain) -> Result<()> {
     // Step 1: learn the peer's public key over UDP discovery.
     println!("pinging discovery…");
     let peer_id = discover_node_id(&sk_bytes, addr).await?;
-    println!(
-        "discovered node id: 0x{}…",
-        hex(&peer_id.as_slice()[..8])
-    );
+    println!("discovered node id: 0x{}…", hex(&peer_id.as_slice()[..8]));
 
     // Step 2: TCP + RLPx + devp2p + rsk status handshake.
     let config = NodeConfig {
@@ -227,13 +222,20 @@ async fn run(host: &str, chain: Chain) -> Result<()> {
         .with_context(|| format!("TCP connect to {addr}"))?;
 
     let handshake = Handshake::new(stream, config, Some(peer_id));
-    let (handled_peer, status, caps, mut framed) = timeout(Duration::from_secs(15), handshake.run())
-        .await
-        .context("RLPx/p2p handshake timed out")??;
+    let (handled_peer, status, caps, mut framed) =
+        timeout(Duration::from_secs(15), handshake.run())
+            .await
+            .context("RLPx/p2p handshake timed out")??;
 
     println!("----------------------------------------");
-    println!("connected to peer:  0x{}…", hex(&handled_peer.as_slice()[..8]));
-    println!("negotiated:         rsk/{} (snap: {})", caps.rsk_version, caps.snap);
+    println!(
+        "connected to peer:  0x{}…",
+        hex(&handled_peer.as_slice()[..8])
+    );
+    println!(
+        "negotiated:         rsk/{} (snap: {})",
+        caps.rsk_version, caps.snap
+    );
     println!(
         "peer status:         block {} 0x{}…",
         status.best_block_number,
@@ -266,7 +268,11 @@ async fn run(host: &str, chain: Chain) -> Result<()> {
                 RskSubMessage::NewBlockHashes(ids) => {
                     println!("NewBlockHashes: {} announcements", ids.len());
                     if let Some(top) = ids.last() {
-                        println!("  newest: block {} 0x{}…", top.number, hex(&top.hash.as_slice()[..8]));
+                        println!(
+                            "  newest: block {} 0x{}…",
+                            top.number,
+                            hex(&top.hash.as_slice()[..8])
+                        );
                     }
                 }
                 other => println!("rsk message: {other:?}"),

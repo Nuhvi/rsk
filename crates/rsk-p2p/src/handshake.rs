@@ -1,5 +1,8 @@
-use crate::protocol::{P2pMessage, HelloMessage, P2P_VERSION, EthStatus, RskStatus, RskMessage, RskSubMessage, Capability};
 use crate::protocol::rsk::RSK_RANGE_VERSION;
+use crate::protocol::{
+    Capability, EthStatus, HelloMessage, P2pMessage, RskMessage, RskStatus, RskSubMessage,
+    P2P_VERSION,
+};
 
 /// What a peer said it speaks, reduced to the two questions this node asks.
 ///
@@ -16,7 +19,10 @@ pub struct PeerCapabilities {
 
 impl Default for PeerCapabilities {
     fn default() -> Self {
-        Self { rsk_version: 62, snap: false }
+        Self {
+            rsk_version: 62,
+            snap: false,
+        }
     }
 }
 
@@ -54,18 +60,18 @@ impl PeerCapabilities {
         self.rsk_version >= RSK_RANGE_VERSION
     }
 }
-use crate::config::NodeConfig;
 use crate::codec::P2pCodec;
-use anyhow::{Result, Context};
+use crate::config::NodeConfig;
+use alloy_primitives::B512;
+use anyhow::{Context, Result};
+use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
-use futures::{StreamExt, SinkExt};
-use alloy_primitives::B512;
 use tracing::trace;
 
-use crate::rlpx::{RLPxHandshake, RLPxCodec};
-use tokio_util::codec::{Decoder, Encoder};
+use crate::rlpx::{RLPxCodec, RLPxHandshake};
 use bytes::BytesMut;
+use tokio_util::codec::{Decoder, Encoder};
 
 pub enum HandshakeCodec {
     Plain(P2pCodec),
@@ -100,7 +106,11 @@ pub struct Handshake {
 }
 
 impl Handshake {
-    pub fn new(stream: TcpStream, config: NodeConfig, remote_id: Option<alloy_primitives::B512>) -> Self {
+    pub fn new(
+        stream: TcpStream,
+        config: NodeConfig,
+        remote_id: Option<alloy_primitives::B512>,
+    ) -> Self {
         Self {
             stream,
             config,
@@ -124,17 +134,23 @@ impl Handshake {
         if let Some(remote_pk) = remote_id {
             trace!(target: "rustock::net", "Attempting RLPx handshake with {:?}", remote_pk);
             let rlpx = RLPxHandshake::new(stream, config.clone(), remote_pk);
-            let (peer_id, frame_codec, stream) = rlpx.run_initiator().await.context("RLPx handshake failed")?;
-            
+            let (peer_id, frame_codec, stream) = rlpx
+                .run_initiator()
+                .await
+                .context("RLPx handshake failed")?;
+
             let codec = HandshakeCodec::RLPx(Box::new(RLPxCodec::new(frame_codec)));
             let mut framed = Framed::new(stream, codec);
-            
+
             let (rsk_status, caps) = Self::p2p_handshake(&config, &mut framed).await?;
             Ok((peer_id, rsk_status, caps, framed))
         } else {
             trace!(target: "rustock::net", "Awaiting inbound RLPx handshake");
             let rlpx = RLPxHandshake::new(stream, config.clone(), B512::ZERO);
-            let (peer_id, frame_codec, stream) = rlpx.run_responder().await.context("Inbound RLPx handshake failed")?;
+            let (peer_id, frame_codec, stream) = rlpx
+                .run_responder()
+                .await
+                .context("Inbound RLPx handshake failed")?;
 
             let codec = HandshakeCodec::RLPx(Box::new(RLPxCodec::new(frame_codec)));
             let mut framed = Framed::new(stream, codec);
@@ -144,24 +160,36 @@ impl Handshake {
         }
     }
 
-    async fn p2p_handshake<S>(config: &NodeConfig, framed: &mut S) -> Result<(RskStatus, PeerCapabilities)> 
-    where S: StreamExt<Item = Result<P2pMessage, anyhow::Error>> + SinkExt<P2pMessage, Error = anyhow::Error> + Unpin
+    async fn p2p_handshake<S>(
+        config: &NodeConfig,
+        framed: &mut S,
+    ) -> Result<(RskStatus, PeerCapabilities)>
+    where
+        S: StreamExt<Item = Result<P2pMessage, anyhow::Error>>
+            + SinkExt<P2pMessage, Error = anyhow::Error>
+            + Unpin,
     {
         Self::send_hello(config, framed).await?;
         let (_peer_id, caps) = Self::receive_hello(framed).await?;
-        
+
         Self::send_status(config, framed).await?;
         let status = Self::receive_status(config, framed).await?;
 
         Ok((status, caps))
     }
 
-    async fn p2p_handshake_inbound<S>(config: &NodeConfig, framed: &mut S) -> Result<(alloy_primitives::B512, RskStatus, PeerCapabilities)> 
-    where S: StreamExt<Item = Result<P2pMessage, anyhow::Error>> + SinkExt<P2pMessage, Error = anyhow::Error> + Unpin
+    async fn p2p_handshake_inbound<S>(
+        config: &NodeConfig,
+        framed: &mut S,
+    ) -> Result<(alloy_primitives::B512, RskStatus, PeerCapabilities)>
+    where
+        S: StreamExt<Item = Result<P2pMessage, anyhow::Error>>
+            + SinkExt<P2pMessage, Error = anyhow::Error>
+            + Unpin,
     {
         let (peer_id, caps) = Self::receive_hello(framed).await?;
         Self::send_hello(config, framed).await?;
-        
+
         let status = Self::receive_status(config, framed).await?;
         Self::send_status(config, framed).await?;
 
@@ -180,17 +208,27 @@ impl Handshake {
     /// do with snapshots. It is not invented here.
     fn capabilities(config: &NodeConfig) -> Vec<Capability> {
         let mut caps = vec![
-            Capability { name: "rsk".to_string(), version: 62 },
-            Capability { name: "rsk".to_string(), version: RSK_RANGE_VERSION },
+            Capability {
+                name: "rsk".to_string(),
+                version: 62,
+            },
+            Capability {
+                name: "rsk".to_string(),
+                version: RSK_RANGE_VERSION,
+            },
         ];
         if config.snap_capability {
-            caps.push(Capability { name: "snap".to_string(), version: 1 });
+            caps.push(Capability {
+                name: "snap".to_string(),
+                version: 1,
+            });
         }
         caps
     }
 
-    async fn send_hello<S>(config: &NodeConfig, framed: &mut S) -> Result<()> 
-    where S: SinkExt<P2pMessage, Error = anyhow::Error> + Unpin
+    async fn send_hello<S>(config: &NodeConfig, framed: &mut S) -> Result<()>
+    where
+        S: SinkExt<P2pMessage, Error = anyhow::Error> + Unpin,
     {
         let hello = HelloMessage {
             protocol_version: P2P_VERSION,
@@ -199,15 +237,21 @@ impl Handshake {
             listen_port: config.listen_port,
             id: config.id,
         };
-        framed.send(P2pMessage::Hello(hello)).await.context("Failed to send Hello")
+        framed
+            .send(P2pMessage::Hello(hello))
+            .await
+            .context("Failed to send Hello")
     }
 
     async fn receive_hello<S>(framed: &mut S) -> Result<(alloy_primitives::B512, PeerCapabilities)>
-    where S: StreamExt<Item = Result<P2pMessage, anyhow::Error>> + Unpin
+    where
+        S: StreamExt<Item = Result<P2pMessage, anyhow::Error>> + Unpin,
     {
-        let msg = framed.next().await
+        let msg = framed
+            .next()
+            .await
             .context("Connection closed waiting for Hello")??;
-        
+
         if let P2pMessage::Hello(peer_hello) = msg {
             trace!(target: "rustock::net", "P2P Handshake successful with peer: {}", peer_hello.client_id);
             let caps = PeerCapabilities::negotiate(&peer_hello.capabilities);
@@ -217,8 +261,9 @@ impl Handshake {
         }
     }
 
-    async fn send_status<S>(config: &NodeConfig, framed: &mut S) -> Result<()> 
-    where S: SinkExt<P2pMessage, Error = anyhow::Error> + Unpin
+    async fn send_status<S>(config: &NodeConfig, framed: &mut S) -> Result<()>
+    where
+        S: SinkExt<P2pMessage, Error = anyhow::Error> + Unpin,
     {
         let status = EthStatus {
             protocol_version: 0x3e, // RSK protocol version V62
@@ -228,7 +273,7 @@ impl Handshake {
             genesis_hash: config.genesis_hash,
         };
         framed.send(P2pMessage::EthStatus(status)).await?;
-        
+
         let rsk_status = RskStatus {
             best_block_number: config.best_block_number,
             best_block_hash: config.best_hash,
@@ -237,24 +282,33 @@ impl Handshake {
             // Only when the parent is known: the list is positional, so a
             // fifth element without the third and fourth is not a message
             // anyone can read.
-            earliest_block: config
-                .best_block_parent_hash
-                .map(|_| config.earliest_block),
+            earliest_block: config.best_block_parent_hash.map(|_| config.earliest_block),
         };
-        framed.send(P2pMessage::RskMessage(RskMessage::new(RskSubMessage::Status(rsk_status)))).await?;
+        framed
+            .send(P2pMessage::RskMessage(RskMessage::new(
+                RskSubMessage::Status(rsk_status),
+            )))
+            .await?;
         Ok(())
     }
 
-    async fn receive_status<S>(config: &NodeConfig, framed: &mut S) -> Result<RskStatus> 
-    where S: StreamExt<Item = Result<P2pMessage, anyhow::Error>> + Unpin
+    async fn receive_status<S>(config: &NodeConfig, framed: &mut S) -> Result<RskStatus>
+    where
+        S: StreamExt<Item = Result<P2pMessage, anyhow::Error>> + Unpin,
     {
         // Wait for EthStatus
-        let eth_msg = framed.next().await
+        let eth_msg = framed
+            .next()
+            .await
             .context("Connection closed waiting for EthStatus")??;
-        
+
         if let P2pMessage::EthStatus(s) = eth_msg {
             if s.genesis_hash != config.genesis_hash {
-                return Err(anyhow::anyhow!("Genesis hash mismatch: expected {:?}, got {:?}", config.genesis_hash, s.genesis_hash));
+                return Err(anyhow::anyhow!(
+                    "Genesis hash mismatch: expected {:?}, got {:?}",
+                    config.genesis_hash,
+                    s.genesis_hash
+                ));
             }
             trace!(target: "rustock::net", "Peer EthStatus: best_hash={:?}", s.best_hash);
         } else {
@@ -262,15 +316,20 @@ impl Handshake {
         }
 
         // Wait for RskStatus
-        let rsk_msg = framed.next().await
+        let rsk_msg = framed
+            .next()
+            .await
             .context("Connection closed waiting for RskStatus")??;
-        
+
         if let P2pMessage::RskMessage(m) = rsk_msg {
             if let RskSubMessage::Status(s) = m.sub_message {
                 trace!(target: "rustock::net", "RSK Handshake successful: peer at block {}", s.best_block_number);
                 Ok(s)
             } else {
-                Err(anyhow::anyhow!("Expected RskStatus, got {:?}", m.sub_message))
+                Err(anyhow::anyhow!(
+                    "Expected RskStatus, got {:?}",
+                    m.sub_message
+                ))
             }
         } else {
             Err(anyhow::anyhow!("Expected RskMessage, got {:?}", rsk_msg))
@@ -281,9 +340,9 @@ impl Handshake {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{B512, B256, U256};
-    use k256::SecretKey;
+    use alloy_primitives::{B256, B512, U256};
     use k256::elliptic_curve::sec1::ToEncodedPoint;
+    use k256::SecretKey;
     use tokio::net::TcpListener;
 
     fn secret_to_public(sk_bytes: &[u8; 32]) -> B512 {
@@ -308,7 +367,7 @@ mod tests {
             total_difficulty: U256::ZERO,
             bootnodes: vec![],
             closed_network: false,
-        read_only: false,
+            read_only: false,
             secret_key: sk,
             discovery_port: 0,
             data_dir: ".".to_string(),
@@ -318,9 +377,9 @@ mod tests {
             max_inbound_per_ip: 4,
             max_inbound_per_cidr: 16,
             inbound_cidr_prefix: 24,
-        best_block_parent_hash: None,
-        earliest_block: 0,
-        snap_capability: false,
+            best_block_parent_hash: None,
+            earliest_block: 0,
+            snap_capability: false,
         }
     }
 
@@ -332,15 +391,16 @@ mod tests {
     async fn test_handshake_genesis_mismatch() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        
+
         let genesis1 = B256::repeat_byte(0x11);
         let genesis2 = B256::repeat_byte(0x22);
-        
+
         let client_task = tokio::spawn(async move {
             let stream = TcpStream::connect(addr).await.unwrap();
             let config = mock_config(genesis1);
             let handshake = Handshake::new(stream, config.clone(), None);
-            let mut framed = tokio_util::codec::Framed::new(handshake.stream, HandshakeCodec::Plain(P2pCodec));
+            let mut framed =
+                tokio_util::codec::Framed::new(handshake.stream, HandshakeCodec::Plain(P2pCodec));
             Handshake::send_hello(&config, &mut framed).await.unwrap();
             let _ = Handshake::receive_hello(&mut framed).await.unwrap();
             Handshake::send_status(&config, &mut framed).await.unwrap();
@@ -351,7 +411,8 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let config = mock_config(genesis2);
             let handshake = Handshake::new(stream, config.clone(), None);
-            let mut framed = tokio_util::codec::Framed::new(handshake.stream, HandshakeCodec::Plain(P2pCodec));
+            let mut framed =
+                tokio_util::codec::Framed::new(handshake.stream, HandshakeCodec::Plain(P2pCodec));
             let _ = Handshake::receive_hello(&mut framed).await.unwrap();
             Handshake::send_hello(&config, &mut framed).await.unwrap();
             Handshake::receive_status(&config, &mut framed).await
@@ -360,15 +421,23 @@ mod tests {
         let (res1, res2) = tokio::join!(client_task, server_task);
         let res1: Result<crate::protocol::RskStatus, anyhow::Error> = res1.unwrap();
         let res2: Result<crate::protocol::RskStatus, anyhow::Error> = res2.unwrap();
-        
+
         assert!(res1.is_err());
         assert!(res2.is_err());
-        
+
         let err1 = res1.unwrap_err().to_string();
         let err2 = res2.unwrap_err().to_string();
-        
-        assert!(err1.contains("Genesis hash mismatch") || err1.contains("Connection closed") || err1.contains("Connection reset"));
-        assert!(err2.contains("Genesis hash mismatch") || err2.contains("Connection closed") || err2.contains("Connection reset"));
+
+        assert!(
+            err1.contains("Genesis hash mismatch")
+                || err1.contains("Connection closed")
+                || err1.contains("Connection reset")
+        );
+        assert!(
+            err2.contains("Genesis hash mismatch")
+                || err2.contains("Connection closed")
+                || err2.contains("Connection reset")
+        );
     }
 
     /// Full end-to-end test: outbound initiator (RLPx) connects to inbound
@@ -415,12 +484,15 @@ mod tests {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::*;
     use super::tests::mock_config;
+    use super::*;
     use alloy_primitives::B256;
 
     fn cap(name: &str, version: u64) -> Capability {
-        Capability { name: name.to_string(), version }
+        Capability {
+            name: name.to_string(),
+            version,
+        }
     }
 
     /// An rskj peer offers `rsk/62` and `snap/1`, and must come out at 62.
@@ -518,9 +590,18 @@ mod uncle_capability_tests {
     #[test]
     fn the_highest_shared_version_wins() {
         let caps = PeerCapabilities::negotiate(&[
-            Capability { name: "rsk".to_string(), version: 62 },
-            Capability { name: "rsk".to_string(), version: 63 },
-            Capability { name: "rsk".to_string(), version: 64 },
+            Capability {
+                name: "rsk".to_string(),
+                version: 62,
+            },
+            Capability {
+                name: "rsk".to_string(),
+                version: 63,
+            },
+            Capability {
+                name: "rsk".to_string(),
+                version: 64,
+            },
         ]);
         assert_eq!(caps.rsk_version, RSK_RANGE_VERSION);
         assert!(caps.understands_header_uncles());

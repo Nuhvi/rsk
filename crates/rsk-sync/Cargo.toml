@@ -1,0 +1,25 @@
+[package]
+name = "rsk-sync"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rootstock header sync engine (parallel skeleton walk from rustock), storing into rsk-store"
+
+[dependencies]
+alloy-primitives = { version = "1.5.4", features = ["serde", "rlp"] }
+anyhow = "1.0.104"
+futures = "0.3.31"
+k256 = { version = "0.13.4", features = ["ecdsa", "ecdh"] }
+rsk-consensus = { path = "../rsk-consensus" }
+rsk-p2p = { path = "../rsk-p2p" }
+rsk-store = { path = "../rsk-store" }
+thiserror = "2.0.18"
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tracing = "0.1.44"
+uuid = { version = "1.20.0", features = ["v4"] }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "time"] }
+tempfile = "3.25.0"
+alloy-rlp = { version = "0.3.13", features = ["derive"] }

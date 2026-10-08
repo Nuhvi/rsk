@@ -5,12 +5,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Converts a U256 gas limit to u64, returning an error on overflow.
 fn gas_limit_as_u64(gas_limit: U256) -> Result<u64, ValidationError> {
-    gas_limit.try_into().map_err(|_| ValidationError::GasLimitOverflow)
+    gas_limit
+        .try_into()
+        .map_err(|_| ValidationError::GasLimitOverflow)
 }
 
 pub struct BlockNumberRule;
 impl ParentHeaderValidator for BlockNumberRule {
-    fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
+    fn validate_with_parent(
+        &self,
+        header: &Header,
+        parent: &Header,
+    ) -> Result<(), ValidationError> {
         if header.number != parent.number + 1 {
             return Err(ValidationError::InvalidBlockNumber {
                 expected: parent.number + 1,
@@ -23,7 +29,11 @@ impl ParentHeaderValidator for BlockNumberRule {
 
 pub struct ParentHashRule;
 impl ParentHeaderValidator for ParentHashRule {
-    fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
+    fn validate_with_parent(
+        &self,
+        header: &Header,
+        parent: &Header,
+    ) -> Result<(), ValidationError> {
         let parent_hash = parent.hash();
         if header.parent_hash != parent_hash {
             return Err(ValidationError::ParentHashMismatch {
@@ -51,7 +61,7 @@ impl HeaderValidator for TimestampRule {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| ValidationError::SystemTimeError)?
             .as_secs();
-            
+
         if header.timestamp > now + self.max_future_offset {
             return Err(ValidationError::TimestampInFuture {
                 current: now,
@@ -63,7 +73,11 @@ impl HeaderValidator for TimestampRule {
 }
 
 impl ParentHeaderValidator for TimestampRule {
-    fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
+    fn validate_with_parent(
+        &self,
+        header: &Header,
+        parent: &Header,
+    ) -> Result<(), ValidationError> {
         self.validate(header)?;
         if header.timestamp <= parent.timestamp {
             return Err(ValidationError::TimestampOlderThanParent {
@@ -113,12 +127,16 @@ pub struct BlockParentGasLimitRule {
 }
 
 impl ParentHeaderValidator for BlockParentGasLimitRule {
-    fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
+    fn validate_with_parent(
+        &self,
+        header: &Header,
+        parent: &Header,
+    ) -> Result<(), ValidationError> {
         let limit = gas_limit_as_u64(header.gas_limit)?;
         let parent_limit = gas_limit_as_u64(parent.gas_limit)?;
         let divisor = self.config.gas_limit_bound_divisor;
         let delta = parent_limit / divisor;
-        
+
         if limit < parent_limit - delta || limit > parent_limit + delta {
             return Err(ValidationError::GasLimitInvalid {
                 parent: parent_limit,

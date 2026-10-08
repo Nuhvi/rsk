@@ -1,7 +1,7 @@
-use alloy_rlp::{RlpDecodable, RlpEncodable, Encodable, Decodable};
-use alloy_primitives::{B256, B512, Bytes};
+use alloy_primitives::{Bytes, B256, B512};
+use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
 use k256::ecdsa::SigningKey;
-use sha3::{Keccak256, Digest};
+use sha3::{Digest, Keccak256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoveryMessageType {
@@ -137,8 +137,9 @@ impl DiscoveryPacket {
         sig_payload.extend_from_slice(&data);
 
         let sig_hash = Keccak256::digest(&sig_payload);
-        
-        let (signature_bytes, recovery_id) = key.sign_prehash_recoverable(&sig_hash)
+
+        let (signature_bytes, recovery_id) = key
+            .sign_prehash_recoverable(&sig_hash)
             .map_err(|e| anyhow::anyhow!("Signing failed: {:?}", e))?;
         let mut signature = [0u8; 65];
         signature[..64].copy_from_slice(&signature_bytes.to_bytes());
@@ -148,7 +149,7 @@ impl DiscoveryPacket {
         mdc_payload.extend_from_slice(&signature);
         mdc_payload.extend_from_slice(&type_raw);
         mdc_payload.extend_from_slice(&data);
-        
+
         let mdc = B256::from_slice(&Keccak256::digest(&mdc_payload));
 
         Ok(Self {
@@ -162,19 +163,23 @@ impl DiscoveryPacket {
     pub fn recover_id(&self) -> anyhow::Result<B512> {
         let mut data = Vec::new();
         self.payload.encode(&mut data);
-        
+
         let mut sig_payload = vec![self.msg_type as u8];
         sig_payload.extend_from_slice(&data);
         let sig_hash = Keccak256::digest(&sig_payload);
-        
+
         let signature_bytes = k256::ecdsa::Signature::from_slice(&self.signature[..64])
             .map_err(|e| anyhow::anyhow!("Invalid signature format: {:?}", e))?;
         let recovery_id = k256::ecdsa::RecoveryId::from_byte(self.signature[64])
             .ok_or_else(|| anyhow::anyhow!("Invalid recovery ID"))?;
-            
-        let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(&sig_hash, &signature_bytes, recovery_id)
-            .map_err(|e| anyhow::anyhow!("Failed to recover public key: {:?}", e))?;
-            
+
+        let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(
+            &sig_hash,
+            &signature_bytes,
+            recovery_id,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to recover public key: {:?}", e))?;
+
         let full_pubkey = vk.to_encoded_point(false);
         let pubkey_bytes = &full_pubkey.as_bytes()[1..]; // skip 0x04 prefix
         Ok(B512::from_slice(pubkey_bytes))
@@ -188,7 +193,7 @@ impl DiscoveryPacket {
         let mdc = B256::from_slice(&buf[0..32]);
         let mut signature = [0u8; 65];
         signature.copy_from_slice(&buf[32..97]);
-        
+
         let actual_mdc = B256::from_slice(&Keccak256::digest(&buf[32..]));
         if mdc != actual_mdc {
             return Err(anyhow::anyhow!("MDC mismatch"));
@@ -202,8 +207,12 @@ impl DiscoveryPacket {
         let payload = match msg_type {
             DiscoveryMessageType::Ping => DiscoveryPayload::Ping(PingMessage::decode(&mut data)?),
             DiscoveryMessageType::Pong => DiscoveryPayload::Pong(PongMessage::decode(&mut data)?),
-            DiscoveryMessageType::FindNode => DiscoveryPayload::FindNode(FindNodeMessage::decode(&mut data)?),
-            DiscoveryMessageType::Neighbors => DiscoveryPayload::Neighbors(NeighborsMessage::decode(&mut data)?),
+            DiscoveryMessageType::FindNode => {
+                DiscoveryPayload::FindNode(FindNodeMessage::decode(&mut data)?)
+            }
+            DiscoveryMessageType::Neighbors => {
+                DiscoveryPayload::Neighbors(NeighborsMessage::decode(&mut data)?)
+            }
         };
 
         Ok(Self {
@@ -224,7 +233,8 @@ mod tests {
     #[test]
     fn test_packet_encoding_decoding() {
         let key = SigningKey::from_slice(&[0x42; 32]).unwrap();
-        let local_id = B512::from_slice(&key.verifying_key().to_encoded_point(false).as_bytes()[1..]);
+        let local_id =
+            B512::from_slice(&key.verifying_key().to_encoded_point(false).as_bytes()[1..]);
 
         let ping = PingMessage {
             from: DiscoveryEndpoint {
@@ -244,10 +254,10 @@ mod tests {
         let payload = DiscoveryPayload::Ping(ping);
         let packet = DiscoveryPacket::create(payload, &key).unwrap();
         let encoded = packet.encode();
-        
+
         let decoded = DiscoveryPacket::decode(&encoded).unwrap();
         assert_eq!(decoded.msg_type, DiscoveryMessageType::Ping);
-        
+
         let recovered_id = decoded.recover_id().unwrap();
         assert_eq!(recovered_id, local_id);
     }

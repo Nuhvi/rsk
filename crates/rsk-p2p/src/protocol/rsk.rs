@@ -1,8 +1,10 @@
-use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable, Header as RlpHeader};
-use alloy_primitives::{B256, Bytes, U256};
-use rsk_consensus::{Header, Transaction};
-use rsk_consensus::rlp_compat::{decode_u8_lenient, decode_u64_lenient, decode_u256_lenient, decode_u32_lenient};
 use super::snap;
+use alloy_primitives::{Bytes, B256, U256};
+use alloy_rlp::{Decodable, Encodable, Header as RlpHeader, RlpDecodable, RlpEncodable};
+use rsk_consensus::rlp_compat::{
+    decode_u256_lenient, decode_u32_lenient, decode_u64_lenient, decode_u8_lenient,
+};
+use rsk_consensus::{Header, Transaction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RskStatus {
@@ -32,7 +34,7 @@ impl Encodable for RskStatus {
         let mut list = Vec::new();
         self.best_block_number.encode(&mut list);
         self.best_block_hash.encode(&mut list);
-        
+
         if let (Some(parent), Some(td)) = (self.best_block_parent_hash, self.total_difficulty) {
             parent.encode(&mut list);
             encode_difficulty(td, &mut list);
@@ -42,8 +44,12 @@ impl Encodable for RskStatus {
                 earliest.encode(&mut list);
             }
         }
-        
-        RlpHeader { list: true, payload_length: list.len() }.encode(out);
+
+        RlpHeader {
+            list: true,
+            payload_length: list.len(),
+        }
+        .encode(out);
         out.put_slice(&list);
     }
 
@@ -52,7 +58,12 @@ impl Encodable for RskStatus {
         if let (Some(parent), Some(td)) = (self.best_block_parent_hash, self.total_difficulty) {
             len += parent.length() + difficulty_length(td);
         }
-        RlpHeader { list: true, payload_length: len }.length() + len
+        RlpHeader {
+            list: true,
+            payload_length: len,
+        }
+        .length()
+            + len
     }
 }
 
@@ -142,10 +153,18 @@ pub struct BlockHeadersQuery {
     pub count: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockHeadersResponse {
     pub id: u64,
     pub headers: Vec<Header>,
+    /// Original wire bytes of each header, positionally aligned with `headers`.
+    ///
+    /// Java's RLP is non-canonical (leading-zero `BigInteger` bytes), so a
+    /// consensus hash is computed over the peer's exact bytes. Retained at
+    /// decode time for callers that persist what they download (e.g. a header
+    /// store), so the stored bytes are always the ones a later re-hash must
+    /// use.
+    pub raw: Vec<Bytes>,
 }
 
 /// A request for trunk headers together with the uncle headers they reference.
@@ -181,7 +200,11 @@ impl HeaderWithUncles {
             uncle.encode(&mut payload);
         }
         let mut out = Vec::with_capacity(payload.len() + 9);
-        RlpHeader { list: true, payload_length: payload.len() }.encode(&mut out);
+        RlpHeader {
+            list: true,
+            payload_length: payload.len(),
+        }
+        .encode(&mut out);
         out.extend_from_slice(&payload);
         out
     }
@@ -337,7 +360,11 @@ impl Encodable for BlockRange {
         self.earliest_block.encode(&mut list);
         self.latest_block.encode(&mut list);
         self.latest_block_hash.encode(&mut list);
-        RlpHeader { list: true, payload_length: list.len() }.encode(out);
+        RlpHeader {
+            list: true,
+            payload_length: list.len(),
+        }
+        .encode(out);
         out.put_slice(&list);
     }
 }
@@ -411,7 +438,7 @@ impl RskSubMessage {
         }
     }
 
-    /// Encodes parameters as a List. 
+    /// Encodes parameters as a List.
     /// Corresponds to Java's getEncodedMessage() [id + params] or [params for status]
     fn encode_params(&self, out: &mut Vec<u8>) {
         match self {
@@ -426,7 +453,11 @@ impl RskSubMessage {
                         earliest.encode(&mut list);
                     }
                 }
-                RlpHeader { list: true, payload_length: list.len() }.encode(out);
+                RlpHeader {
+                    list: true,
+                    payload_length: list.len(),
+                }
+                .encode(out);
                 out.extend_from_slice(&list);
             }
             RskSubMessage::BlockRangeUpdate(range) => {
@@ -437,9 +468,13 @@ impl RskSubMessage {
                 let mut query_params = Vec::new();
                 r.query.hash.encode(&mut query_params);
                 r.query.count.encode(&mut query_params);
-                
+
                 let mut inner_list = Vec::new();
-                RlpHeader { list: true, payload_length: query_params.len() }.encode(&mut inner_list);
+                RlpHeader {
+                    list: true,
+                    payload_length: query_params.len(),
+                }
+                .encode(&mut inner_list);
                 inner_list.extend_from_slice(&query_params);
 
                 let mut params = Vec::new();
@@ -447,7 +482,11 @@ impl RskSubMessage {
                 // The inner list is pre-encoded RLP, so it's just appended to the outer list
                 params.extend_from_slice(&inner_list);
 
-                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                RlpHeader {
+                    list: true,
+                    payload_length: params.len(),
+                }
+                .encode(out);
                 out.extend_from_slice(&params);
             }
             RskSubMessage::BlockHeadersWithUnclesRequest(r) => {
@@ -459,10 +498,18 @@ impl RskSubMessage {
 
                 let mut params = Vec::new();
                 r.id.encode(&mut params);
-                RlpHeader { list: true, payload_length: query_params.len() }.encode(&mut params);
+                RlpHeader {
+                    list: true,
+                    payload_length: query_params.len(),
+                }
+                .encode(&mut params);
                 params.extend_from_slice(&query_params);
 
-                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                RlpHeader {
+                    list: true,
+                    payload_length: params.len(),
+                }
+                .encode(out);
                 out.extend_from_slice(&params);
             }
             RskSubMessage::BlockHeadersWithUnclesResponse(r) => {
@@ -473,18 +520,28 @@ impl RskSubMessage {
                     entry.header.encode(&mut one);
                     one.extend_from_slice(&entry.encoded_uncles());
 
-                    RlpHeader { list: true, payload_length: one.len() }
-                        .encode(&mut entries_payload);
+                    RlpHeader {
+                        list: true,
+                        payload_length: one.len(),
+                    }
+                    .encode(&mut entries_payload);
                     entries_payload.extend_from_slice(&one);
                 }
 
                 let mut params = Vec::new();
                 r.id.encode(&mut params);
-                RlpHeader { list: true, payload_length: entries_payload.len() }
-                    .encode(&mut params);
+                RlpHeader {
+                    list: true,
+                    payload_length: entries_payload.len(),
+                }
+                .encode(&mut params);
                 params.extend_from_slice(&entries_payload);
 
-                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                RlpHeader {
+                    list: true,
+                    payload_length: params.len(),
+                }
+                .encode(out);
                 out.extend_from_slice(&params);
             }
             RskSubMessage::BlockHeadersResponse(r) => {
@@ -493,20 +550,32 @@ impl RskSubMessage {
                 for h in &r.headers {
                     h.encode(&mut headers_payload);
                 }
-                
+
                 let mut headers_list = Vec::new();
-                RlpHeader { list: true, payload_length: headers_payload.len() }.encode(&mut headers_list);
+                RlpHeader {
+                    list: true,
+                    payload_length: headers_payload.len(),
+                }
+                .encode(&mut headers_list);
                 headers_list.extend_from_slice(&headers_payload);
 
                 let mut wrapped_headers = Vec::new();
-                RlpHeader { list: true, payload_length: headers_list.len() }.encode(&mut wrapped_headers);
+                RlpHeader {
+                    list: true,
+                    payload_length: headers_list.len(),
+                }
+                .encode(&mut wrapped_headers);
                 wrapped_headers.extend_from_slice(&headers_list);
 
                 let mut params = Vec::new();
                 r.id.encode(&mut params);
                 params.extend_from_slice(&wrapped_headers);
 
-                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                RlpHeader {
+                    list: true,
+                    payload_length: params.len(),
+                }
+                .encode(out);
                 out.extend_from_slice(&params);
             }
             RskSubMessage::BlockHashRequest(r) => {
@@ -515,14 +584,22 @@ impl RskSubMessage {
                 r.height.encode(&mut inner);
 
                 let mut inner_list = Vec::new();
-                RlpHeader { list: true, payload_length: inner.len() }.encode(&mut inner_list);
+                RlpHeader {
+                    list: true,
+                    payload_length: inner.len(),
+                }
+                .encode(&mut inner_list);
                 inner_list.extend_from_slice(&inner);
 
                 let mut params = Vec::new();
                 r.id.encode(&mut params);
                 params.extend_from_slice(&inner_list);
 
-                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                RlpHeader {
+                    list: true,
+                    payload_length: params.len(),
+                }
+                .encode(out);
                 out.extend_from_slice(&params);
             }
             RskSubMessage::BlockHashResponse(r) => {
@@ -531,14 +608,22 @@ impl RskSubMessage {
                 r.hash.encode(&mut inner);
 
                 let mut inner_list = Vec::new();
-                RlpHeader { list: true, payload_length: inner.len() }.encode(&mut inner_list);
+                RlpHeader {
+                    list: true,
+                    payload_length: inner.len(),
+                }
+                .encode(&mut inner_list);
                 inner_list.extend_from_slice(&inner);
 
                 let mut params = Vec::new();
                 r.id.encode(&mut params);
                 params.extend_from_slice(&inner_list);
 
-                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                RlpHeader {
+                    list: true,
+                    payload_length: params.len(),
+                }
+                .encode(out);
                 out.extend_from_slice(&params);
             }
             RskSubMessage::SkeletonRequest(r) => {
@@ -547,14 +632,22 @@ impl RskSubMessage {
                 r.start_number.encode(&mut inner);
 
                 let mut inner_list = Vec::new();
-                RlpHeader { list: true, payload_length: inner.len() }.encode(&mut inner_list);
+                RlpHeader {
+                    list: true,
+                    payload_length: inner.len(),
+                }
+                .encode(&mut inner_list);
                 inner_list.extend_from_slice(&inner);
 
                 let mut params = Vec::new();
                 r.id.encode(&mut params);
                 params.extend_from_slice(&inner_list);
 
-                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                RlpHeader {
+                    list: true,
+                    payload_length: params.len(),
+                }
+                .encode(out);
                 out.extend_from_slice(&params);
             }
             RskSubMessage::SkeletonResponse(r) => {
@@ -565,23 +658,39 @@ impl RskSubMessage {
                     let mut bid_elems = Vec::new();
                     bid.hash.encode(&mut bid_elems);
                     bid.number.encode(&mut bid_elems);
-                    RlpHeader { list: true, payload_length: bid_elems.len() }.encode(&mut bids_payload);
+                    RlpHeader {
+                        list: true,
+                        payload_length: bid_elems.len(),
+                    }
+                    .encode(&mut bids_payload);
                     bids_payload.extend_from_slice(&bid_elems);
                 }
 
                 let mut inner_list = Vec::new();
-                RlpHeader { list: true, payload_length: bids_payload.len() }.encode(&mut inner_list);
+                RlpHeader {
+                    list: true,
+                    payload_length: bids_payload.len(),
+                }
+                .encode(&mut inner_list);
                 inner_list.extend_from_slice(&bids_payload);
 
                 let mut outer = Vec::new();
-                RlpHeader { list: true, payload_length: inner_list.len() }.encode(&mut outer);
+                RlpHeader {
+                    list: true,
+                    payload_length: inner_list.len(),
+                }
+                .encode(&mut outer);
                 outer.extend_from_slice(&inner_list);
 
                 let mut params = Vec::new();
                 r.id.encode(&mut params);
                 params.extend_from_slice(&outer);
 
-                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                RlpHeader {
+                    list: true,
+                    payload_length: params.len(),
+                }
+                .encode(out);
                 out.extend_from_slice(&params);
             }
             RskSubMessage::BodyRequest(r) => {
@@ -590,14 +699,22 @@ impl RskSubMessage {
                 r.hash.encode(&mut inner);
 
                 let mut inner_list = Vec::new();
-                RlpHeader { list: true, payload_length: inner.len() }.encode(&mut inner_list);
+                RlpHeader {
+                    list: true,
+                    payload_length: inner.len(),
+                }
+                .encode(&mut inner_list);
                 inner_list.extend_from_slice(&inner);
 
                 let mut params = Vec::new();
                 r.id.encode(&mut params);
                 params.extend_from_slice(&inner_list);
 
-                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                RlpHeader {
+                    list: true,
+                    payload_length: params.len(),
+                }
+                .encode(out);
                 out.extend_from_slice(&params);
             }
             RskSubMessage::BodyResponse(r) => {
@@ -609,7 +726,11 @@ impl RskSubMessage {
                     txs_payload.extend_from_slice(&tx.rlp_for_trie());
                 }
                 let mut txs_list = Vec::new();
-                RlpHeader { list: true, payload_length: txs_payload.len() }.encode(&mut txs_list);
+                RlpHeader {
+                    list: true,
+                    payload_length: txs_payload.len(),
+                }
+                .encode(&mut txs_list);
                 txs_list.extend_from_slice(&txs_payload);
 
                 let mut uncles_payload = Vec::new();
@@ -617,12 +738,20 @@ impl RskSubMessage {
                     uncle.encode(&mut uncles_payload);
                 }
                 let mut uncles_list = Vec::new();
-                RlpHeader { list: true, payload_length: uncles_payload.len() }.encode(&mut uncles_list);
+                RlpHeader {
+                    list: true,
+                    payload_length: uncles_payload.len(),
+                }
+                .encode(&mut uncles_list);
                 uncles_list.extend_from_slice(&uncles_payload);
 
                 let body_len = txs_list.len() + uncles_list.len();
                 let mut body = Vec::new();
-                RlpHeader { list: true, payload_length: body_len }.encode(&mut body);
+                RlpHeader {
+                    list: true,
+                    payload_length: body_len,
+                }
+                .encode(&mut body);
                 body.extend_from_slice(&txs_list);
                 body.extend_from_slice(&uncles_list);
 
@@ -630,7 +759,11 @@ impl RskSubMessage {
                 r.id.encode(&mut params);
                 params.extend_from_slice(&body);
 
-                RlpHeader { list: true, payload_length: params.len() }.encode(out);
+                RlpHeader {
+                    list: true,
+                    payload_length: params.len(),
+                }
+                .encode(out);
                 out.extend_from_slice(&params);
             }
             RskSubMessage::Transactions(txs) => {
@@ -642,7 +775,11 @@ impl RskSubMessage {
                     // the mirror image of the decode bug above.
                     txs_payload.extend_from_slice(tx);
                 }
-                RlpHeader { list: true, payload_length: txs_payload.len() }.encode(out);
+                RlpHeader {
+                    list: true,
+                    payload_length: txs_payload.len(),
+                }
+                .encode(out);
                 out.extend_from_slice(&txs_payload);
             }
             // Snap bodies are built in `snap`, which owns their shape; here
@@ -677,21 +814,33 @@ impl Encodable for RskMessage {
     fn encode(&self, out: &mut dyn alloy_rlp::BufMut) {
         let mut params_rlp = Vec::new();
         self.sub_message.encode_params(&mut params_rlp);
-        
+
         // Java Message.getEncoded(): RLP([type, RLP_String(params_rlp)])
         let mut msg_rlp = Vec::new();
         (self.sub_message.message_type() as u8).encode(&mut msg_rlp);
         // encodeElement wraps in Rlp String (Blob)
-        RlpHeader { list: false, payload_length: params_rlp.len() }.encode(&mut msg_rlp);
+        RlpHeader {
+            list: false,
+            payload_length: params_rlp.len(),
+        }
+        .encode(&mut msg_rlp);
         msg_rlp.extend_from_slice(&params_rlp);
-        
+
         let mut wrapped_msg = Vec::new();
-        RlpHeader { list: true, payload_length: msg_rlp.len() }.encode(&mut wrapped_msg);
+        RlpHeader {
+            list: true,
+            payload_length: msg_rlp.len(),
+        }
+        .encode(&mut wrapped_msg);
         wrapped_msg.extend_from_slice(&msg_rlp);
 
         // Java RskMessage.encode(): RLP([wrapped_msg])
         let mut final_rlp = Vec::new();
-        RlpHeader { list: true, payload_length: wrapped_msg.len() }.encode(&mut final_rlp);
+        RlpHeader {
+            list: true,
+            payload_length: wrapped_msg.len(),
+        }
+        .encode(&mut final_rlp);
         final_rlp.extend_from_slice(&wrapped_msg);
 
         out.put_slice(&final_rlp);
@@ -714,11 +863,13 @@ impl Decodable for RskMessage {
         let mut b2 = &b1[..h2.payload_length];
 
         let type_byte = decode_u8_lenient(&mut b2)?;
-        
+
         // Next is the body_blob (RLP String)
         let body_h = RlpHeader::decode(&mut b2)?;
         if body_h.list {
-            return Err(alloy_rlp::Error::Custom("Expected RLP string for body blob"));
+            return Err(alloy_rlp::Error::Custom(
+                "Expected RLP string for body blob",
+            ));
         }
         let mut body_params = &b2[..body_h.payload_length];
 
@@ -748,7 +899,7 @@ impl Decodable for RskMessage {
                 let list_h = RlpHeader::decode(&mut body_params)?;
                 let mut list_body = &body_params[..list_h.payload_length];
                 let id = decode_u64_lenient(&mut list_body)?;
-                
+
                 let query_h = RlpHeader::decode(&mut list_body)?;
                 let mut query_body = &list_body[..query_h.payload_length];
                 let hash = B256::decode(&mut query_body)?;
@@ -766,15 +917,27 @@ impl Decodable for RskMessage {
 
                 let outer_h = RlpHeader::decode(&mut list_body)?;
                 let mut outer_body = &list_body[..outer_h.payload_length];
-                
+
                 let inner_h = RlpHeader::decode(&mut outer_body)?;
                 let mut inner_body = &outer_body[..inner_h.payload_length];
 
                 let mut headers = Vec::new();
+                let mut raws = Vec::new();
                 while !inner_body.is_empty() {
-                    headers.push(Header::decode_with_hash(&mut inner_body)?);
+                    // Keep the exact bytes the peer sent: Java's RLP is
+                    // non-canonical, and a consensus hash is defined over the
+                    // original encoding, not a re-encoded one.
+                    let start = inner_body;
+                    let header = Header::decode_with_hash(&mut inner_body)?;
+                    let consumed = start.len() - inner_body.len();
+                    raws.push(Bytes::copy_from_slice(&start[..consumed]));
+                    headers.push(header);
                 }
-                RskSubMessage::BlockHeadersResponse(BlockHeadersResponse { id, headers })
+                RskSubMessage::BlockHeadersResponse(BlockHeadersResponse {
+                    id,
+                    headers,
+                    raw: raws,
+                })
             }
             8 => {
                 // BlockHashRequest: RLP([id, RLP([height])])
@@ -810,7 +973,10 @@ impl Decodable for RskMessage {
                     block_identifiers.push(BlockIdentifier { hash, number });
                 }
 
-                RskSubMessage::SkeletonResponse(SkeletonResponse { id, block_identifiers })
+                RskSubMessage::SkeletonResponse(SkeletonResponse {
+                    id,
+                    block_identifiers,
+                })
             }
             16 => {
                 // SkeletonRequest: RLP([id, RLP([startNumber])])
@@ -876,7 +1042,11 @@ impl Decodable for RskMessage {
 
                 // Skip optional BlockHeaderExtension (we don't need it for body storage)
 
-                RskSubMessage::BodyResponse(BodyResponse { id, transactions, uncles })
+                RskSubMessage::BodyResponse(BodyResponse {
+                    id,
+                    transactions,
+                    uncles,
+                })
             }
             6 => {
                 // NewBlockHashes: RLP list of [hash, number] pairs
@@ -918,21 +1088,21 @@ impl Decodable for RskMessage {
             snap::message_type::STATUS_REQUEST => RskSubMessage::SnapStatusRequest(
                 snap::SnapStatusRequest::decode_body(&mut body_params)?,
             ),
-            snap::message_type::STATUS_RESPONSE => RskSubMessage::SnapStatusResponse(
-                Box::new(snap::SnapStatusResponse::decode_body(&mut body_params)?),
-            ),
+            snap::message_type::STATUS_RESPONSE => RskSubMessage::SnapStatusResponse(Box::new(
+                snap::SnapStatusResponse::decode_body(&mut body_params)?,
+            )),
             snap::message_type::STATE_CHUNK_REQUEST => RskSubMessage::SnapChunkRequest(
                 snap::SnapChunkRequest::decode_body(&mut body_params)?,
             ),
-            snap::message_type::STATE_CHUNK_RESPONSE => RskSubMessage::SnapChunkResponse(
-                Box::new(snap::SnapChunkResponse::decode_body(&mut body_params)?),
-            ),
+            snap::message_type::STATE_CHUNK_RESPONSE => RskSubMessage::SnapChunkResponse(Box::new(
+                snap::SnapChunkResponse::decode_body(&mut body_params)?,
+            )),
             snap::message_type::BLOCKS_REQUEST => RskSubMessage::SnapBlocksRequest(
                 snap::SnapBlocksRequest::decode_body(&mut body_params)?,
             ),
-            snap::message_type::BLOCKS_RESPONSE => RskSubMessage::SnapBlocksResponse(
-                Box::new(snap::SnapBlocksResponse::decode_body(&mut body_params)?),
-            ),
+            snap::message_type::BLOCKS_RESPONSE => RskSubMessage::SnapBlocksResponse(Box::new(
+                snap::SnapBlocksResponse::decode_body(&mut body_params)?,
+            )),
             26 => RskSubMessage::BlockRangeUpdate(BlockRange::decode(&mut body_params)?),
             27 => {
                 let list_h = RlpHeader::decode(&mut body_params)?;
@@ -956,7 +1126,9 @@ impl Decodable for RskMessage {
 
                 let entries_h = RlpHeader::decode(&mut list_body)?;
                 if list_body.len() < entries_h.payload_length {
-                    return Err(alloy_rlp::Error::Custom("malformed headers-with-uncles list"));
+                    return Err(alloy_rlp::Error::Custom(
+                        "malformed headers-with-uncles list",
+                    ));
                 }
                 let mut entries_body = &list_body[..entries_h.payload_length];
 
@@ -964,7 +1136,9 @@ impl Decodable for RskMessage {
                 while !entries_body.is_empty() {
                     let entry_h = RlpHeader::decode(&mut entries_body)?;
                     if !entry_h.list || entries_body.len() < entry_h.payload_length {
-                        return Err(alloy_rlp::Error::Custom("malformed headers-with-uncles entry"));
+                        return Err(alloy_rlp::Error::Custom(
+                            "malformed headers-with-uncles entry",
+                        ));
                     }
                     let mut entry_body = &entries_body[..entry_h.payload_length];
                     entries_body = &entries_body[entry_h.payload_length..];
@@ -1011,9 +1185,7 @@ impl Decodable for RskMessage {
                     entries,
                 })
             }
-            other => {
-                RskSubMessage::Unknown(other)
-            }
+            other => RskSubMessage::Unknown(other),
         };
 
         Ok(RskMessage { sub_message })
@@ -1023,8 +1195,7 @@ impl Decodable for RskMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_rlp::{Encodable, Decodable};
-
+    use alloy_rlp::{Decodable, Encodable};
 
     /// A REMASC transaction's zero fields are written as literal 0x00 bytes,
     /// not RLP's empty string. Serving a canonical re-encoding changes the
@@ -1036,7 +1207,11 @@ mod tests {
         inner.push(0x08);
         inner.extend_from_slice(&[0x00, 0x80, 0x00, 0x00, 0x00]);
         let mut raw = Vec::new();
-        RlpHeader { list: true, payload_length: inner.len() }.encode(&mut raw);
+        RlpHeader {
+            list: true,
+            payload_length: inner.len(),
+        }
+        .encode(&mut raw);
         raw.extend_from_slice(&inner);
 
         let tx = Transaction::decode(&mut raw.as_slice()).unwrap();
@@ -1070,7 +1245,7 @@ mod tests {
             best_block_hash: B256::repeat_byte(0x11),
             best_block_parent_hash: Some(B256::repeat_byte(0x22)),
             total_difficulty: Some(U256::from(9999)),
-        earliest_block: None,
+            earliest_block: None,
         };
 
         let mut buf = Vec::new();
@@ -1088,7 +1263,7 @@ mod tests {
             best_block_hash: B256::repeat_byte(0xaa),
             best_block_parent_hash: None,
             total_difficulty: None,
-        earliest_block: None,
+            earliest_block: None,
         };
         let msg = RskMessage::new(RskSubMessage::Status(status));
 
@@ -1097,7 +1272,7 @@ mod tests {
 
         let mut decode_buf = buf.as_slice();
         let decoded = RskMessage::decode(&mut decode_buf).unwrap();
-        
+
         if let RskSubMessage::Status(s) = decoded.sub_message {
             assert_eq!(s.best_block_number, 1);
             assert_eq!(s.best_block_hash, B256::repeat_byte(0xaa));
@@ -1122,7 +1297,7 @@ mod tests {
 
         let mut decode_buf = buf.as_slice();
         let decoded = RskMessage::decode(&mut decode_buf).unwrap();
-        
+
         if let RskSubMessage::BlockHeadersRequest(r) = decoded.sub_message {
             assert_eq!(r.id, 42);
             assert_eq!(r.query.count, 10);
@@ -1134,7 +1309,10 @@ mod tests {
 
     #[test]
     fn test_rsk_message_rlp_block_hash_request() {
-        let req = BlockHashRequest { id: 7, height: 12345 };
+        let req = BlockHashRequest {
+            id: 7,
+            height: 12345,
+        };
         let msg = RskMessage::new(RskSubMessage::BlockHashRequest(req));
 
         let mut buf = Vec::new();
@@ -1153,7 +1331,10 @@ mod tests {
 
     #[test]
     fn test_rsk_message_rlp_block_hash_response() {
-        let resp = BlockHashResponse { id: 7, hash: B256::repeat_byte(0xcc) };
+        let resp = BlockHashResponse {
+            id: 7,
+            hash: B256::repeat_byte(0xcc),
+        };
         let msg = RskMessage::new(RskSubMessage::BlockHashResponse(resp));
 
         let mut buf = Vec::new();
@@ -1172,7 +1353,10 @@ mod tests {
 
     #[test]
     fn test_rsk_message_rlp_skeleton_request() {
-        let req = SkeletonRequest { id: 99, start_number: 5000 };
+        let req = SkeletonRequest {
+            id: 99,
+            start_number: 5000,
+        };
         let msg = RskMessage::new(RskSubMessage::SkeletonRequest(req));
 
         let mut buf = Vec::new();
@@ -1194,9 +1378,18 @@ mod tests {
         let resp = SkeletonResponse {
             id: 99,
             block_identifiers: vec![
-                BlockIdentifier { hash: B256::repeat_byte(0x01), number: 0 },
-                BlockIdentifier { hash: B256::repeat_byte(0x02), number: 192 },
-                BlockIdentifier { hash: B256::repeat_byte(0x03), number: 384 },
+                BlockIdentifier {
+                    hash: B256::repeat_byte(0x01),
+                    number: 0,
+                },
+                BlockIdentifier {
+                    hash: B256::repeat_byte(0x02),
+                    number: 192,
+                },
+                BlockIdentifier {
+                    hash: B256::repeat_byte(0x03),
+                    number: 384,
+                },
             ],
         };
         let msg = RskMessage::new(RskSubMessage::SkeletonResponse(resp));
@@ -1241,22 +1434,38 @@ mod tests {
         let mut inner = Vec::new();
         inner.extend_from_slice(&tx);
         let mut wire = Vec::new();
-        RlpHeader { list: true, payload_length: inner.len() }.encode(&mut wire);
+        RlpHeader {
+            list: true,
+            payload_length: inner.len(),
+        }
+        .encode(&mut wire);
         wire.extend_from_slice(&inner);
 
         // Frame it exactly as rskj's Message.getEncoded does:
         //   RLP([ RLP([ type, RLP_String(params) ]) ])
         let mut msg_rlp = Vec::new();
         (RskMessageType::Transactions as u8).encode(&mut msg_rlp);
-        RlpHeader { list: false, payload_length: wire.len() }.encode(&mut msg_rlp);
+        RlpHeader {
+            list: false,
+            payload_length: wire.len(),
+        }
+        .encode(&mut msg_rlp);
         msg_rlp.extend_from_slice(&wire);
 
         let mut wrapped = Vec::new();
-        RlpHeader { list: true, payload_length: msg_rlp.len() }.encode(&mut wrapped);
+        RlpHeader {
+            list: true,
+            payload_length: msg_rlp.len(),
+        }
+        .encode(&mut wrapped);
         wrapped.extend_from_slice(&msg_rlp);
 
         let mut framed = Vec::new();
-        RlpHeader { list: true, payload_length: wrapped.len() }.encode(&mut framed);
+        RlpHeader {
+            list: true,
+            payload_length: wrapped.len(),
+        }
+        .encode(&mut framed);
         framed.extend_from_slice(&wrapped);
 
         let mut slice = framed.as_slice();
@@ -1302,7 +1511,10 @@ mod tests {
 
     #[test]
     fn test_rsk_message_rlp_body_request() {
-        let req = BodyRequest { id: 55, hash: B256::repeat_byte(0xdd) };
+        let req = BodyRequest {
+            id: 55,
+            hash: B256::repeat_byte(0xdd),
+        };
         let msg = RskMessage::new(RskSubMessage::BodyRequest(req));
 
         let mut buf = Vec::new();
@@ -1385,8 +1597,8 @@ mod tests {
 
     #[test]
     fn test_rsk_message_rlp_body_response_with_txs_and_uncles() {
-        use rsk_consensus::Transaction;
         use alloy_primitives::Address;
+        use rsk_consensus::Transaction;
 
         fn make_tx(nonce: u64) -> Transaction {
             Transaction {
@@ -1642,7 +1854,11 @@ mod block_range_tests {
         8_992_000u64.encode(&mut list);
         99u64.encode(&mut list); // whatever comes next
         let mut buf = Vec::new();
-        RlpHeader { list: true, payload_length: list.len() }.encode(&mut buf);
+        RlpHeader {
+            list: true,
+            payload_length: list.len(),
+        }
+        .encode(&mut buf);
         buf.extend_from_slice(&list);
 
         let decoded = RskStatus::decode(&mut buf.as_slice()).expect("decodes");
@@ -1679,7 +1895,10 @@ mod block_range_tests {
         };
         let mut buf = Vec::new();
         range.encode(&mut buf);
-        assert_eq!(BlockRange::decode(&mut buf.as_slice()).expect("decodes"), range);
+        assert_eq!(
+            BlockRange::decode(&mut buf.as_slice()).expect("decodes"),
+            range
+        );
     }
 
     /// 26 is free in rskj, whose highest message type is 25.
@@ -1719,7 +1938,6 @@ mod rskj_interop {
         }
     }
 }
-
 
 #[cfg(test)]
 mod headers_with_uncles_tests {
@@ -1762,20 +1980,28 @@ mod headers_with_uncles_tests {
         let commitment = alloy_primitives::keccak256(entry.encoded_uncles());
         let mut header = entry.header;
         header.ommers_hash = commitment;
-        HeaderWithUncles { header, uncles: entry.uncles }
+        HeaderWithUncles {
+            header,
+            uncles: entry.uncles,
+        }
     }
 
     fn roundtrip(sub: RskSubMessage) -> RskSubMessage {
         let mut buf = Vec::new();
         RskMessage::new(sub).encode(&mut buf);
-        RskMessage::decode(&mut buf.as_slice()).expect("decodes").sub_message
+        RskMessage::decode(&mut buf.as_slice())
+            .expect("decodes")
+            .sub_message
     }
 
     #[test]
     fn request_roundtrips() {
         let req = BlockHeadersWithUnclesRequest {
             id: 42,
-            query: BlockHeadersQuery { hash: B256::repeat_byte(7), count: 192 },
+            query: BlockHeadersQuery {
+                hash: B256::repeat_byte(7),
+                count: 192,
+            },
         };
         match roundtrip(RskSubMessage::BlockHeadersWithUnclesRequest(req.clone())) {
             RskSubMessage::BlockHeadersWithUnclesRequest(got) => assert_eq!(got, req),
@@ -1789,7 +2015,10 @@ mod headers_with_uncles_tests {
             with_uncles(10, 1000, vec![plain(9, 700), plain(8, 650)]),
             with_uncles(11, 1100, vec![]),
         ];
-        let resp = BlockHeadersWithUnclesResponse { id: 5, entries: entries.clone() };
+        let resp = BlockHeadersWithUnclesResponse {
+            id: 5,
+            entries: entries.clone(),
+        };
 
         match roundtrip(RskSubMessage::BlockHeadersWithUnclesResponse(resp)) {
             RskSubMessage::BlockHeadersWithUnclesResponse(got) => {
@@ -1827,7 +2056,10 @@ mod headers_with_uncles_tests {
 
         let mut buf = Vec::new();
         RskMessage::new(RskSubMessage::BlockHeadersWithUnclesResponse(
-            BlockHeadersWithUnclesResponse { id: 1, entries: vec![forged] },
+            BlockHeadersWithUnclesResponse {
+                id: 1,
+                entries: vec![forged],
+            },
         ))
         .encode(&mut buf);
 
@@ -1851,7 +2083,10 @@ mod headers_with_uncles_tests {
 
         let mut buf = Vec::new();
         RskMessage::new(RskSubMessage::BlockHeadersWithUnclesResponse(
-            BlockHeadersWithUnclesResponse { id: 1, entries: vec![stripped] },
+            BlockHeadersWithUnclesResponse {
+                id: 1,
+                entries: vec![stripped],
+            },
         ))
         .encode(&mut buf);
         assert!(RskMessage::decode(&mut buf.as_slice()).is_err());

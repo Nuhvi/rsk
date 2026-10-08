@@ -1,11 +1,14 @@
-pub mod protocol;
-pub mod config;
 pub mod codec;
+pub mod config;
 pub mod discovery;
 pub mod handshake;
+pub mod protocol;
 pub mod rlpx;
 pub mod utils;
 
-pub use protocol::{HelloMessage, P2pMessage, Capability, PeerInfo, P2P_VERSION, EthStatus, RskStatus, RskMessage, RskSubMessage};
 pub use config::NodeConfig;
-pub use handshake::Handshake;
+pub use handshake::{Handshake, HandshakeCodec, PeerCapabilities};
+pub use protocol::{
+    Capability, EthStatus, HelloMessage, P2pMessage, PeerInfo, RskMessage, RskStatus,
+    RskSubMessage, P2P_VERSION,
+};

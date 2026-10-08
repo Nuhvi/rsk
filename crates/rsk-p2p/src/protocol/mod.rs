@@ -1,19 +1,17 @@
-pub mod p2p;
 pub mod eth;
+pub mod p2p;
 pub mod rsk;
 pub mod snap;
 
-pub use p2p::{HelloMessage, P2pMessage, Capability, PeerInfo, P2P_VERSION, P2pHandler};
 pub use eth::EthStatus;
+pub use p2p::{Capability, HelloMessage, P2pHandler, P2pMessage, PeerInfo, P2P_VERSION};
 pub use rsk::{
-    RskStatus, RskSubMessage, RskMessage,
-    BlockHeadersRequest, BlockHeadersQuery, BlockHeadersResponse,
-    BlockHeadersWithUnclesRequest, BlockHeadersWithUnclesResponse, HeaderWithUncles,
-    BlockHashRequest, BlockHashResponse,
-    SkeletonRequest, SkeletonResponse, BlockIdentifier,
-    BodyRequest, BodyResponse,
+    BlockHashRequest, BlockHashResponse, BlockHeadersQuery, BlockHeadersRequest,
+    BlockHeadersResponse, BlockHeadersWithUnclesRequest, BlockHeadersWithUnclesResponse,
+    BlockIdentifier, BodyRequest, BodyResponse, HeaderWithUncles, RskMessage, RskStatus,
+    RskSubMessage, SkeletonRequest, SkeletonResponse,
 };
 pub use snap::{
-    ChunkPayload, Refusal, SnapBlocksRequest, SnapBlocksResponse, SnapChunkRequest, SnapChunkResponse,
-    SnapEntry, SnapStatusRequest, SnapStatusResponse,
+    ChunkPayload, Refusal, SnapBlocksRequest, SnapBlocksResponse, SnapChunkRequest,
+    SnapChunkResponse, SnapEntry, SnapStatusRequest, SnapStatusResponse,
 };

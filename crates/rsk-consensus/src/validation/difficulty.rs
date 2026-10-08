@@ -13,7 +13,11 @@ pub struct DifficultyRule {
 }
 
 impl ParentHeaderValidator for DifficultyRule {
-    fn validate_with_parent(&self, header: &Header, parent: &Header) -> Result<(), ValidationError> {
+    fn validate_with_parent(
+        &self,
+        header: &Header,
+        parent: &Header,
+    ) -> Result<(), ValidationError> {
         let expected = self.calculate_expected_difficulty(header, parent);
         if header.difficulty != expected {
             return Err(ValidationError::DifficultyMismatch {

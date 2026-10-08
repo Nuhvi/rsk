@@ -18,17 +18,26 @@ notes on next steps.
 - **Milestone 1 done:** `rsk-consensus` (vendored from rustock) provides the full
   RSK header type + `HeaderVerifier` consensus rules + the cumulative-difficulty
   checkpoint gate; `rsk-p2p` (vendored from rustock) provides the RLPx / devp2p /
-  `rsk/62` stack, the rsk subprotocol messages and UDP discovery. The
-  `connect` example dials a real mainnet bootnode, verifies genesis and prints
-  the peer's status — the first step toward P2P header sync:
+  `rsk/62` stack, the rsk subprotocol messages and UDP discovery.
+
+- **Milestone 2 done:** `rsk-sync` performs a **parallel skeleton header walk**
+  over P2P (port of rustock's `HeaderWalk`), verifying every header with the
+  full `HeaderVerifier` rules, storing raw headers into redb, and gating the
+  peer's difficulty claim against the #9,020,000 checkpoint. It anchors at the
+  checkpoint (or a previously-verified boundary on resume) instead of
+  re-downloading genesis. Verified live on mainnet: 288k headers walked in ~10
+  min (debug build, one peer) and a resume re-synced only the ~130-block delta.
 
   ```sh
-  cargo run -p rsk-p2p --example connect -- --host bootstrap12.rsk.co:5050
-  # … peer status: block 9307795, td 61329131479833386325493975807 …
+  cargo run -p rsk-sync --example initial_sync -- --data-dir ./data \
+    --bootnode bootstrap12.rsk.co:5050
   ```
 
-- **Next (M2):** port rustock's skeleton `HeaderWalk` as `rsk-sync` to pull
-  headers over P2P into redb.
+  (Discovery note: only some RSK bootnodes answer UDP discovery at any given
+  time; try several. `bootstrap12.rsk.co` has been reliable in testing.)
+
+- **Next (M3):** follow mode near the tip (`NewBlockHashes` + status polls),
+  Bitcoin cross-link of embedded BTC headers, and reorg handling.
 
 ## Project Structure
 
@@ -40,6 +49,7 @@ crates/
   bitcoin-spv/   — Bitcoin SPV helpers + difficulty-period checkpoint dump
   rsk-consensus/ — vendored rustock consensus: Header, HeaderVerifier, ChainConfig, checkpoint (88 tests)
   rsk-p2p/       — vendored rustock RLPx networking + rsk subprotocol + discovery (80 tests)
+  rsk-sync/      — parallel skeleton header walk into redb + checkpoint gate (rustock HeaderWalk port)
 ```
 
 ### `rsk-store` (library, usable by both node and client)
