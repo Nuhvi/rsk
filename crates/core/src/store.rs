@@ -91,6 +91,8 @@ impl ForkMeta {
     }
 }
 
+// TODO: make the store transactional, so take read transaction snapshot etc.
+
 /// redb-backed Bitcoin chain state. All methods are synchronous and take `&self`
 /// (redb manages its own read/write transactions); there is no threading, no
 /// network and no hidden I/O — the caller drives every operation.
@@ -108,8 +110,7 @@ impl Store {
     /// Create a store over the redb in-memory backend. No disk I/O: this is
     /// what tests use, and what "I control everything going on" means.
     pub fn in_memory() -> Result<Self, Error> {
-        let db = Database::builder()
-            .create_with_backend(redb::backends::InMemoryBackend::new())?;
+        let db = Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?;
         Self::new(db)
     }
 
@@ -179,14 +180,8 @@ impl Store {
                 row.extend_from_slice(&cum.to_be_bytes());
                 headers.insert((0, *height), row.as_slice())?;
             }
-            let first = sorted
-                .first()
-                .expect("checked non-empty above")
-                .0;
-            let last = sorted
-                .last()
-                .expect("checked non-empty above")
-                .0;
+            let first = sorted.first().expect("checked non-empty above").0;
+            let last = sorted.last().expect("checked non-empty above").0;
             let last_hash = sorted
                 .last()
                 .expect("checked non-empty above")
@@ -225,9 +220,7 @@ impl Store {
 
     /// The tip of a fork: `(height, hash)`.
     pub fn fork_tip(&self, fork_id: u64) -> Result<Option<(u64, BlockHash)>, Error> {
-        Ok(self
-            .fork_meta(fork_id)?
-            .map(|m| (m.tip_height, m.tip_hash)))
+        Ok(self.fork_meta(fork_id)?.map(|m| (m.tip_height, m.tip_hash)))
     }
 
     /// Where `hash` lives, if stored: `(fork_id, height)`.
@@ -350,16 +343,17 @@ impl Store {
                 row.extend_from_slice(&bytes);
                 row.extend_from_slice(&cum.to_be_bytes());
                 headers.insert((fork_id, height), row.as_slice())?;
-                hash_loc.insert(header.block_hash().as_byte_array().as_slice(), (fork_id, height))?;
+                hash_loc.insert(
+                    header.block_hash().as_byte_array().as_slice(),
+                    (fork_id, height),
+                )?;
                 // Extend the spine when the root chain crosses a period
                 // boundary (the spine stays a full-chain work ladder).
                 if fork_id == 0 && height % DIFFICULTY_PERIOD == 0 {
                     checkpoints.insert(height, bytes.as_slice())?;
                 }
             }
-            let last = entries
-                .last()
-                .expect("checked non-empty above");
+            let last = entries.last().expect("checked non-empty above");
             let last_hash = last.1.block_hash();
             let mut meta = forks.get(fork_id)?.map(|v| ForkMeta::decode(v.value()));
             if let Some(m) = meta.as_mut() {
@@ -367,8 +361,7 @@ impl Store {
                 m.tip_hash = last_hash;
                 m.tip_work = last.2;
             }
-            let meta = meta
-                .expect("fork meta must exist before appending headers");
+            let meta = meta.expect("fork meta must exist before appending headers");
             forks.insert(fork_id, meta.encode().as_slice())?;
         }
         txn.commit()?;
@@ -445,7 +438,9 @@ impl Store {
             out
         };
         for id in fork_ids {
-            let Some(meta) = self.fork_meta(id)? else { continue };
+            let Some(meta) = self.fork_meta(id)? else {
+                continue;
+            };
             if meta.forkpoint <= below {
                 pruned += self.delete_fork(id)?;
             }

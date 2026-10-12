@@ -333,7 +333,22 @@ impl Chain {
     /// Advance the finalized checkpoint to the newest difficulty-period
     /// boundary that is at least a full period below the tip, and prune
     /// everything at or below it. Returns the new finalized height, if any.
+    ///
+    /// Only finalizes if the work built on top of the boundary (boundary to tip)
+    /// is at least the work of the full period before it. This prevents
+    /// finalizing across a difficulty drop — e.g. from X to 0.1X — that could
+    /// otherwise be reorged if the higher-difficulty chain returns: the tail has
+    /// to grow until it outweighs what it would be replacing.
+    ///
+    /// Cumulative work is known at every period boundary (the spine), so both
+    /// sides are plain differences of stored cumulative work.
+    ///
+    /// Pruning assumes the root chain is canonical, so nothing is finalized
+    /// while a fork is the best chain.
     pub fn finalize_period(&self) -> Result<Option<u64>, Error> {
+        if self.store.best_fork()? != Some(0) {
+            return Ok(None);
+        }
         let Some(tip) = self.tip_height()? else {
             return Ok(None);
         };
@@ -345,6 +360,19 @@ impl Chain {
         if boundary <= current {
             return Ok(None);
         }
+
+        let work = |height: u64| -> Result<Work, Error> {
+            self.store
+                .work_at(0, height)?
+                .ok_or_else(|| Error::Internal(format!("no cumulative work at height {height}")))
+        };
+        // One full period ending at the boundary, and everything built above it.
+        let before = work(boundary)? - work(boundary - DIFFICULTY_PERIOD)?;
+        let after = work(tip)? - work(boundary)?;
+        if after < before {
+            return Ok(None);
+        }
+
         self.store.prune_below(boundary)?;
         Ok(Some(boundary))
     }
@@ -369,12 +397,21 @@ mod tests {
     /// so we can synthesize long chains quickly without a real miner.
     const EASY_BITS: u32 = 0x207f_ffff;
 
-    /// Mine a header on top of `prev` whose hash meets the easy target. The
-    /// returned header is PoW-valid by construction; `tag` makes the header
-    /// unique (used as the timestamp) so two headers with the same parent never
-    /// collide.
-    fn mine(prev: BlockHash, tag: u32) -> BitcoinHeader {
-        let bits = CompactTarget::from_consensus(EASY_BITS);
+    /// Targets with per-block work exactly 20 and 22 (a 1.1x difficulty step).
+    ///
+    /// `Target::to_work` is an integer division (`2^256 / (target + 1)`), so
+    /// near the top of the target range only whole multiples of `EASY_BITS`'s
+    /// work of 2 are reachable (`0x207effff` also floors to 2). Starting from a
+    /// larger base gives finer steps while still passing about one hash in 20,
+    /// so mining stays instant.
+    const WORK20_BITS: u32 = 0x200c_cccc;
+    const WORK22_BITS: u32 = 0x200b_a2e8;
+
+    /// Mine a header on top of `prev` whose hash meets the given target. `tag`
+    /// makes the header unique (used as the timestamp) so two headers with the
+    /// same parent never collide.
+    fn mine_with_target(prev: BlockHash, bits: u32, tag: u32) -> BitcoinHeader {
+        let target = CompactTarget::from_consensus(bits);
         let mut nonce = 0u32;
         loop {
             let h = BitcoinHeader {
@@ -382,7 +419,7 @@ mod tests {
                 prev_blockhash: prev,
                 merkle_root: bitcoin::hashes::Hash::all_zeros(),
                 time: 1_600_000_000 + tag,
-                bits,
+                bits: target,
                 nonce,
             };
             if h.validate_pow(h.target()).is_ok() {
@@ -391,6 +428,26 @@ mod tests {
             nonce = nonce.wrapping_add(1);
             assert!(nonce != 0, "could not mine a header");
         }
+    }
+
+    /// Mine `n` contiguous headers above `prev` with the given target bits.
+    fn mine_chain_with_target(prev: BlockHash, n: usize, bits: u32) -> Vec<BitcoinHeader> {
+        let mut out = Vec::with_capacity(n);
+        let mut parent = prev;
+        for i in 0..n {
+            let h = mine_with_target(parent, bits, i as u32);
+            parent = h.block_hash();
+            out.push(h);
+        }
+        out
+    }
+
+    /// Mine a header on top of `prev` whose hash meets the easy target. The
+    /// returned header is PoW-valid by construction; `tag` makes the header
+    /// unique (used as the timestamp) so two headers with the same parent never
+    /// collide.
+    fn mine(prev: BlockHash, tag: u32) -> BitcoinHeader {
+        mine_with_target(prev, EASY_BITS, tag)
     }
 
     /// Mine `n` contiguous headers above `prev` (chain order: parent first).
@@ -686,6 +743,81 @@ mod tests {
         let out = chain.connect_headers(&run)?;
         assert_eq!(out.connected, 2);
         assert_eq!(out.tip_height, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn finalizes_period_only_when_tail_work_exceeds_pre_check() -> eyre::Result<()> {
+        // At constant difficulty, the work from the boundary to the tip (a full
+        // period plus the extra blocks) exceeds the work of the period before
+        // the boundary, so finalization proceeds.
+        let chain = seeded();
+        let checkpoint = DIFFICULTY_PERIOD as usize;
+
+        // Build a chain to the checkpoint height.
+        let run1 = mine_chain(canonical_hash(&chain, 0), checkpoint);
+        chain.connect_headers(&run1)?;
+        assert_eq!(chain.tip_height()?, Some(checkpoint as u64));
+
+        // Now extend past the checkpoint with blocks at the same difficulty.
+        let run2 = mine_chain(
+            canonical_hash(&chain, checkpoint as u64),
+            checkpoint + 100, // one full period + 100 more
+        );
+        chain.connect_headers(&run2)?;
+        assert_eq!(chain.tip_height()?, Some((2 * checkpoint + 100) as u64));
+
+        // Finalization should succeed because the tail has accumulated a full
+        // period of work after the checkpoint.
+        let finalized = chain.finalize_period()?;
+        assert_eq!(finalized, Some(DIFFICULTY_PERIOD));
+        assert_eq!(chain.finalized_height()?, Some(DIFFICULTY_PERIOD));
+        Ok(())
+    }
+
+    #[test]
+    fn finalizes_only_once_tail_work_catches_up() -> eyre::Result<()> {
+        // Difficulty drops by 10% right at the checkpoint (per-block work
+        // 22 -> 20). A tail of one full period at the lower difficulty carries
+        // ~9% less work than the period before the checkpoint, so finalization
+        // must wait until the tail has grown by about a tenth — and then go
+        // ahead. The boundary stays 2016 throughout (tip < 6048).
+        let chain = seeded();
+        let period = DIFFICULTY_PERIOD as usize;
+
+        // Guard the constants: 11 * 20 == 10 * 22.
+        let w20 = header_work(&mine_with_target(BlockHash::all_zeros(), WORK20_BITS, 0));
+        let w22 = header_work(&mine_with_target(BlockHash::all_zeros(), WORK22_BITS, 0));
+        let times = |w: Work, n: u32| (0..n).fold(Work::from_be_bytes([0; 32]), |acc, _| acc + w);
+        assert_eq!(times(w20, 11), times(w22, 10));
+
+        // The period before the checkpoint: 2016 blocks at work 22.
+        let run1 = mine_chain_with_target(canonical_hash(&chain, 0), period, WORK22_BITS);
+        chain.connect_headers(&run1)?;
+        assert_eq!(chain.tip_height()?, Some(period as u64));
+
+        // Smallest tail at work 20 that reaches 2016 * 22: ceil(44352 / 20).
+        let tail_needed = (period * 22).div_ceil(20);
+        let tail = mine_chain_with_target(
+            canonical_hash(&chain, period as u64),
+            tail_needed,
+            WORK20_BITS,
+        );
+
+        // One block short of enough: refused.
+        chain.connect_headers(&tail[..tail_needed - 1])?;
+        assert_eq!(chain.tip_height()?, Some((period + tail_needed - 1) as u64));
+        assert_eq!(
+            chain.finalize_period()?,
+            None,
+            "must not finalize while the tail is lighter than the period before it"
+        );
+        assert_eq!(chain.finalized_height()?, Some(0));
+
+        // The last block tips the tail over: now it finalizes.
+        chain.connect_headers(&tail[tail_needed - 1..])?;
+        assert_eq!(chain.finalize_period()?, Some(DIFFICULTY_PERIOD));
+        assert_eq!(chain.finalized_height()?, Some(DIFFICULTY_PERIOD));
         Ok(())
     }
 }
