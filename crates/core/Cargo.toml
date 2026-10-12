@@ -1,0 +1,17 @@
+[package]
+name = "rsk-core"
+version = "0.1.0"
+edition = "2024"
+description = "Side-effect-free Rootstock/Bitcoin core: deterministic chain state in redb, no concurrency or I/O in the logic"
+
+[dependencies]
+bitcoin = "0.32.8"
+redb = "2"
+thiserror = "2.0.18"
+
+[lints.clippy]
+unwrap_used = "deny"
+
+[dev-dependencies]
+hex = "0.4.3"
+eyre = "0.6"

@@ -1,0 +1,513 @@
+//! Persistent Bitcoin chain state, backed by redb.
+//!
+//! This is the *state* of the side-effect-free core, modelled on Electrum's
+//! `BlockchainManager`: a **tree of chains** (forks), each with a `forkpoint`
+//! and a `parent`, plus a trusted **checkpoint spine** (one header per
+//! difficulty period) that makes the whole chain's work computable without
+//! holding every block. All validation lives in [`crate::chain`]. Tests
+//! construct the store with the redb **in-memory** backend, so the exact same
+//! code path runs with zero disk I/O.
+
+use std::path::Path;
+
+use bitcoin::block::BlockHash;
+use bitcoin::block::Header as BitcoinHeader;
+use bitcoin::consensus::{Decodable, Encodable};
+use bitcoin::hashes::Hash;
+use bitcoin::pow::Work;
+use redb::{Database, ReadableTable, TableDefinition};
+
+use crate::error::Error;
+
+/// Bitcoin difficulty period, in blocks. Difficulty retargets only at period
+/// boundaries, so every block in a period carries the same work.
+pub const DIFFICULTY_PERIOD: u64 = 2016;
+
+/// Sentinel `parent` for the root chain (fork id 0).
+pub const NO_PARENT: u64 = u64::MAX;
+
+/// Headers+work keyed by `(fork_id, height)`: value is 80-byte header followed
+/// by the 32-byte cumulative work at that height.
+const BTC_HEADERS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("btc_headers");
+/// `hash → (fork_id, height)`.
+const BTC_HASH_LOC: TableDefinition<&[u8], (u64, u64)> = TableDefinition::new("btc_hash_loc");
+/// Fork metadata: `fork_id → ForkMeta` (see [`ForkMeta::encode`]).
+const BTC_FORKS: TableDefinition<u64, &[u8]> = TableDefinition::new("btc_forks");
+/// The checkpoint spine: one trusted header per difficulty period, never
+/// pruned — the cheap whole-chain work ladder.
+const BTC_CHECKPOINTS: TableDefinition<u64, &[u8]> = TableDefinition::new("btc_checkpoints");
+const BTC_META: TableDefinition<&str, &[u8]> = TableDefinition::new("btc_meta");
+
+const META_SEED_HEIGHT: &str = "seed_height";
+const META_FINALIZED: &str = "finalized_height";
+const META_BEST_FORK: &str = "best_fork";
+const META_NEXT_FORK: &str = "next_fork";
+
+/// Metadata for one chain (fork) in the tree. The root chain (id 0) has
+/// `forkpoint == 0`, `parent == None`, and is the initial best chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForkMeta {
+    /// Height of this fork's first header.
+    pub forkpoint: u64,
+    /// The chain this one diverged from; `None` for the root chain.
+    pub parent: Option<u64>,
+    /// Hash of the block at `forkpoint` (this fork's identity).
+    pub forkpoint_hash: BlockHash,
+    /// Highest connected height on this fork.
+    pub tip_height: u64,
+    /// Hash of the block at `tip_height`.
+    pub tip_hash: BlockHash,
+    /// Cumulative work at `tip_height`.
+    pub tip_work: Work,
+}
+
+impl ForkMeta {
+    /// Wire encoding: `forkpoint(8) parent(8) forkpoint_hash(32) tip_height(8)
+    /// tip_hash(32) tip_work(32)` = 120 bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(120);
+        out.extend(self.forkpoint.to_be_bytes());
+        out.extend(self.parent.unwrap_or(NO_PARENT).to_be_bytes());
+        out.extend(self.forkpoint_hash.as_byte_array());
+        out.extend(self.tip_height.to_be_bytes());
+        out.extend(self.tip_hash.as_byte_array());
+        out.extend(self.tip_work.to_be_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> ForkMeta {
+        let parent = u64::from_be_bytes(bytes[8..16].try_into().expect("8 bytes"));
+        let mut fp_hash = [0u8; 32];
+        fp_hash.copy_from_slice(&bytes[16..48]);
+        let tip_work = Work::from_be_bytes(bytes[80..112].try_into().expect("32 bytes"));
+        ForkMeta {
+            forkpoint: u64::from_be_bytes(bytes[0..8].try_into().expect("8 bytes")),
+            parent: (parent != NO_PARENT).then_some(parent),
+            forkpoint_hash: BlockHash::from_byte_array(fp_hash),
+            tip_height: u64::from_be_bytes(bytes[48..56].try_into().expect("8 bytes")),
+            tip_hash: BlockHash::from_byte_array(bytes[56..88].try_into().expect("32 bytes")),
+            tip_work,
+        }
+    }
+}
+
+/// redb-backed Bitcoin chain state. All methods are synchronous and take `&self`
+/// (redb manages its own read/write transactions); there is no threading, no
+/// network and no hidden I/O — the caller drives every operation.
+pub struct Store {
+    db: Database,
+}
+
+impl Store {
+    /// Open (creating if needed) a file-backed store at `path`.
+    pub fn open(path: &Path) -> Result<Self, Error> {
+        let db = Database::create(path)?;
+        Self::new(db)
+    }
+
+    /// Create a store over the redb in-memory backend. No disk I/O: this is
+    /// what tests use, and what "I control everything going on" means.
+    pub fn in_memory() -> Result<Self, Error> {
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())?;
+        Self::new(db)
+    }
+
+    fn new(db: Database) -> Result<Self, Error> {
+        let txn = db.begin_write()?;
+        txn.open_table(BTC_HEADERS)?;
+        txn.open_table(BTC_HASH_LOC)?;
+        txn.open_table(BTC_FORKS)?;
+        txn.open_table(BTC_CHECKPOINTS)?;
+        txn.open_table(BTC_META)?;
+        txn.commit()?;
+        Ok(Self { db })
+    }
+
+    // ── seed ────────────────────────────────────────────────────────────────
+
+    /// Plant the trust anchor: one header per difficulty period (the
+    /// checkpoint spine from `bitcoin-spv/checkpoints.txt`), taken on faith
+    /// without validating ancestors, and create the root chain on top of it.
+    ///
+    /// Because difficulty is constant within a period, each checkpoint header
+    /// pins the work of its whole 2016-block period, so cumulative work is
+    /// known at every boundary without holding every block. The entries must be
+    /// one period apart (contiguous, ascending), starting at a period boundary.
+    pub fn seed_checkpoints(&self, entries: &[(u64, BitcoinHeader)]) -> Result<(), Error> {
+        if entries.is_empty() {
+            return Err(Error::Internal("no checkpoints to seed".into()));
+        }
+        let mut sorted = entries.to_vec();
+        sorted.sort_by_key(|(h, _)| *h);
+        for w in sorted.windows(2) {
+            if w[1].0 != w[0].0 + DIFFICULTY_PERIOD {
+                return Err(Error::Internal(format!(
+                    "checkpoints must be contiguous difficulty periods: {} then {}",
+                    w[0].0, w[1].0
+                )));
+            }
+        }
+
+        let txn = self.db.begin_write()?;
+        {
+            let mut headers = txn.open_table(BTC_HEADERS)?;
+            let mut hash_loc = txn.open_table(BTC_HASH_LOC)?;
+            let mut forks = txn.open_table(BTC_FORKS)?;
+            let mut checkpoints = txn.open_table(BTC_CHECKPOINTS)?;
+            let mut meta = txn.open_table(BTC_META)?;
+            let mut cum = Work::from_be_bytes([0; 32]);
+            let mut prev_w = Work::from_be_bytes([0; 32]);
+            for (i, (height, header)) in sorted.iter().enumerate() {
+                let w = header.target().to_work();
+                cum = if i == 0 {
+                    w // just the boundary block itself
+                } else {
+                    // Period (i-1) had `DIFFICULTY_PERIOD` blocks at `prev_w`;
+                    // the boundary block `prev_w` was already counted, so add
+                    // the remaining `DIFFICULTY_PERIOD - 1` plus this block.
+                    cum + work_scaled(prev_w, DIFFICULTY_PERIOD - 1) + w
+                };
+                prev_w = w;
+                let bytes = encode(header)?;
+                checkpoints.insert(*height, bytes.as_slice())?;
+                hash_loc.insert(header.block_hash().as_byte_array().as_slice(), (0, *height))?;
+                // The spine doubles as the root chain's headers at these
+                // heights, with cumulative work.
+                let mut row = Vec::with_capacity(112);
+                row.extend_from_slice(&bytes);
+                row.extend_from_slice(&cum.to_be_bytes());
+                headers.insert((0, *height), row.as_slice())?;
+            }
+            let first = sorted
+                .first()
+                .expect("checked non-empty above")
+                .0;
+            let last = sorted
+                .last()
+                .expect("checked non-empty above")
+                .0;
+            let last_hash = sorted
+                .last()
+                .expect("checked non-empty above")
+                .1
+                .block_hash();
+            let root = ForkMeta {
+                forkpoint: 0,
+                parent: None,
+                forkpoint_hash: sorted[0].1.block_hash(),
+                tip_height: last,
+                tip_hash: last_hash,
+                tip_work: cum,
+            };
+            forks.insert(0, root.encode().as_slice())?;
+            meta.insert(META_SEED_HEIGHT, first.to_be_bytes().as_slice())?;
+            meta.insert(META_FINALIZED, last.to_be_bytes().as_slice())?;
+            meta.insert(META_BEST_FORK, 0u64.to_be_bytes().as_slice())?;
+            meta.insert(META_NEXT_FORK, 1u64.to_be_bytes().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    // ── fork reads ──────────────────────────────────────────────────────────
+
+    pub fn fork_meta(&self, fork_id: u64) -> Result<Option<ForkMeta>, Error> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BTC_FORKS)?;
+        Ok(table.get(fork_id)?.map(|v| ForkMeta::decode(v.value())))
+    }
+
+    /// The current best (heaviest) chain id.
+    pub fn best_fork(&self) -> Result<Option<u64>, Error> {
+        self.meta_u64(META_BEST_FORK)
+    }
+
+    /// The tip of a fork: `(height, hash)`.
+    pub fn fork_tip(&self, fork_id: u64) -> Result<Option<(u64, BlockHash)>, Error> {
+        Ok(self
+            .fork_meta(fork_id)?
+            .map(|m| (m.tip_height, m.tip_hash)))
+    }
+
+    /// Where `hash` lives, if stored: `(fork_id, height)`.
+    pub fn locate(&self, hash: &BlockHash) -> Result<Option<(u64, u64)>, Error> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BTC_HASH_LOC)?;
+        Ok(table
+            .get(hash.as_byte_array().as_slice())?
+            .map(|v| v.value()))
+    }
+
+    /// Read a header + cumulative work at `(fork_id, height)`.
+    fn row(&self, fork_id: u64, height: u64) -> Result<Option<(BitcoinHeader, Work)>, Error> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BTC_HEADERS)?;
+        Ok(table.get((fork_id, height))?.map(|v| {
+            let bytes = v.value();
+            let mut reader = &bytes[..80];
+            let header = BitcoinHeader::consensus_decode(&mut reader)
+                .expect("stored header is always valid");
+            let work = Work::from_be_bytes(bytes[80..112].try_into().expect("32-byte work"));
+            (header, work)
+        }))
+    }
+
+    pub fn header_at(&self, fork_id: u64, height: u64) -> Result<Option<BitcoinHeader>, Error> {
+        Ok(self.row(fork_id, height)?.map(|(h, _)| h))
+    }
+
+    pub fn work_at(&self, fork_id: u64, height: u64) -> Result<Option<Work>, Error> {
+        Ok(self.row(fork_id, height)?.map(|(_, w)| w))
+    }
+
+    /// Cumulative work of a fork at its tip — the number chain selection
+    /// compares across forks (Electrum's `get_chainwork`).
+    pub fn fork_chainwork(&self, fork_id: u64) -> Result<Option<Work>, Error> {
+        let meta = self.fork_meta(fork_id)?;
+        match meta {
+            None => Ok(None),
+            Some(m) => self.work_at(fork_id, m.tip_height),
+        }
+    }
+
+    pub fn seed_height(&self) -> Result<Option<u64>, Error> {
+        self.meta_u64(META_SEED_HEIGHT)
+    }
+
+    pub fn finalized_height(&self) -> Result<Option<u64>, Error> {
+        self.meta_u64(META_FINALIZED)
+    }
+
+    fn meta_u64(&self, key: &str) -> Result<Option<u64>, Error> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BTC_META)?;
+        Ok(table
+            .get(key)?
+            .map(|v| u64::from_be_bytes(v.value().try_into().expect("8-byte meta"))))
+    }
+
+    // ── fork writes ─────────────────────────────────────────────────────────
+
+    /// Create a new fork diverging from `parent` at `forkpoint`; the block at
+    /// `forkpoint` is `forkpoint_hash`. Returns the new fork id.
+    ///
+    /// The new fork's tip starts empty (`tip_height = forkpoint - 1`, pointing
+    /// at its parent block) and is overwritten by the first `put_headers`.
+    pub fn create_fork(
+        &self,
+        parent: u64,
+        forkpoint: u64,
+        forkpoint_hash: BlockHash,
+    ) -> Result<u64, Error> {
+        let txn = self.db.begin_write()?;
+        let id = {
+            let mut meta = txn.open_table(BTC_META)?;
+            let next = meta
+                .get(META_NEXT_FORK)?
+                .map(|v| u64::from_be_bytes(v.value().try_into().expect("8 bytes")))
+                .unwrap_or(1);
+            meta.insert(META_NEXT_FORK, (next + 1).to_be_bytes().as_slice())?;
+            next
+        };
+        let meta = ForkMeta {
+            forkpoint,
+            parent: Some(parent),
+            forkpoint_hash,
+            tip_height: forkpoint.saturating_sub(1),
+            tip_hash: BlockHash::all_zeros(),
+            tip_work: Work::from_be_bytes([0; 32]),
+        };
+        {
+            let mut forks = txn.open_table(BTC_FORKS)?;
+            forks.insert(id, meta.encode().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(id)
+    }
+
+    /// Append a contiguous run of headers to a fork in a single write
+    /// transaction. Each entry carries its cumulative work (through that
+    /// header, on this fork). Period-boundary heights on the root chain also
+    /// extend the checkpoint spine.
+    pub fn put_headers(
+        &self,
+        fork_id: u64,
+        entries: &[(u64, &BitcoinHeader, Work)],
+    ) -> Result<(), Error> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut headers = txn.open_table(BTC_HEADERS)?;
+            let mut hash_loc = txn.open_table(BTC_HASH_LOC)?;
+            let mut checkpoints = txn.open_table(BTC_CHECKPOINTS)?;
+            let mut forks = txn.open_table(BTC_FORKS)?;
+            for &(height, header, cum) in entries {
+                let bytes = encode(header)?;
+                let mut row = Vec::with_capacity(112);
+                row.extend_from_slice(&bytes);
+                row.extend_from_slice(&cum.to_be_bytes());
+                headers.insert((fork_id, height), row.as_slice())?;
+                hash_loc.insert(header.block_hash().as_byte_array().as_slice(), (fork_id, height))?;
+                // Extend the spine when the root chain crosses a period
+                // boundary (the spine stays a full-chain work ladder).
+                if fork_id == 0 && height % DIFFICULTY_PERIOD == 0 {
+                    checkpoints.insert(height, bytes.as_slice())?;
+                }
+            }
+            let last = entries
+                .last()
+                .expect("checked non-empty above");
+            let last_hash = last.1.block_hash();
+            let mut meta = forks.get(fork_id)?.map(|v| ForkMeta::decode(v.value()));
+            if let Some(m) = meta.as_mut() {
+                m.tip_height = last.0;
+                m.tip_hash = last_hash;
+                m.tip_work = last.2;
+            }
+            let meta = meta
+                .expect("fork meta must exist before appending headers");
+            forks.insert(fork_id, meta.encode().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Mark `fork_id` as the best (heaviest) chain.
+    pub fn set_best_fork(&self, fork_id: u64) -> Result<(), Error> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut meta = txn.open_table(BTC_META)?;
+            meta.insert(META_BEST_FORK, fork_id.to_be_bytes().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Delete a fork and every header/hash it owns (used when it falls at or
+    /// below the finalized floor, or is superseded by pruning).
+    pub fn delete_fork(&self, fork_id: u64) -> Result<u64, Error> {
+        let Some(meta) = self.fork_meta(fork_id)? else {
+            return Ok(0);
+        };
+        let txn = self.db.begin_write()?;
+        let mut removed = 0u64;
+        {
+            let mut headers = txn.open_table(BTC_HEADERS)?;
+            let mut hash_loc = txn.open_table(BTC_HASH_LOC)?;
+            let mut forks = txn.open_table(BTC_FORKS)?;
+            let heights: Vec<u64> = {
+                let mut cursor = headers.range((fork_id, u64::MIN)..=(fork_id, u64::MAX))?;
+                let mut out = Vec::new();
+                while let Some(entry) = cursor.next() {
+                    let (key, _) = entry.map_err(Error::Storage)?;
+                    out.push(key.value().1);
+                }
+                out
+            };
+            for h in heights {
+                if let Some(row) = headers.remove((fork_id, h))? {
+                    let bytes = row.value();
+                    let mut reader = &bytes[..80];
+                    let header = BitcoinHeader::consensus_decode(&mut reader)
+                        .expect("stored header is always valid");
+                    hash_loc.remove(header.block_hash().as_byte_array().as_slice())?;
+                }
+                removed += 1;
+            }
+            forks.remove(fork_id)?;
+        }
+        txn.commit()?;
+        let _ = meta;
+        Ok(removed)
+    }
+
+    /// Prune every header/fork at or below the finalized floor. The checkpoint
+    /// spine and the root chain's rows above the floor survive. Returns the
+    /// number of rows removed.
+    pub fn prune_below(&self, below: u64) -> Result<u64, Error> {
+        let mut pruned = 0u64;
+        // Delete forks that can no longer be canonical (forkpoint <= floor).
+        let fork_ids: Vec<u64> = {
+            let txn = self.db.begin_read()?;
+            let forks = txn.open_table(BTC_FORKS)?;
+            let mut out = Vec::new();
+            let mut cursor = forks.iter()?;
+            while let Some(entry) = cursor.next() {
+                let (key, _) = entry.map_err(Error::Storage)?;
+                let id = key.value();
+                if id != 0 {
+                    out.push(id);
+                }
+            }
+            out
+        };
+        for id in fork_ids {
+            let Some(meta) = self.fork_meta(id)? else { continue };
+            if meta.forkpoint <= below {
+                pruned += self.delete_fork(id)?;
+            }
+        }
+        // Prune the root chain's non-spine rows below the floor. Checkpoint
+        // rows double as the spine and are never pruned.
+        let txn = self.db.begin_write()?;
+        {
+            let mut headers = txn.open_table(BTC_HEADERS)?;
+            let mut hash_loc = txn.open_table(BTC_HASH_LOC)?;
+            let checkpoints = txn.open_table(BTC_CHECKPOINTS)?;
+            let heights: Vec<u64> = {
+                let mut cursor = headers.range((0, u64::MIN)..=(0, below))?;
+                let mut out = Vec::new();
+                while let Some(entry) = cursor.next() {
+                    let (key, _) = entry.map_err(Error::Storage)?;
+                    let h = key.value().1;
+                    if h < below && checkpoints.get(h)?.is_none() {
+                        out.push(h);
+                    }
+                }
+                out
+            };
+            for h in heights {
+                if let Some(row) = headers.remove((0, h))? {
+                    let bytes = row.value();
+                    let mut reader = &bytes[..80];
+                    let header = BitcoinHeader::consensus_decode(&mut reader)
+                        .expect("stored header is always valid");
+                    hash_loc.remove(header.block_hash().as_byte_array().as_slice())?;
+                    pruned += 1;
+                }
+            }
+            let mut meta = txn.open_table(BTC_META)?;
+            meta.insert(META_FINALIZED, below.to_be_bytes().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(pruned)
+    }
+
+    /// Number of live forks (debug/tests).
+    pub fn fork_count(&self) -> Result<u64, Error> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BTC_FORKS)?;
+        Ok(table.iter()?.count() as u64)
+    }
+}
+
+fn encode(header: &BitcoinHeader) -> Result<Vec<u8>, Error> {
+    let mut buf = Vec::with_capacity(80);
+    header
+        .consensus_encode(&mut buf)
+        .map_err(|e| Error::Internal(format!("encode header: {e}")))?;
+    Ok(buf)
+}
+
+/// `work` added to itself `n` times. (`Work` has no `Mul`, and the per-period
+/// scaling only ever happens at seed/prune time, so a loop is fine.)
+fn work_scaled(work: Work, n: u64) -> Work {
+    let mut acc = Work::from_be_bytes([0; 32]);
+    for _ in 0..n {
+        acc = acc + work;
+    }
+    acc
+}
