@@ -2704,6 +2704,7 @@ dependencies = [
  "k256",
  "primitive-types 0.13.1",
  "rsk-consensus",
+ "rsk-core",
  "rsk-p2p",
  "rsk-store",
  "tempfile",

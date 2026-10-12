@@ -26,6 +26,9 @@ pub enum Error {
     #[error("no chain seeded: call Chain::seed_checkpoints first")]
     Unseeded,
 
+    #[error("chain already seeded: checkpoints are planted once; resume by connecting headers")]
+    AlreadySeeded,
+
     #[error("unknown ancestor {0}: the batch does not link to any stored header or checkpoint")]
     UnknownAncestor(BlockHash),
 

@@ -146,11 +146,19 @@ impl Store {
     /// checkpoint spine from `bitcoin-spv/checkpoints.txt`), taken on faith
     /// without validating ancestors, and create the root chain on top of it.
     ///
+    /// This is a one-time operation: it is refused ([`Error::AlreadySeeded`])
+    /// if the store already carries a chain, so it can never clobber a taller
+    /// tip or a more advanced finality floor. Resume by connecting the headers
+    /// above the existing tip.
+    ///
     /// Because difficulty is constant within a period, each checkpoint header
     /// pins the work of its whole 2016-block period, so cumulative work is
     /// known at every boundary without holding every block. The entries must be
     /// one period apart (contiguous, ascending), starting at a period boundary.
     pub fn seed_checkpoints(&self, entries: &[(u64, BitcoinHeader)]) -> Result<(), Error> {
+        if self.fork_meta(0)?.is_some() {
+            return Err(Error::AlreadySeeded);
+        }
         if entries.is_empty() {
             return Err(Error::Internal("no checkpoints to seed".into()));
         }

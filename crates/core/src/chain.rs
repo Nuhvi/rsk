@@ -96,6 +96,16 @@ impl Chain {
         }
     }
 
+    /// Cumulative proof-of-work of the best chain through its tip — the number
+    /// chain selection compares across forks, observable from outside the
+    /// crate (drivers print it; nothing in the logic depends on it).
+    pub fn chainwork(&self) -> Result<Option<Work>, Error> {
+        match self.store.best_fork()? {
+            None => Ok(None),
+            Some(best) => self.store.fork_chainwork(best),
+        }
+    }
+
     /// The current finalized (pruned) height.
     pub fn finalized_height(&self) -> Result<Option<u64>, Error> {
         self.store.finalized_height()
@@ -527,6 +537,25 @@ mod tests {
         let h3 = canonical_hash(&chain, 3);
         assert!(chain.is_canonical(3, &h3)?);
         assert_eq!(chain.height_of(&h3)?, Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn seeding_twice_is_refused_and_leaves_the_chain_intact() -> eyre::Result<()> {
+        let chain = seeded();
+        let run = mine_chain(canonical_hash(&chain, 0), 5);
+        chain.connect_headers(&run)?;
+        let tip = chain.tip_height()?;
+        let work = chain.chainwork()?;
+
+        // Re-seeding an anchored store is refused rather than clobbering the
+        // taller tip and the finality floor.
+        let other = mine(BlockHash::all_zeros(), 42);
+        let err = chain.seed_checkpoints(&[(0, other)]).unwrap_err();
+        assert!(matches!(err, Error::AlreadySeeded), "got {err:?}");
+
+        assert_eq!(chain.tip_height()?, tip);
+        assert_eq!(chain.chainwork()?, work);
         Ok(())
     }
 
