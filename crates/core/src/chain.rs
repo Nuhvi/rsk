@@ -29,7 +29,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::pow::Work;
 
 use crate::error::Error;
-use crate::store::{DIFFICULTY_PERIOD, Store};
+use crate::store::{DIFFICULTY_PERIOD, Store, WriteTxn};
 
 /// How far below the tip a period boundary must be before we consider it
 /// settled and prune the non-checkpoint headers below it.
@@ -47,6 +47,10 @@ pub struct ConnectOutcome {
     pub best_fork: Option<u64>,
     /// Canonical tip height after this batch.
     pub tip_height: u64,
+    /// The new finalized (pruned) height, if this batch advanced it. This is
+    /// the same value [`Chain::finalize_period`] would return: finalization is
+    /// applied automatically, inside the same transaction as the connect.
+    pub finalized: Option<u64>,
 }
 
 /// The canonical-chain engine: a thin, deterministic layer over [`Store`].
@@ -176,9 +180,14 @@ impl Chain {
     ///   when it is strictly heavier.
     /// - A fork whose `forkpoint` is at or below the finalized floor is refused
     ///   ([`Error::ForkBelowFinalized`]) — the spine's finality floor.
+    ///
+    /// The whole operation — reads, validation, writes and the automatic
+    /// finalization below — runs inside one [`WriteTxn`], so nothing can change
+    /// the store between the reads a decision is based on and the writes that
+    /// act on it.
     pub fn connect_headers(&self, headers: &[BitcoinHeader]) -> Result<ConnectOutcome, Error> {
-        let prev_best = self.store.best_fork()?;
         if headers.is_empty() {
+            let prev_best = self.store.best_fork()?;
             let tip = match prev_best {
                 Some(f) => {
                     self.store
@@ -193,22 +202,23 @@ impl Chain {
                 prev_best_fork: prev_best,
                 best_fork: prev_best,
                 tip_height: tip,
+                finalized: None,
             });
         }
 
+        // One transaction for the entire read → validate → write → finalize
+        // sequence. Dropping it without committing (the early returns) aborts.
+        let txn = self.store.write()?;
+        let prev_best = txn.best_fork()?;
+
         // Skip a leading prefix that is already stored anywhere (reconnects).
         let mut start = 0usize;
-        while start < headers.len() && self.store.locate(&headers[start].block_hash())?.is_some() {
+        while start < headers.len() && txn.locate(&headers[start].block_hash())?.is_some() {
             start += 1;
         }
         if start == headers.len() {
             let tip = match prev_best {
-                Some(f) => {
-                    self.store
-                        .fork_tip(f)?
-                        .unwrap_or((0, BlockHash::all_zeros()))
-                        .0
-                }
+                Some(f) => txn.fork_tip(f)?.unwrap_or((0, BlockHash::all_zeros())).0,
                 None => 0,
             };
             return Ok(ConnectOutcome {
@@ -216,6 +226,7 @@ impl Chain {
                 prev_best_fork: prev_best,
                 best_fork: prev_best,
                 tip_height: tip,
+                finalized: None,
             });
         }
 
@@ -225,15 +236,12 @@ impl Chain {
         } else {
             headers[start - 1].block_hash()
         };
-        let (parent_fork, parent_height) = self
-            .store
-            .locate(&parent)?
-            .ok_or(Error::UnknownAncestor(parent))?;
+        let (parent_fork, parent_height) =
+            txn.locate(&parent)?.ok_or(Error::UnknownAncestor(parent))?;
 
         // Decide the target chain: extend the chain whose tip is the parent, or
         // start a new fork from the parent block.
-        let parent_tip = self
-            .store
+        let parent_tip = txn
             .fork_tip(parent_fork)?
             .unwrap_or((0, BlockHash::all_zeros()))
             .0;
@@ -241,7 +249,7 @@ impl Chain {
             (parent_fork, parent_height + 1)
         } else {
             let forkpoint = parent_height + 1;
-            if let Some(finalized) = self.store.finalized_height()?
+            if let Some(finalized) = txn.finalized_height()?
                 && forkpoint <= finalized
             {
                 return Err(Error::ForkBelowFinalized {
@@ -249,9 +257,7 @@ impl Chain {
                     finalized,
                 });
             }
-            let id = self
-                .store
-                .create_fork(parent_fork, forkpoint, headers[start].block_hash())?;
+            let id = txn.create_fork(parent_fork, forkpoint, headers[start].block_hash())?;
             (id, forkpoint)
         };
 
@@ -275,12 +281,9 @@ impl Chain {
         }
 
         // Cumulative work of the run, starting from the parent's work.
-        let base_work = self
-            .store
-            .work_at(parent_fork, parent_height)?
-            .ok_or_else(|| {
-                Error::Internal(format!("no work at ({parent_fork}, {parent_height})"))
-            })?;
+        let base_work = txn.work_at(parent_fork, parent_height)?.ok_or_else(|| {
+            Error::Internal(format!("no work at ({parent_fork}, {parent_height})"))
+        })?;
         let mut entries: Vec<(u64, &BitcoinHeader, Work)> =
             Vec::with_capacity(headers.len() - start);
         let mut cumulative = base_work;
@@ -288,40 +291,37 @@ impl Chain {
             cumulative = cumulative + header.target().to_work();
             entries.push((forkpoint + offset as u64, header, cumulative));
         }
-        self.store.put_headers(target_fork, &entries)?;
+        txn.put_headers(target_fork, &entries)?;
 
         // Re-select the best chain by cumulative work (strictly heavier wins).
-        let mut best = self.store.best_fork()?.unwrap_or(0);
-        let mut best_work = self
-            .store
+        let mut best = txn.best_fork()?.unwrap_or(0);
+        let best_work = txn
             .fork_chainwork(best)?
             .unwrap_or(Work::from_be_bytes([0; 32]));
-        let target_work = self
-            .store
+        let target_work = txn
             .fork_chainwork(target_fork)?
             .unwrap_or(Work::from_be_bytes([0; 32]));
         if target_fork != best && target_work > best_work {
-            self.store.set_best_fork(target_fork)?;
+            txn.set_best_fork(target_fork)?;
             best = target_fork;
-            best_work = target_work;
         }
-        let _ = best_work;
 
         let tip_height = match prev_best {
-            Some(_) => {
-                self.store
-                    .fork_tip(best)?
-                    .unwrap_or((0, BlockHash::all_zeros()))
-                    .0
-            }
+            Some(_) => txn.fork_tip(best)?.unwrap_or((0, BlockHash::all_zeros())).0,
             None => forkpoint + (headers.len() - start) as u64 - 1,
         };
+
+        // Finalization is part of connecting headers: advance the finality
+        // floor if this batch tipped a period boundary over the margin.
+        let finalized = finalize_in_txn(&txn)?;
+        txn.commit()?;
 
         Ok(ConnectOutcome {
             connected: headers.len() - start,
             prev_best_fork: prev_best,
             best_fork: Some(best),
             tip_height,
+            finalized,
         })
     }
 
@@ -333,6 +333,11 @@ impl Chain {
     /// Advance the finalized checkpoint to the newest difficulty-period
     /// boundary that is at least a full period below the tip, and prune
     /// everything at or below it. Returns the new finalized height, if any.
+    ///
+    /// This runs automatically at the end of every [`Chain::connect_headers`]
+    /// batch (reported in [`ConnectOutcome::finalized`]); you do not normally
+    /// need to call it. It is kept public for callers that want to finalize
+    /// without connecting anything.
     ///
     /// Only finalizes if the work built on top of the boundary (boundary to tip)
     /// is at least the work of the full period before it. This prevents
@@ -346,36 +351,50 @@ impl Chain {
     /// Pruning assumes the root chain is canonical, so nothing is finalized
     /// while a fork is the best chain.
     pub fn finalize_period(&self) -> Result<Option<u64>, Error> {
-        if self.store.best_fork()? != Some(0) {
-            return Ok(None);
+        let txn = self.store.write()?;
+        match finalize_in_txn(&txn)? {
+            Some(height) => {
+                txn.commit()?;
+                Ok(Some(height))
+            }
+            // No writes were staged; dropping the transaction aborts it.
+            None => Ok(None),
         }
-        let Some(tip) = self.tip_height()? else {
-            return Ok(None);
-        };
-        if tip < FINALITY_MARGIN_BLOCKS {
-            return Ok(None);
-        }
-        let boundary = ((tip - FINALITY_MARGIN_BLOCKS) / DIFFICULTY_PERIOD) * DIFFICULTY_PERIOD;
-        let current = self.store.finalized_height()?.unwrap_or(0);
-        if boundary <= current {
-            return Ok(None);
-        }
-
-        let work = |height: u64| -> Result<Work, Error> {
-            self.store
-                .work_at(0, height)?
-                .ok_or_else(|| Error::Internal(format!("no cumulative work at height {height}")))
-        };
-        // One full period ending at the boundary, and everything built above it.
-        let before = work(boundary)? - work(boundary - DIFFICULTY_PERIOD)?;
-        let after = work(tip)? - work(boundary)?;
-        if after < before {
-            return Ok(None);
-        }
-
-        self.store.prune_below(boundary)?;
-        Ok(Some(boundary))
     }
+}
+
+/// The finalization rule, applied through an open transaction. See
+/// [`Chain::finalize_period`] for what it means; factored out so
+/// `connect_headers` can run it inside the same transaction as the connect.
+fn finalize_in_txn(txn: &WriteTxn) -> Result<Option<u64>, Error> {
+    if txn.best_fork()? != Some(0) {
+        return Ok(None);
+    }
+    let Some((tip, _)) = txn.fork_tip(0)? else {
+        return Ok(None);
+    };
+    if tip < FINALITY_MARGIN_BLOCKS {
+        return Ok(None);
+    }
+    let boundary = ((tip - FINALITY_MARGIN_BLOCKS) / DIFFICULTY_PERIOD) * DIFFICULTY_PERIOD;
+    let current = txn.finalized_height()?.unwrap_or(0);
+    if boundary <= current {
+        return Ok(None);
+    }
+
+    let work = |height: u64| -> Result<Work, Error> {
+        txn.work_at(0, height)?
+            .ok_or_else(|| Error::Internal(format!("no cumulative work at height {height}")))
+    };
+    // One full period ending at the boundary, and everything built above it.
+    let before = work(boundary)? - work(boundary - DIFFICULTY_PERIOD)?;
+    let after = work(tip)? - work(boundary)?;
+    if after < before {
+        return Ok(None);
+    }
+
+    txn.prune_below(boundary)?;
+    Ok(Some(boundary))
 }
 
 // ── proof-of-work helper ────────────────────────────────────────────────────
@@ -568,6 +587,30 @@ mod tests {
     }
 
     #[test]
+    fn failed_batch_leaves_no_partial_state() -> eyre::Result<()> {
+        // A batch whose parent is not a chain tip starts a new fork; if a later
+        // header in the same batch fails validation, the fork must be rolled
+        // back too — the whole read/validate/write/finalize runs in one txn.
+        let chain = seeded();
+        let main = mine_chain(canonical_hash(&chain, 0), 5);
+        chain.connect_headers(&main)?;
+        assert_eq!(chain.store.fork_count()?, 1);
+
+        // Fork from height 3 (parent = main[2], not the tip), second header
+        // with bad PoW (a much harder target than it was mined for).
+        let fork_base = main[2].block_hash();
+        let mut fork = mine_chain_off(fork_base, 2, 1000);
+        fork[1].bits = CompactTarget::from_consensus(0x1d00_ffff);
+        let err = chain.connect_headers(&fork).unwrap_err();
+        assert!(matches!(err, Error::BadPow { .. }), "got {err:?}");
+
+        // No orphan fork, and no header of the batch was committed.
+        assert_eq!(chain.store.fork_count()?, 1, "no orphan fork");
+        assert!(chain.store.locate(&fork[0].block_hash())?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn heavier_fork_wins() -> eyre::Result<()> {
         let chain = seeded();
         let main = mine_chain(canonical_hash(&chain, 0), 5);
@@ -651,11 +694,11 @@ mod tests {
             canonical_hash(&chain, 0),
             2 * DIFFICULTY_PERIOD as usize + 100,
         );
-        chain.connect_headers(&run)?;
+        let out = chain.connect_headers(&run)?;
         assert_eq!(chain.tip_height()?, Some(2 * DIFFICULTY_PERIOD + 100));
 
-        let finalized = chain.finalize_period()?;
-        assert_eq!(finalized, Some(DIFFICULTY_PERIOD));
+        // Finalization happened automatically as part of the connect.
+        assert_eq!(out.finalized, Some(DIFFICULTY_PERIOD));
         assert_eq!(chain.finalized_height()?, Some(DIFFICULTY_PERIOD));
 
         // Non-checkpoint headers below the boundary are pruned; the boundary
@@ -681,8 +724,9 @@ mod tests {
             canonical_hash(&chain, 0),
             2 * DIFFICULTY_PERIOD as usize + 100,
         );
-        chain.connect_headers(&run)?;
-        chain.finalize_period()?;
+        // The connect finalizes and prunes automatically.
+        let out = chain.connect_headers(&run)?;
+        assert_eq!(out.finalized, Some(DIFFICULTY_PERIOD));
 
         // The checkpoint spine still resolves: height 0 (the seeded genesis)
         // survives, its hash maps to its height, and its work is intact.
@@ -764,13 +808,12 @@ mod tests {
             canonical_hash(&chain, checkpoint as u64),
             checkpoint + 100, // one full period + 100 more
         );
-        chain.connect_headers(&run2)?;
+        let out = chain.connect_headers(&run2)?;
         assert_eq!(chain.tip_height()?, Some((2 * checkpoint + 100) as u64));
 
         // Finalization should succeed because the tail has accumulated a full
         // period of work after the checkpoint.
-        let finalized = chain.finalize_period()?;
-        assert_eq!(finalized, Some(DIFFICULTY_PERIOD));
+        assert_eq!(out.finalized, Some(DIFFICULTY_PERIOD));
         assert_eq!(chain.finalized_height()?, Some(DIFFICULTY_PERIOD));
         Ok(())
     }
@@ -804,19 +847,18 @@ mod tests {
             WORK20_BITS,
         );
 
-        // One block short of enough: refused.
-        chain.connect_headers(&tail[..tail_needed - 1])?;
+        // One block short of enough: the automatic finalization is refused.
+        let short = chain.connect_headers(&tail[..tail_needed - 1])?;
         assert_eq!(chain.tip_height()?, Some((period + tail_needed - 1) as u64));
         assert_eq!(
-            chain.finalize_period()?,
-            None,
+            short.finalized, None,
             "must not finalize while the tail is lighter than the period before it"
         );
         assert_eq!(chain.finalized_height()?, Some(0));
 
         // The last block tips the tail over: now it finalizes.
-        chain.connect_headers(&tail[tail_needed - 1..])?;
-        assert_eq!(chain.finalize_period()?, Some(DIFFICULTY_PERIOD));
+        let out = chain.connect_headers(&tail[tail_needed - 1..])?;
+        assert_eq!(out.finalized, Some(DIFFICULTY_PERIOD));
         assert_eq!(chain.finalized_height()?, Some(DIFFICULTY_PERIOD));
         Ok(())
     }

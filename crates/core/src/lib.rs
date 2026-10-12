@@ -11,8 +11,14 @@
 //! driven entirely by the caller:
 //!
 //! ```text
-//! seed_checkpoints  →  connect_headers  →  finalize_period  (repeat)
+//! seed_checkpoints  →  connect_headers  (finalizes automatically; repeat)
 //! ```
+//!
+//! Every read-modify-write — connecting headers, selecting the best chain and
+//! advancing the finality floor — happens inside a single redb transaction
+//! ([`store::WriteTxn`]), so the store cannot change under a decision. A
+//! [`Chain::finalize_period`] method remains for callers that want to finalize
+//! without connecting anything, but it is not part of the normal flow.
 //!
 //! Tests construct the store over redb's **in-memory backend**, so the exact
 //! production code path runs with zero disk access and a fully deterministic
@@ -40,6 +46,10 @@
 // Tests read/write a deterministic in-memory store and conventionally use
 // `unwrap`; keep the strict lint for production code only.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
+// The error enum deliberately mirrors redb's error types (`thiserror`), which
+// makes `Result<_, Error>` larger than clippy's default threshold. That shape
+// is intentional (see CONTRIBUTING.md); every fallible method returns it.
+#![allow(clippy::result_large_err)]
 
 pub mod chain;
 pub mod error;

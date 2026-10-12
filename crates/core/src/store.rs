@@ -7,6 +7,12 @@
 //! holding every block. All validation lives in [`crate::chain`]. Tests
 //! construct the store with the redb **in-memory** backend, so the exact same
 //! code path runs with zero disk I/O.
+//!
+//! Reads and writes that must be atomic (in particular, the read-modify-write
+//! of connecting headers) go through a single [`WriteTxn`]: redb serialises
+//! writers, so nothing can change between the reads a decision is based on and
+//! the writes that act on that decision. Read-only callers keep using [`Store`],
+//! whose methods each open a short-lived read snapshot.
 
 use std::path::Path;
 
@@ -15,7 +21,7 @@ use bitcoin::block::Header as BitcoinHeader;
 use bitcoin::consensus::{Decodable, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::pow::Work;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition, WriteTransaction};
 
 use crate::error::Error;
 
@@ -91,11 +97,10 @@ impl ForkMeta {
     }
 }
 
-// TODO: make the store transactional, so take read transaction snapshot etc.
-
-/// redb-backed Bitcoin chain state. All methods are synchronous and take `&self`
-/// (redb manages its own read/write transactions); there is no threading, no
-/// network and no hidden I/O — the caller drives every operation.
+/// redb-backed Bitcoin chain state. Read-only methods each open their own
+/// short-lived read snapshot. For a read-modify-write that must be atomic,
+/// open a [`WriteTxn`] with [`Store::write`] and drive the whole operation
+/// through it.
 pub struct Store {
     db: Database,
 }
@@ -125,6 +130,16 @@ impl Store {
         Ok(Self { db })
     }
 
+    /// Begin a single read-write transaction. While it is open no other writer
+    /// can run, and every read through it sees one consistent snapshot — so a
+    /// read → decide → write sequence cannot be interleaved. Call
+    /// [`WriteTxn::commit`] to persist; dropping without committing aborts.
+    pub fn write(&self) -> Result<WriteTxn, Error> {
+        Ok(WriteTxn {
+            txn: self.db.begin_write()?,
+        })
+    }
+
     // ── seed ────────────────────────────────────────────────────────────────
 
     /// Plant the trust anchor: one header per difficulty period (the
@@ -150,13 +165,13 @@ impl Store {
             }
         }
 
-        let txn = self.db.begin_write()?;
+        let txn = self.write()?;
         {
-            let mut headers = txn.open_table(BTC_HEADERS)?;
-            let mut hash_loc = txn.open_table(BTC_HASH_LOC)?;
-            let mut forks = txn.open_table(BTC_FORKS)?;
-            let mut checkpoints = txn.open_table(BTC_CHECKPOINTS)?;
-            let mut meta = txn.open_table(BTC_META)?;
+            let mut headers = txn.txn.open_table(BTC_HEADERS)?;
+            let mut hash_loc = txn.txn.open_table(BTC_HASH_LOC)?;
+            let mut forks = txn.txn.open_table(BTC_FORKS)?;
+            let mut checkpoints = txn.txn.open_table(BTC_CHECKPOINTS)?;
+            let mut meta = txn.txn.open_table(BTC_META)?;
             let mut cum = Work::from_be_bytes([0; 32]);
             let mut prev_w = Work::from_be_bytes([0; 32]);
             for (i, (height, header)) in sorted.iter().enumerate() {
@@ -205,12 +220,12 @@ impl Store {
         Ok(())
     }
 
-    // ── fork reads ──────────────────────────────────────────────────────────
+    // ── read-only convenience (own snapshot per call) ────────────────────────
 
     pub fn fork_meta(&self, fork_id: u64) -> Result<Option<ForkMeta>, Error> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(BTC_FORKS)?;
-        Ok(table.get(fork_id)?.map(|v| ForkMeta::decode(v.value())))
+        read_fork_meta(&table, fork_id)
     }
 
     /// The current best (heaviest) chain id.
@@ -227,38 +242,25 @@ impl Store {
     pub fn locate(&self, hash: &BlockHash) -> Result<Option<(u64, u64)>, Error> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(BTC_HASH_LOC)?;
-        Ok(table
-            .get(hash.as_byte_array().as_slice())?
-            .map(|v| v.value()))
-    }
-
-    /// Read a header + cumulative work at `(fork_id, height)`.
-    fn row(&self, fork_id: u64, height: u64) -> Result<Option<(BitcoinHeader, Work)>, Error> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(BTC_HEADERS)?;
-        Ok(table.get((fork_id, height))?.map(|v| {
-            let bytes = v.value();
-            let mut reader = &bytes[..80];
-            let header = BitcoinHeader::consensus_decode(&mut reader)
-                .expect("stored header is always valid");
-            let work = Work::from_be_bytes(bytes[80..112].try_into().expect("32-byte work"));
-            (header, work)
-        }))
+        read_loc(&table, hash.as_byte_array())
     }
 
     pub fn header_at(&self, fork_id: u64, height: u64) -> Result<Option<BitcoinHeader>, Error> {
-        Ok(self.row(fork_id, height)?.map(|(h, _)| h))
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BTC_HEADERS)?;
+        Ok(read_row(&table, fork_id, height)?.map(|(h, _)| h))
     }
 
     pub fn work_at(&self, fork_id: u64, height: u64) -> Result<Option<Work>, Error> {
-        Ok(self.row(fork_id, height)?.map(|(_, w)| w))
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BTC_HEADERS)?;
+        Ok(read_row(&table, fork_id, height)?.map(|(_, w)| w))
     }
 
     /// Cumulative work of a fork at its tip — the number chain selection
     /// compares across forks (Electrum's `get_chainwork`).
     pub fn fork_chainwork(&self, fork_id: u64) -> Result<Option<Work>, Error> {
-        let meta = self.fork_meta(fork_id)?;
-        match meta {
+        match self.fork_meta(fork_id)? {
             None => Ok(None),
             Some(m) => self.work_at(fork_id, m.tip_height),
         }
@@ -275,12 +277,17 @@ impl Store {
     fn meta_u64(&self, key: &str) -> Result<Option<u64>, Error> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(BTC_META)?;
-        Ok(table
-            .get(key)?
-            .map(|v| u64::from_be_bytes(v.value().try_into().expect("8-byte meta"))))
+        read_meta_u64(&table, key)
     }
 
-    // ── fork writes ─────────────────────────────────────────────────────────
+    /// Number of live forks (debug/tests).
+    pub fn fork_count(&self) -> Result<u64, Error> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BTC_FORKS)?;
+        Ok(table.iter()?.count() as u64)
+    }
+
+    // ── writes (each is its own transaction) ─────────────────────────────────
 
     /// Create a new fork diverging from `parent` at `forkpoint`; the block at
     /// `forkpoint` is `forkpoint_hash`. Returns the new fork id.
@@ -293,9 +300,130 @@ impl Store {
         forkpoint: u64,
         forkpoint_hash: BlockHash,
     ) -> Result<u64, Error> {
-        let txn = self.db.begin_write()?;
+        let txn = self.write()?;
+        let id = txn.create_fork(parent, forkpoint, forkpoint_hash)?;
+        txn.commit()?;
+        Ok(id)
+    }
+
+    /// Append a contiguous run of headers to a fork in a single write
+    /// transaction. Each entry carries its cumulative work (through that
+    /// header, on this fork). Period-boundary heights on the root chain also
+    /// extend the checkpoint spine.
+    pub fn put_headers(
+        &self,
+        fork_id: u64,
+        entries: &[(u64, &BitcoinHeader, Work)],
+    ) -> Result<(), Error> {
+        let txn = self.write()?;
+        txn.put_headers(fork_id, entries)?;
+        txn.commit()
+    }
+
+    /// Mark `fork_id` as the best (heaviest) chain.
+    pub fn set_best_fork(&self, fork_id: u64) -> Result<(), Error> {
+        let txn = self.write()?;
+        txn.set_best_fork(fork_id)?;
+        txn.commit()
+    }
+
+    /// Delete a fork and every header/hash it owns (used when it falls at or
+    /// below the finalized floor, or is superseded by pruning).
+    pub fn delete_fork(&self, fork_id: u64) -> Result<u64, Error> {
+        let txn = self.write()?;
+        let removed = txn.delete_fork(fork_id)?;
+        txn.commit()?;
+        Ok(removed)
+    }
+
+    /// Prune every header/fork at or below the finalized floor. The checkpoint
+    /// spine and the root chain's rows above the floor survive. Returns the
+    /// number of rows removed.
+    pub fn prune_below(&self, below: u64) -> Result<u64, Error> {
+        let txn = self.write()?;
+        let pruned = txn.prune_below(below)?;
+        txn.commit()?;
+        Ok(pruned)
+    }
+}
+
+/// A single read-write transaction: a consistent snapshot plus the exclusive
+/// right to write. Every method mirrors its [`Store`] counterpart but shares
+/// this one transaction, so a sequence of reads feeding a decision and the
+/// writes acting on it are atomic with respect to any other writer.
+pub struct WriteTxn {
+    txn: WriteTransaction,
+}
+
+impl WriteTxn {
+    // ── reads (from the transaction's snapshot) ──────────────────────────────
+
+    pub fn fork_meta(&self, fork_id: u64) -> Result<Option<ForkMeta>, Error> {
+        let table = self.txn.open_table(BTC_FORKS)?;
+        read_fork_meta(&table, fork_id)
+    }
+
+    pub fn best_fork(&self) -> Result<Option<u64>, Error> {
+        self.meta_u64(META_BEST_FORK)
+    }
+
+    pub fn fork_tip(&self, fork_id: u64) -> Result<Option<(u64, BlockHash)>, Error> {
+        Ok(self.fork_meta(fork_id)?.map(|m| (m.tip_height, m.tip_hash)))
+    }
+
+    pub fn locate(&self, hash: &BlockHash) -> Result<Option<(u64, u64)>, Error> {
+        let table = self.txn.open_table(BTC_HASH_LOC)?;
+        read_loc(&table, hash.as_byte_array())
+    }
+
+    pub fn header_at(&self, fork_id: u64, height: u64) -> Result<Option<BitcoinHeader>, Error> {
+        let table = self.txn.open_table(BTC_HEADERS)?;
+        Ok(read_row(&table, fork_id, height)?.map(|(h, _)| h))
+    }
+
+    pub fn work_at(&self, fork_id: u64, height: u64) -> Result<Option<Work>, Error> {
+        let table = self.txn.open_table(BTC_HEADERS)?;
+        Ok(read_row(&table, fork_id, height)?.map(|(_, w)| w))
+    }
+
+    /// Cumulative work of a fork at its tip.
+    pub fn fork_chainwork(&self, fork_id: u64) -> Result<Option<Work>, Error> {
+        match self.fork_meta(fork_id)? {
+            None => Ok(None),
+            Some(m) => self.work_at(fork_id, m.tip_height),
+        }
+    }
+
+    pub fn seed_height(&self) -> Result<Option<u64>, Error> {
+        self.meta_u64(META_SEED_HEIGHT)
+    }
+
+    pub fn finalized_height(&self) -> Result<Option<u64>, Error> {
+        self.meta_u64(META_FINALIZED)
+    }
+
+    fn meta_u64(&self, key: &str) -> Result<Option<u64>, Error> {
+        let table = self.txn.open_table(BTC_META)?;
+        read_meta_u64(&table, key)
+    }
+
+    pub fn fork_count(&self) -> Result<u64, Error> {
+        let table = self.txn.open_table(BTC_FORKS)?;
+        Ok(table.iter()?.count() as u64)
+    }
+
+    // ── writes ───────────────────────────────────────────────────────────────
+
+    /// Create a new fork diverging from `parent` at `forkpoint`. See
+    /// [`Store::create_fork`].
+    pub fn create_fork(
+        &self,
+        parent: u64,
+        forkpoint: u64,
+        forkpoint_hash: BlockHash,
+    ) -> Result<u64, Error> {
         let id = {
-            let mut meta = txn.open_table(BTC_META)?;
+            let mut meta = self.txn.open_table(BTC_META)?;
             let next = meta
                 .get(META_NEXT_FORK)?
                 .map(|v| u64::from_be_bytes(v.value().try_into().expect("8 bytes")))
@@ -312,17 +440,13 @@ impl Store {
             tip_work: Work::from_be_bytes([0; 32]),
         };
         {
-            let mut forks = txn.open_table(BTC_FORKS)?;
+            let mut forks = self.txn.open_table(BTC_FORKS)?;
             forks.insert(id, meta.encode().as_slice())?;
         }
-        txn.commit()?;
         Ok(id)
     }
 
-    /// Append a contiguous run of headers to a fork in a single write
-    /// transaction. Each entry carries its cumulative work (through that
-    /// header, on this fork). Period-boundary heights on the root chain also
-    /// extend the checkpoint spine.
+    /// Append a contiguous run of headers to a fork. See [`Store::put_headers`].
     pub fn put_headers(
         &self,
         fork_id: u64,
@@ -331,12 +455,11 @@ impl Store {
         if entries.is_empty() {
             return Ok(());
         }
-        let txn = self.db.begin_write()?;
         {
-            let mut headers = txn.open_table(BTC_HEADERS)?;
-            let mut hash_loc = txn.open_table(BTC_HASH_LOC)?;
-            let mut checkpoints = txn.open_table(BTC_CHECKPOINTS)?;
-            let mut forks = txn.open_table(BTC_FORKS)?;
+            let mut headers = self.txn.open_table(BTC_HEADERS)?;
+            let mut hash_loc = self.txn.open_table(BTC_HASH_LOC)?;
+            let mut checkpoints = self.txn.open_table(BTC_CHECKPOINTS)?;
+            let mut forks = self.txn.open_table(BTC_FORKS)?;
             for &(height, header, cum) in entries {
                 let bytes = encode(header)?;
                 let mut row = Vec::with_capacity(112);
@@ -364,37 +487,30 @@ impl Store {
             let meta = meta.expect("fork meta must exist before appending headers");
             forks.insert(fork_id, meta.encode().as_slice())?;
         }
-        txn.commit()?;
         Ok(())
     }
 
     /// Mark `fork_id` as the best (heaviest) chain.
     pub fn set_best_fork(&self, fork_id: u64) -> Result<(), Error> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut meta = txn.open_table(BTC_META)?;
-            meta.insert(META_BEST_FORK, fork_id.to_be_bytes().as_slice())?;
-        }
-        txn.commit()?;
+        let mut meta = self.txn.open_table(BTC_META)?;
+        meta.insert(META_BEST_FORK, fork_id.to_be_bytes().as_slice())?;
         Ok(())
     }
 
-    /// Delete a fork and every header/hash it owns (used when it falls at or
-    /// below the finalized floor, or is superseded by pruning).
+    /// Delete a fork and every header/hash it owns. See [`Store::delete_fork`].
     pub fn delete_fork(&self, fork_id: u64) -> Result<u64, Error> {
-        let Some(meta) = self.fork_meta(fork_id)? else {
+        if self.fork_meta(fork_id)?.is_none() {
             return Ok(0);
-        };
-        let txn = self.db.begin_write()?;
+        }
         let mut removed = 0u64;
         {
-            let mut headers = txn.open_table(BTC_HEADERS)?;
-            let mut hash_loc = txn.open_table(BTC_HASH_LOC)?;
-            let mut forks = txn.open_table(BTC_FORKS)?;
+            let mut headers = self.txn.open_table(BTC_HEADERS)?;
+            let mut hash_loc = self.txn.open_table(BTC_HASH_LOC)?;
+            let mut forks = self.txn.open_table(BTC_FORKS)?;
             let heights: Vec<u64> = {
-                let mut cursor = headers.range((fork_id, u64::MIN)..=(fork_id, u64::MAX))?;
+                let cursor = headers.range((fork_id, u64::MIN)..=(fork_id, u64::MAX))?;
                 let mut out = Vec::new();
-                while let Some(entry) = cursor.next() {
+                for entry in cursor {
                     let (key, _) = entry.map_err(Error::Storage)?;
                     out.push(key.value().1);
                 }
@@ -402,33 +518,25 @@ impl Store {
             };
             for h in heights {
                 if let Some(row) = headers.remove((fork_id, h))? {
-                    let bytes = row.value();
-                    let mut reader = &bytes[..80];
-                    let header = BitcoinHeader::consensus_decode(&mut reader)
-                        .expect("stored header is always valid");
+                    let (header, _) = decode_row(row.value());
                     hash_loc.remove(header.block_hash().as_byte_array().as_slice())?;
                 }
                 removed += 1;
             }
             forks.remove(fork_id)?;
         }
-        txn.commit()?;
-        let _ = meta;
         Ok(removed)
     }
 
-    /// Prune every header/fork at or below the finalized floor. The checkpoint
-    /// spine and the root chain's rows above the floor survive. Returns the
-    /// number of rows removed.
+    /// Prune every header/fork at or below the finalized floor. See
+    /// [`Store::prune_below`].
     pub fn prune_below(&self, below: u64) -> Result<u64, Error> {
         let mut pruned = 0u64;
         // Delete forks that can no longer be canonical (forkpoint <= floor).
         let fork_ids: Vec<u64> = {
-            let txn = self.db.begin_read()?;
-            let forks = txn.open_table(BTC_FORKS)?;
+            let forks = self.txn.open_table(BTC_FORKS)?;
             let mut out = Vec::new();
-            let mut cursor = forks.iter()?;
-            while let Some(entry) = cursor.next() {
+            for entry in forks.iter()? {
                 let (key, _) = entry.map_err(Error::Storage)?;
                 let id = key.value();
                 if id != 0 {
@@ -447,15 +555,14 @@ impl Store {
         }
         // Prune the root chain's non-spine rows below the floor. Checkpoint
         // rows double as the spine and are never pruned.
-        let txn = self.db.begin_write()?;
         {
-            let mut headers = txn.open_table(BTC_HEADERS)?;
-            let mut hash_loc = txn.open_table(BTC_HASH_LOC)?;
-            let checkpoints = txn.open_table(BTC_CHECKPOINTS)?;
+            let mut headers = self.txn.open_table(BTC_HEADERS)?;
+            let mut hash_loc = self.txn.open_table(BTC_HASH_LOC)?;
+            let checkpoints = self.txn.open_table(BTC_CHECKPOINTS)?;
             let heights: Vec<u64> = {
-                let mut cursor = headers.range((0, u64::MIN)..=(0, below))?;
+                let cursor = headers.range((0, u64::MIN)..=(0, below))?;
                 let mut out = Vec::new();
-                while let Some(entry) = cursor.next() {
+                for entry in cursor {
                     let (key, _) = entry.map_err(Error::Storage)?;
                     let h = key.value().1;
                     if h < below && checkpoints.get(h)?.is_none() {
@@ -466,27 +573,62 @@ impl Store {
             };
             for h in heights {
                 if let Some(row) = headers.remove((0, h))? {
-                    let bytes = row.value();
-                    let mut reader = &bytes[..80];
-                    let header = BitcoinHeader::consensus_decode(&mut reader)
-                        .expect("stored header is always valid");
+                    let (header, _) = decode_row(row.value());
                     hash_loc.remove(header.block_hash().as_byte_array().as_slice())?;
                     pruned += 1;
                 }
             }
-            let mut meta = txn.open_table(BTC_META)?;
+            let mut meta = self.txn.open_table(BTC_META)?;
             meta.insert(META_FINALIZED, below.to_be_bytes().as_slice())?;
         }
-        txn.commit()?;
         Ok(pruned)
     }
 
-    /// Number of live forks (debug/tests).
-    pub fn fork_count(&self) -> Result<u64, Error> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(BTC_FORKS)?;
-        Ok(table.iter()?.count() as u64)
+    /// Persist every change made through this transaction.
+    pub fn commit(self) -> Result<(), Error> {
+        self.txn.commit()?;
+        Ok(())
     }
+}
+
+// ── shared read helpers (used by both Store and WriteTxn) ───────────────────
+
+fn decode_row(bytes: &[u8]) -> (BitcoinHeader, Work) {
+    let mut reader = &bytes[..80];
+    let header =
+        BitcoinHeader::consensus_decode(&mut reader).expect("stored header is always valid");
+    let work = Work::from_be_bytes(bytes[80..112].try_into().expect("32-byte work"));
+    (header, work)
+}
+
+fn read_row<T>(table: &T, fork_id: u64, height: u64) -> Result<Option<(BitcoinHeader, Work)>, Error>
+where
+    T: ReadableTable<(u64, u64), &'static [u8]>,
+{
+    Ok(table.get((fork_id, height))?.map(|v| decode_row(v.value())))
+}
+
+fn read_fork_meta<T>(table: &T, fork_id: u64) -> Result<Option<ForkMeta>, Error>
+where
+    T: ReadableTable<u64, &'static [u8]>,
+{
+    Ok(table.get(fork_id)?.map(|v| ForkMeta::decode(v.value())))
+}
+
+fn read_loc<T>(table: &T, hash: &[u8; 32]) -> Result<Option<(u64, u64)>, Error>
+where
+    T: ReadableTable<&'static [u8], (u64, u64)>,
+{
+    Ok(table.get(hash.as_slice())?.map(|v| v.value()))
+}
+
+fn read_meta_u64<T>(table: &T, key: &str) -> Result<Option<u64>, Error>
+where
+    T: ReadableTable<&'static str, &'static [u8]>,
+{
+    Ok(table
+        .get(key)?
+        .map(|v| u64::from_be_bytes(v.value().try_into().expect("8-byte meta"))))
 }
 
 fn encode(header: &BitcoinHeader) -> Result<Vec<u8>, Error> {
