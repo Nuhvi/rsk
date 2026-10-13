@@ -608,6 +608,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "btc-p2p"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "thiserror",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2597,6 +2605,15 @@ dependencies = [
  "serde",
  "serde_json",
  "sha3 0.10.9",
+]
+
+[[package]]
+name = "rsk-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitcoin",
+ "btc-p2p",
 ]
 
 [[package]]

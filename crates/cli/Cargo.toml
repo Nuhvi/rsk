@@ -1,0 +1,13 @@
+[package]
+name = "rsk-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Command line for the RSK One node: talk to real peers, sync headers, stay live"
+
+[dependencies]
+anyhow = "1.0.104"
+bitcoin = "0.32.8"
+btc-p2p = { path = "../btc-p2p" }
+
+[lints.clippy]
+unwrap_used = "deny"

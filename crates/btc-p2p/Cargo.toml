@@ -1,0 +1,12 @@
+[package]
+name = "btc-p2p"
+version = "0.1.0"
+edition = "2024"
+description = "Bitcoin P2P protocol client: framed transport, version/verack handshake, headers requests"
+
+[dependencies]
+bitcoin = "0.32.8"
+thiserror = "2.0.18"
+
+[lints.clippy]
+unwrap_used = "deny"
