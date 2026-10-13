@@ -9,6 +9,8 @@
 //! PoW-, continuity-, difficulty- and timestamp-validates every one and
 //! finalizes difficulty periods as it goes. `export-checkpoints` writes the
 //! store's period-boundary headers back out as a `checkpoints.txt`.
+//! `rsk-probe` connects to a Rootstock peer and reads its tip (step 1 of the
+//! RSK IBD design).
 //!
 //! Logs go to stderr (tracing); data (e.g. exported checkpoints) goes to
 //! stdout, so `rsk-cli export-checkpoints > file` stays clean.
@@ -16,6 +18,7 @@
 mod export;
 mod peers;
 mod probe;
+mod rsk_probe;
 mod sync;
 
 use anyhow::Result;
@@ -51,6 +54,9 @@ enum Command {
     /// Export the store's period-boundary headers as a checkpoints.txt
     #[command(name = "export-checkpoints")]
     ExportCheckpoints(export::Args),
+    /// Connect to a Rootstock peer and read its tip (step 1 of RSK IBD)
+    #[command(name = "rsk-probe")]
+    RskProbe(rsk_probe::Args),
 }
 
 fn main() -> Result<()> {
@@ -59,6 +65,7 @@ fn main() -> Result<()> {
         Command::Probe(args) => probe::run(args),
         Command::Sync(args) => sync::run(args),
         Command::ExportCheckpoints(args) => export::run(args),
+        Command::RskProbe(args) => rsk_probe::run(args),
     }
 }
 

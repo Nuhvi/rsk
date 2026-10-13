@@ -5,14 +5,19 @@ edition = "2024"
 description = "Command line for the RSK One node: talk to real peers, sync headers, stay live"
 
 [dependencies]
+alloy-primitives = { version = "1.5.4", features = ["serde", "rlp"] }
 anyhow = "1.0.104"
 bitcoin = "0.32.8"
 btc-p2p = { path = "../btc-p2p" }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4.3"
+k256 = { version = "0.13.4", features = ["ecdsa", "ecdh"] }
 rsk-core = { path = "../core" }
+rsk-p2p = { path = "../rsk-p2p" }
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "net", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+uuid = { version = "1.20.0", features = ["v4"] }
 
 [lints.clippy]
 unwrap_used = "deny"
