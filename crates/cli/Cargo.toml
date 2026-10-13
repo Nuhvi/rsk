@@ -8,6 +8,9 @@ description = "Command line for the RSK One node: talk to real peers, sync heade
 anyhow = "1.0.104"
 bitcoin = "0.32.8"
 btc-p2p = { path = "../btc-p2p" }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4.3"
+rsk-core = { path = "../core" }
 
 [lints.clippy]
 unwrap_used = "deny"

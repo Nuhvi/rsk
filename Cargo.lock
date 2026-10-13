@@ -2614,6 +2614,9 @@ dependencies = [
  "anyhow",
  "bitcoin",
  "btc-p2p",
+ "clap",
+ "hex",
+ "rsk-core",
 ]
 
 [[package]]
