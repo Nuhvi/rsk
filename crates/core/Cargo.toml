@@ -6,6 +6,7 @@ description = "Side-effect-free Rootstock/Bitcoin core: deterministic chain stat
 
 [dependencies]
 bitcoin = "0.32.8"
+hex = "0.4.3"
 redb = "2"
 thiserror = "2.0.18"
 
@@ -13,5 +14,4 @@ thiserror = "2.0.18"
 unwrap_used = "deny"
 
 [dev-dependencies]
-hex = "0.4.3"
 eyre = "0.6"

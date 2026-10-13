@@ -43,10 +43,12 @@ notes on next steps.
 
 ```
 crates/
+  rsk-core/      — side-effect-free Bitcoin canonical chain: checkpoint spine, fork tree, finality (redb)
+  btc-p2p/       — Bitcoin P2P protocol client: framed transport, version/verack handshake, headers
+  cli/           — rsk-cli: run the node (probe, sync, export-checkpoints)
   rsk/           — Rust SDK library (header model, merge-mining verification, RPC light-client logic)
   rsk-store/     — Persistent storage for Bitcoin and RSK headers (redb). Shared between node and client.
   rsk-node/      — Binary crate (header sync orchestration, Electrum + RSK RPC)
-  bitcoin-spv/   — Bitcoin SPV helpers + difficulty-period checkpoint dump
   rsk-consensus/ — vendored rustock consensus: Header, HeaderVerifier, ChainConfig, checkpoint (88 tests)
   rsk-p2p/       — vendored rustock RLPx networking + rsk subprotocol + discovery (80 tests)
   rsk-sync/      — parallel skeleton header walk into redb + checkpoint gate (rustock HeaderWalk port)

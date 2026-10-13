@@ -143,25 +143,37 @@ impl<S: Read + Write> Session<S> {
         Ok(msg)
     }
 
-    /// One `getheaders` round trip: send the locator, return the first
-    /// `headers` response. Chatter on the way (`ping`, `sendheaders`,
-    /// `sendcmpct`, ...) is answered or skipped. An empty response means the
-    /// peer knows nothing after our locator — i.e. we are caught up with it.
-    pub fn get_headers(
-        &mut self,
-        locator: &[BlockHash],
-        stop: BlockHash,
-    ) -> Result<Vec<BlockHeader>, Error> {
+    /// Send a `getheaders` request without waiting for the reply. Pair with
+    /// [`Session::read_headers`] to overlap requests: send the next one, do
+    /// work, then read.
+    pub fn request_headers(&mut self, locator: &[BlockHash], stop: BlockHash) -> Result<(), Error> {
         self.send(NetworkMessage::GetHeaders(GetHeadersMessage::new(
             locator.to_vec(),
             stop,
-        )))?;
+        )))
+    }
+
+    /// Read until a `headers` reply arrives, answering `ping` inline and
+    /// skipping other chatter.
+    pub fn read_headers(&mut self) -> Result<Vec<BlockHeader>, Error> {
         loop {
             let msg = self.next_message()?;
             if let NetworkMessage::Headers(headers) = msg.into_payload() {
                 return Ok(headers);
             }
         }
+    }
+
+    /// One `getheaders` round trip: send the locator, return the first
+    /// `headers` response. An empty response means the peer knows nothing
+    /// after our locator — i.e. we are caught up with it.
+    pub fn get_headers(
+        &mut self,
+        locator: &[BlockHash],
+        stop: BlockHash,
+    ) -> Result<Vec<BlockHeader>, Error> {
+        self.request_headers(locator, stop)?;
+        self.read_headers()
     }
 }
 

@@ -8,6 +8,7 @@ use bitcoin::block::BlockHash;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::hashes::Hash;
 use btc_p2p::session::Session;
+use tracing::{info, warn};
 
 use crate::USER_AGENT;
 use crate::peers;
@@ -29,7 +30,7 @@ pub struct Args {
 
 pub fn run(args: Args) -> Result<()> {
     let (candidates, failed) = peers::candidates(args.addr, &args.seed);
-    println!(
+    info!(
         "{} candidate peer address(es); {} seed(s) failed to resolve{}",
         candidates.len(),
         failed.len(),
@@ -44,10 +45,10 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     for addr in candidates.into_iter().take(args.limit) {
-        println!("trying {addr} …");
+        info!("trying {addr} …");
         match connect_probe(addr) {
             Ok(()) => return Ok(()),
-            Err(e) => println!("  {addr} failed: {e:#}"),
+            Err(e) => warn!("  {addr} failed: {e:#}"),
         }
     }
     bail!("no peer answered within {} tries", args.limit)
@@ -58,10 +59,10 @@ fn connect_probe(addr: SocketAddr) -> Result<()> {
     let (mut session, handshake) =
         Session::connect(addr, USER_AGENT, 0).context("connecting and handshaking")?;
 
-    println!("  user agent:   {}", handshake.user_agent);
-    println!("  version:      {}", handshake.version);
-    println!("  services:     {}", handshake.services);
-    println!("  best height:  {}", handshake.start_height);
+    info!("  user agent:   {}", handshake.user_agent);
+    info!("  version:      {}", handshake.version);
+    info!("  services:     {}", handshake.services);
+    info!("  best height:  {}", handshake.start_height);
 
     let genesis = genesis_block(Network::Bitcoin).header.block_hash();
     let headers = session
@@ -75,9 +76,9 @@ fn connect_probe(addr: SocketAddr) -> Result<()> {
         .last()
         .context("checked non-empty above")?
         .block_hash();
-    println!("  getheaders:   {} header(s) in one batch", headers.len());
-    println!("  first:        {first}");
-    println!("  last:         {last}");
-    println!("probe ok: handshake and header flow work against {addr}");
+    info!("  getheaders:   {} header(s) in one batch", headers.len());
+    info!("  first:        {first}");
+    info!("  last:         {last}");
+    info!("probe ok: handshake and header flow work against {addr}");
     Ok(())
 }

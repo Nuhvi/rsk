@@ -30,6 +30,9 @@ pub enum Error {
     #[error("chain already seeded: checkpoints are planted once; resume by connecting headers")]
     AlreadySeeded,
 
+    #[error("malformed checkpoint line {line}: {detail}")]
+    CheckpointFormat { line: usize, detail: String },
+
     #[error("unknown ancestor {0}: the batch does not link to any stored header or checkpoint")]
     UnknownAncestor(BlockHash),
 

@@ -1,13 +1,17 @@
 //! `rsk-cli sync` — download real Bitcoin headers over P2P into `rsk-core`.
 //!
-//! The default mode seeds **genesis only** and pulls the whole chain from the
-//! peer: every header is PoW-, continuity-, difficulty- and timestamp-checked
-//! by `rsk-core`, which also finalizes difficulty periods (and prunes below
-//! the floor) as it goes, so the store stays bounded. `--spine-tail` instead
-//! trusts the embedded checkpoint spine and syncs only the recent tail — the
-//! ephemeral-sidechain trust model.
+//! By default the node anchors on the **embedded checkpoint spine** (one
+//! trusted header per difficulty period, compiled into `rsk-core`). Like
+//! Electrum's hardcoded checkpoints, this lets the node skip the whole-history
+//! download and sync only the tail above the newest checkpoint, while still
+//! PoW-, continuity-, difficulty- and timestamp-validating every header above
+//! it. `--cut N` pulls the spine back N periods (trust less, validate more);
+//! `--from-genesis` ignores the spine entirely and validates the whole chain
+//! from block 1.
 //!
-//! The store is opened once and reused, so a re-run resumes from the tip.
+//! Headers come from a small pool of peers, round-robining across all of them
+//! with the next batch prefetched while the current one validates. The store is
+//! durable, so a re-run resumes from the tip.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -16,29 +20,15 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use bitcoin::Network;
-use bitcoin::block::{BlockHash, Header as BitcoinHeader};
+use bitcoin::block::BlockHash;
 use bitcoin::blockdata::constants::genesis_block;
-use bitcoin::consensus::Decodable;
 use bitcoin::hashes::Hash as _;
 use bitcoin::pow::Work;
-use btc_p2p::session::Session;
 use rsk_core::{Chain, DIFFICULTY_PERIOD};
+use tracing::{info, warn};
 
-use crate::USER_AGENT;
-use crate::peers;
-
-/// The embedded checkpoint spine: one 80-byte hex header per difficulty
-/// period, from genesis to near the tip. It is the same file
-/// `bitcoin-spv::checkpoints()` embeds; read in directly so the CLI does not
-/// pull that crate's network dependencies.
-const CHECKPOINTS: &str = include_str!("../../bitcoin-spv/checkpoints.txt");
-
-/// Where the chain store lives by default, relative to the working directory
-/// (the repo gitignores `data/`). Product-scoped rather than bitcoin-scoped
-/// because the same store will later carry RSK chain state. Keep it simple and
-/// predictable; the absolute path is logged at startup so there is never a
-/// question of *where*.
-const DEFAULT_DATA_DIR: &str = "data/rsk-one";
+use crate::DEFAULT_DATA_DIR;
+use crate::peers::{self, Peer, Pool};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -46,14 +36,19 @@ pub struct Args {
     #[arg(long, value_name = "DIR", default_value = DEFAULT_DATA_DIR)]
     data_dir: PathBuf,
 
-    /// Trust the embedded checkpoint spine and sync only the recent tail
-    /// instead of the whole chain from genesis
-    #[arg(long)]
-    spine_tail: bool,
-
-    /// Periods of spine tail to leave un-synced when --spine-tail is set
-    #[arg(long, value_name = "N", default_value_t = 24)]
+    /// Trust only the first (spine length − N) checkpoints, validating N
+    /// periods of real headers above the spine
+    #[arg(long, value_name = "N", default_value_t = 0)]
     cut: u64,
+
+    /// Ignore the embedded checkpoint spine and validate the whole chain from
+    /// block 1
+    #[arg(long)]
+    from_genesis: bool,
+
+    /// Number of peers to keep connected
+    #[arg(long, value_name = "N", default_value_t = 3)]
+    peers: usize,
 
     /// Peer address to try first (repeatable), e.g. 1.2.3.4:8333
     #[arg(long, value_name = "IP:PORT")]
@@ -63,92 +58,75 @@ pub struct Args {
     #[arg(long, value_name = "HOST")]
     seed: Vec<String>,
 
-    /// Maximum number of peer attempts
+    /// Maximum number of peer connections to attempt
     #[arg(long, value_name = "N", default_value_t = 8)]
     limit: usize,
 }
 
-pub fn run(args: Args) -> Result<()> {
+pub fn run(mut args: Args) -> Result<()> {
     std::fs::create_dir_all(&args.data_dir)
         .with_context(|| format!("creating data dir {}", args.data_dir.display()))?;
-    // Make the location unambiguous for the user: log the absolute path, not
-    // the relative one they typed (or the default).
+    // Make the location unambiguous: log the absolute path, not the relative
+    // one the user typed (or the default).
     let data_dir = std::fs::canonicalize(&args.data_dir)
         .with_context(|| format!("resolving data dir {}", args.data_dir.display()))?;
     let store_path = data_dir.join("chain.redb");
-    println!("data directory: {}", data_dir.display());
-    println!("chain store:    {}", store_path.display());
+    info!("data directory: {}", data_dir.display());
+    info!("chain store:    {}", store_path.display());
 
     let chain = Chain::open(&store_path, Network::Bitcoin)?;
 
     let from = anchor(&chain, &args)?;
-    println!("syncing from height {from} …");
+    info!("syncing from height {from} …");
 
-    let (candidates, failed) = peers::candidates(args.addr, &args.seed);
+    let (candidates, failed) = peers::candidates(std::mem::take(&mut args.addr), &args.seed);
     if !failed.is_empty() {
-        println!("seed(s) failed to resolve: {}", failed.join(", "));
+        warn!("seed(s) failed to resolve: {}", failed.join(", "));
     }
     if candidates.is_empty() {
         bail!("no candidate peers: every DNS seed failed to resolve");
     }
-    println!("{} candidate peer address(es)", candidates.len());
 
-    let mut queue: VecDeque<SocketAddr> = candidates.into_iter().collect();
-    sync(&chain, &mut queue, args.limit)
+    let mut candidates: VecDeque<SocketAddr> = candidates.into_iter().collect();
+    sync(&chain, &mut candidates, &args)
 }
 
 /// Plant the trust anchor once and return the first height to download. On a
 /// store that is already anchored this is just the height above the tip.
 fn anchor(chain: &Chain, args: &Args) -> Result<u64> {
     if let Some(tip) = chain.tip_height()? {
-        println!("resume: store already anchored at tip {tip}; continuing above it");
+        info!("resume: store already anchored at tip {tip}; continuing above it");
         return Ok(tip + 1);
     }
-    if args.spine_tail {
-        let spine = parse_checkpoints()?;
-        let cut = args.cut as usize;
-        anyhow::ensure!(
-            cut + 2 < spine.len(),
-            "--cut {cut} leaves nothing to validate above the {}-period spine",
-            spine.len()
-        );
-        let prefix = &spine[..spine.len() - cut];
-        chain.seed_checkpoints(prefix)?;
-        let seed_height = prefix.last().context("non-empty spine")?.0;
-        println!(
-            "spine: seeded {} trusted checkpoints (heights 0..={seed_height}); syncing the {cut} period(s) above them",
-            prefix.len()
-        );
-        Ok(seed_height + 1)
-    } else {
+    if args.from_genesis {
         let genesis = genesis_block(Network::Bitcoin).header;
         chain.seed_checkpoints(&[(0, genesis)])?;
-        println!("spine: seeded genesis only; syncing the whole chain from block 1");
-        Ok(1)
+        info!("anchor: genesis only — validating the whole chain from block 1");
+        return Ok(1);
     }
-}
 
-fn parse_checkpoints() -> Result<Vec<(u64, BitcoinHeader)>> {
-    let mut out = Vec::new();
-    for (i, line) in CHECKPOINTS
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .enumerate()
-    {
-        let bytes = hex::decode(line.trim()).with_context(|| format!("checkpoint line {i}"))?;
-        anyhow::ensure!(
-            bytes.len() == 80,
-            "checkpoint line {i} is {} bytes, want 80",
-            bytes.len()
+    let spine = rsk_core::checkpoints::parse()?;
+    let cut = args.cut as usize;
+    anyhow::ensure!(
+        cut < spine.len(),
+        "--cut {cut} is past the end of the {}-period spine",
+        spine.len()
+    );
+    let prefix = &spine[..spine.len() - cut];
+    chain.seed_checkpoints(prefix)?;
+    let seed_height = prefix.last().context("non-empty spine")?.0;
+    if cut == 0 {
+        info!(
+            "anchor: {} embedded checkpoints trusted (heights 0..={seed_height}); syncing the tail above them",
+            prefix.len()
         );
-        let mut reader = bytes.as_slice();
-        out.push((
-            i as u64 * DIFFICULTY_PERIOD,
-            BitcoinHeader::consensus_decode(&mut reader)
-                .with_context(|| format!("checkpoint line {i}"))?,
-        ));
+    } else {
+        info!(
+            "anchor: {} checkpoints trusted up to {seed_height}; validating {cut} period(s) of real headers above",
+            prefix.len()
+        );
     }
-    Ok(out)
+    Ok(seed_height + 1)
 }
 
 /// A locator for our canonical tip: the last few headers (newest first), then
@@ -173,124 +151,175 @@ fn locator(chain: &Chain) -> Result<Vec<BlockHash>> {
     Ok(out)
 }
 
-fn sync(chain: &Chain, queue: &mut VecDeque<SocketAddr>, limit: usize) -> Result<()> {
-    let started = Instant::now();
-    let mut total = 0usize;
-    let mut batches = 0usize;
-    let mut works: Vec<Work> = Vec::new();
-    let mut peer_height: Option<u64> = None;
-    let mut attempts = 0usize;
-    let mut caught_up = false;
+fn start_height(chain: &Chain) -> Result<i32> {
+    Ok(chain.tip_height()?.unwrap_or(0).min(i32::MAX as u64) as i32)
+}
 
-    'peers: while let Some(addr) = queue.pop_front() {
-        attempts += 1;
-        if attempts > limit {
-            bail!("gave up after {limit} peer attempt(s)");
-        }
-        let start_height = chain.tip_height()?.unwrap_or(0).min(i32::MAX as u64) as i32;
-        let (mut session, handshake) = match Session::connect(addr, USER_AGENT, start_height) {
-            Ok(pair) => pair,
+/// Running totals for the sync report.
+struct Stats {
+    started: Instant,
+    total: usize,
+    batches: usize,
+    works: Vec<Work>,
+    /// The greatest advertised height across the peers driving the sync.
+    peer_height: u64,
+}
+
+fn sync(chain: &Chain, candidates: &mut VecDeque<SocketAddr>, args: &Args) -> Result<()> {
+    let want = args.peers.max(1);
+    let mut pool = Pool::new();
+    pool.fill(candidates, want, args.limit, start_height(chain)?);
+    if pool.is_empty() {
+        bail!("could not connect to any peer");
+    }
+    let summary = pool.summary();
+    let mut peers = pool.into_peers();
+    let n = peers.len();
+    info!("{n} peer(s) connected: {summary}");
+
+    let mut stats = Stats {
+        started: Instant::now(),
+        total: 0,
+        batches: 0,
+        works: Vec::new(),
+        peer_height: peers
+            .iter()
+            .map(|p| p.handshake.start_height.max(0) as u64)
+            .max()
+            .unwrap_or(0),
+    };
+
+    // Every peer is a worker; `alive[i]` marks those still usable. The sync
+    // round-robins across them and prefetches the next batch while the current
+    // one validates, so download overlaps the (CPU-bound) validation.
+    let mut alive = vec![true; n];
+    let mut cur = 0usize;
+    peers[cur]
+        .session
+        .request_headers(&locator(chain)?, BlockHash::all_zeros())?;
+
+    loop {
+        let server = peers[cur].addr;
+        let headers = match peers[cur].session.read_headers() {
+            Ok(headers) => headers,
             Err(e) => {
-                println!("  {addr} failed: {e:#}");
+                warn!("  peer {server} dropped: {e:#}");
+                alive[cur] = false;
+                let Some(next) = next_alive(&alive, cur) else {
+                    bail!("all peers dropped");
+                };
+                cur = next;
+                peers[cur]
+                    .session
+                    .request_headers(&locator(chain)?, BlockHash::all_zeros())?;
                 continue;
             }
         };
-        peer_height = Some(handshake.start_height.max(0) as u64);
-        println!(
-            "peer {addr}: {} best height {}",
-            handshake.user_agent, handshake.start_height
-        );
+        if headers.is_empty() {
+            return report(chain, &stats);
+        }
 
-        loop {
-            let locator = locator(chain)?;
-            let headers = match session.get_headers(&locator, BlockHash::all_zeros()) {
-                Ok(headers) => headers,
-                Err(e) => {
-                    println!("  peer {addr} dropped: {e:#}");
-                    queue.push_back(addr);
-                    continue 'peers;
-                }
-            };
-            if headers.is_empty() {
-                caught_up = true;
-                break 'peers;
-            }
+        // Prefetch the next batch on another peer *before* validating this one.
+        let last = headers.last().context("non-empty headers")?.block_hash();
+        cur = prefetch(&mut peers, &mut alive, cur, last)?;
 
-            let first = chain.tip_height()?.unwrap_or(0) + 1;
-            let out = match chain.connect_headers(&headers) {
-                Ok(out) => out,
-                Err(e) => {
-                    // The transactional store means nothing from this batch
-                    // stuck; drop the peer and try another.
-                    println!("  peer {addr} sent headers we rejected: {e:#}");
-                    queue.push_back(addr);
-                    continue 'peers;
-                }
+        let first = chain.tip_height()?.unwrap_or(0) + 1;
+        let out = chain.connect_headers(&headers)?;
+        stats.batches += 1;
+        stats.total += out.connected;
+        stats
+            .works
+            .push(chain.chainwork()?.context("chainwork after connect")?);
+        let tip = chain.tip_height()?.context("tip after connect")?;
+        let seen = first + out.connected as u64 - 1;
+        // Print the first handful, then every 20th batch, so a long run stays
+        // readable.
+        if stats.batches <= 10 || stats.batches.is_multiple_of(20) {
+            let percent = if stats.peer_height > 0 {
+                format!(" {:>5.1}%", 100.0 * seen as f64 / stats.peer_height as f64)
+            } else {
+                String::new()
             };
-            batches += 1;
-            total += out.connected;
-            works.push(chain.chainwork()?.context("chainwork after connect")?);
-            let tip = chain.tip_height()?.context("tip after connect")?;
-            let seen = first + out.connected as u64 - 1;
-            // Print the first handful, then every 20th batch, so a ~485-batch
-            // from-genesis run stays readable.
-            if batches <= 10 || batches.is_multiple_of(20) {
-                let percent = match peer_height {
-                    Some(h) if h > 0 => format!(" {:>5.1}%", 100.0 * seen as f64 / h as f64),
-                    _ => String::new(),
-                };
-                let rate = total as f64 / started.elapsed().as_secs_f64().max(0.001);
-                println!(
-                    "[{batches:>4}] headers {first}..={seen}  tip {tip}{percent}  {rate:.0} h/s"
-                );
-                if let Some(finalized) = out.finalized {
-                    println!("         ↳ auto-finalized difficulty period {finalized}");
-                }
+            let rate = stats.total as f64 / stats.started.elapsed().as_secs_f64().max(0.001);
+            let live = alive.iter().filter(|a| **a).count();
+            info!(
+                "[{:>4}] headers {first}..={seen}  tip {tip}{percent}  {rate:.0} h/s  peer {server} ({live}/{n} up)",
+                stats.batches
+            );
+            if let Some(finalized) = out.finalized {
+                info!("         ↳ auto-finalized difficulty period {finalized}");
             }
         }
     }
+}
 
-    if !caught_up {
-        bail!("did not reach any peer's tip");
+/// The next alive peer after `from`, round-robin.
+fn next_alive(alive: &[bool], from: usize) -> Option<usize> {
+    let n = alive.len();
+    (1..=n).map(|step| (from + step) % n).find(|&p| alive[p])
+}
+
+/// Send the next `getheaders` (for the batch after `last`) to an alive peer,
+/// round-robin, returning whichever peer now holds the outstanding request. A
+/// peer whose send fails is marked dead; if every other peer is gone, the peer
+/// we just read from is reused (single-peer fallback).
+fn prefetch(peers: &mut [Peer], alive: &mut [bool], from: usize, last: BlockHash) -> Result<usize> {
+    let n = peers.len();
+    for step in 1..=n {
+        let p = (from + step) % n;
+        if !alive[p] {
+            continue;
+        }
+        match peers[p]
+            .session
+            .request_headers(&[last], BlockHash::all_zeros())
+        {
+            Ok(()) => return Ok(p),
+            Err(e) => {
+                warn!("  peer {} dropped (request): {e:#}", peers[p].addr);
+                alive[p] = false;
+            }
+        }
     }
-
-    report(chain, total, batches, started, peer_height, &works)
+    peers[from]
+        .session
+        .request_headers(&[last], BlockHash::all_zeros())?;
+    Ok(from)
 }
 
 /// The end-of-run summary and the invariants that say the sync was real.
-fn report(
-    chain: &Chain,
-    total: usize,
-    batches: usize,
-    started: Instant,
-    peer_height: Option<u64>,
-    works: &[Work],
-) -> Result<()> {
+fn report(chain: &Chain, stats: &Stats) -> Result<()> {
     let tip = chain.tip_height()?.context("no tip after sync")?;
-    let elapsed = started.elapsed().as_secs_f64();
-    println!(
-        "\nsynced {total} headers in {batches} batches over {elapsed:.1}s ({:.0} headers/s); tip {tip}",
-        total as f64 / elapsed.max(0.001)
+    let elapsed = stats.started.elapsed().as_secs_f64();
+    info!(
+        "\nsynced {} headers in {} batches over {elapsed:.1}s ({:.0} headers/s); tip {tip}",
+        stats.total,
+        stats.batches,
+        stats.total as f64 / elapsed.max(0.001)
     );
 
     // 1. We reached the peer's advertised height.
-    if let Some(peer_height) = peer_height {
+    if stats.peer_height > 0 {
         anyhow::ensure!(
-            tip >= peer_height,
-            "tip {tip} is below the peer's advertised height {peer_height}"
+            tip >= stats.peer_height,
+            "tip {tip} is below the peer's advertised height {}",
+            stats.peer_height
         );
-        println!("peer advertised height {peer_height}; our tip is {tip}");
+        info!(
+            "peer advertised height {}; our tip is {tip}",
+            stats.peer_height
+        );
     }
 
     // 2. Cumulative work grew monotonically with the tip.
-    for window in works.windows(2) {
+    for window in stats.works.windows(2) {
         anyhow::ensure!(
             window[1] > window[0],
             "cumulative work did not increase across a batch"
         );
     }
     if let Some(work) = chain.chainwork()? {
-        println!("chainwork: {work} (log2 {:.1})", work.log2());
+        info!("chainwork: {work} (log2 {:.1})", work.log2());
     }
 
     // 3. Genesis survived and the canonical (root) chain won.
@@ -312,7 +341,7 @@ fn report(
             finalized >= expected.saturating_sub(2 * DIFFICULTY_PERIOD),
             "finality floor {finalized} lagged the expected boundary {expected}"
         );
-        println!("finality: floor {finalized} (expected boundary ~{expected})");
+        info!("finality: floor {finalized} (expected boundary ~{expected})");
     }
     Ok(())
 }

@@ -27,10 +27,10 @@
 //! ## The trust model (Electrum's)
 //!
 //! - The anchor is a **checkpoint spine**: one header per difficulty period
-//!   (2016 blocks), seeded from `bitcoin-spv/checkpoints.txt` and trusted
-//!   wholesale (no ancestor validation). One header per period is enough to
-//!   know the *entire* chain's work, because Bitcoin difficulty is constant
-//!   within a period.
+//!   (2016 blocks), seeded from this crate's embedded `checkpoints.txt` and
+//!   trusted wholesale (no ancestor validation). One header per period is
+//!   enough to know the *entire* chain's work, because Bitcoin difficulty is
+//!   constant within a period.
 //! - Headers above the spine are PoW-, continuity-, difficulty- and
 //!   timestamp-validated (see [`validation`]) and kept as a **tree of chains**
 //!   (forks), each with a forkpoint and a parent. The best chain is the one
@@ -53,6 +53,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod chain;
+pub mod checkpoints;
 pub mod error;
 pub mod store;
 pub mod validation;

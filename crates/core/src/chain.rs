@@ -8,7 +8,7 @@
 //! which is kept (not rejected) and can later win if it becomes heavier.
 //!
 //! The trust anchor is a **checkpoint spine**: one header per difficulty period
-//! (2016 blocks), seeded from `bitcoin-spv/checkpoints.txt`. Because Bitcoin
+//! (2016 blocks), seeded from this crate's embedded `checkpoints.txt`. Because Bitcoin
 //! difficulty is constant within a period, each spine header pins the work of
 //! its whole period, so the cumulative work of the *entire* chain is known
 //! without holding every block. The spine also sets the **finality floor**:
@@ -123,6 +123,28 @@ impl Chain {
     /// The current finalized (pruned) height.
     pub fn finalized_height(&self) -> Result<Option<u64>, Error> {
         self.store.finalized_height()
+    }
+
+    /// The period-boundary headers at or below the finalized floor, in height
+    /// order (height `0` first).
+    ///
+    /// These are the checkpoints that have satisfied the finality rule — the
+    /// tail above them outweighs the period before them — so they are safe to
+    /// treat as irreversible, e.g. to embed as a trust anchor. The tip's
+    /// nearest boundary is deliberately **excluded**: it is not final yet.
+    pub fn finalized_checkpoints(&self) -> Result<Vec<(u64, BitcoinHeader)>, Error> {
+        let Some(finalized) = self.finalized_height()? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        let mut height = 0u64;
+        while height <= finalized {
+            if let Some(header) = self.header_at(height)? {
+                out.push((height, header));
+            }
+            height += DIFFICULTY_PERIOD;
+        }
+        Ok(out)
     }
 
     /// Height of a known block hash on the canonical chain, if it is canonical.
@@ -871,6 +893,33 @@ mod tests {
 
         // Finalizing again with no new period is a no-op.
         assert_eq!(chain.finalize_period()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn finalized_checkpoints_stop_at_the_floor() -> eyre::Result<()> {
+        let chain = seeded();
+        // Two full periods plus a bit: boundary 2016 becomes final, and the
+        // tip's nearest boundary (the next ones up to 4032) is not.
+        let parent = canonical(&chain, 0);
+        let run = easy_chain(&parent, 2 * DIFFICULTY_PERIOD as usize + 100, 1);
+        chain.connect_headers(&run)?;
+
+        let finalized = chain.finalized_height()?.expect("a finalized floor");
+        assert_eq!(finalized, DIFFICULTY_PERIOD);
+        let cps = chain.finalized_checkpoints()?;
+
+        // Every exported checkpoint is at or below the floor, and the newest
+        // one *is* the floor — never the un-finalized boundary above it.
+        assert_eq!(cps.first().map(|(h, _)| *h), Some(0));
+        assert_eq!(cps.last().map(|(h, _)| *h), Some(finalized));
+        assert!(cps.iter().all(|(h, _)| *h <= finalized));
+        assert_eq!(cps.len() as u64, finalized / DIFFICULTY_PERIOD + 1);
+
+        // The tip is well past the floor: the boundary just above it was
+        // deliberately not exported.
+        let tip = chain.tip_height()?.expect("a tip");
+        assert!(tip > finalized + DIFFICULTY_PERIOD);
         Ok(())
     }
 

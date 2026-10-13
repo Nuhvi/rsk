@@ -11,6 +11,8 @@ btc-p2p = { path = "../btc-p2p" }
 clap = { version = "4", features = ["derive"] }
 hex = "0.4.3"
 rsk-core = { path = "../core" }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [lints.clippy]
 unwrap_used = "deny"

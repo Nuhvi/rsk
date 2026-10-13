@@ -145,7 +145,7 @@ impl Store {
     // ── seed ────────────────────────────────────────────────────────────────
 
     /// Plant the trust anchor: one header per difficulty period (the
-    /// checkpoint spine from `bitcoin-spv/checkpoints.txt`), taken on faith
+    /// checkpoint spine from this crate's embedded `checkpoints.txt`), taken on faith
     /// without validating ancestors, and create the root chain on top of it.
     ///
     /// This is a one-time operation: it is refused ([`Error::AlreadySeeded`])
