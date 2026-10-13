@@ -1,3 +1,4 @@
+use bitcoin::Network;
 use bitcoin::block::BlockHash;
 use thiserror::Error;
 
@@ -35,8 +36,21 @@ pub enum Error {
     #[error("bad proof of work at height {height}: {detail}")]
     BadPow { height: u64, detail: String },
 
+    #[error("wrong difficulty at height {height}: expected bits {expected:#010x}, got {got:#010x}")]
+    BadDifficulty {
+        height: u64,
+        expected: u32,
+        got: u32,
+    },
+
+    #[error("timestamp {got} at height {height} is not above the median-time-past {median}")]
+    BadTimestamp { height: u64, median: u32, got: u32 },
+
     #[error("header at height {height} does not link to {expected}")]
     LinkBreak { height: u64, expected: BlockHash },
+
+    #[error("chain was seeded for {seeded}, not {opened}")]
+    NetworkMismatch { seeded: Network, opened: Network },
 
     #[error("fork at height {fork} is at or below the finalized checkpoint {finalized}")]
     ForkBelowFinalized { fork: u64, finalized: u64 },

@@ -20,16 +20,20 @@
 //!
 //! - The spine is trusted wholesale. Nothing before the first checkpoint is
 //!   ever validated.
-//! - Difficulty retargeting between periods is not yet validated (headers are
-//!   only PoW- and continuity-checked); see CONTRIBUTING.md.
+//! - Future-time, version and transaction/merkle checks are not made: the core
+//!   has no clock, and the first two add no SPV value. See [`crate::validation`]
+//!   for the exact rule set.
 
+use bitcoin::Network;
 use bitcoin::block::BlockHash;
 use bitcoin::block::Header as BitcoinHeader;
+use bitcoin::consensus::Params;
 use bitcoin::hashes::Hash;
 use bitcoin::pow::Work;
 
 use crate::error::Error;
 use crate::store::{DIFFICULTY_PERIOD, Store, WriteTxn};
+use crate::validation;
 
 /// How far below the tip a period boundary must be before we consider it
 /// settled and prune the non-checkpoint headers below it.
@@ -59,28 +63,38 @@ pub struct ConnectOutcome {
 /// headers and reads back outcomes.
 pub struct Chain {
     store: Store,
+    network: Network,
 }
 
 impl Chain {
-    /// Open a file-backed chain store.
-    pub fn open(path: &std::path::Path) -> Result<Self, Error> {
+    /// Open a file-backed chain store for the given network.
+    pub fn open(path: &std::path::Path, network: Network) -> Result<Self, Error> {
         Ok(Self {
             store: Store::open(path)?,
+            network,
         })
     }
 
-    /// Open an in-memory chain store (tests, no disk I/O).
-    pub fn in_memory() -> Result<Self, Error> {
+    /// Open an in-memory chain store (tests, no disk I/O) for the given network.
+    pub fn in_memory(network: Network) -> Result<Self, Error> {
         Ok(Self {
             store: Store::in_memory()?,
+            network,
         })
+    }
+
+    /// The network this chain validates against.
+    pub fn network(&self) -> Network {
+        self.network
     }
 
     /// Plant the trust anchor: the checkpoint spine, one header per difficulty
     /// period, accepted without validating its ancestors. This makes the whole
-    /// chain's work computable and creates the root chain.
+    /// chain's work computable and creates the root chain. The network is
+    /// recorded so a later connect with different parameters is refused.
     pub fn seed_checkpoints(&self, entries: &[(u64, BitcoinHeader)]) -> Result<(), Error> {
-        self.store.seed_checkpoints(entries)
+        self.store.seed_checkpoints(entries)?;
+        self.store.set_network(self.network)
     }
 
     /// The best (heaviest) chain id, if seeded.
@@ -185,11 +199,15 @@ impl Chain {
     /// - The first header's parent must be a known block. If that block is a
     ///   chain tip, the run extends that chain; otherwise it starts a **new
     ///   fork** (kept, not rejected).
-    /// - Every header is PoW- and continuity-checked.
+    /// - Every header is PoW-, continuity-, difficulty- and
+    ///   median-time-past-checked (see [`crate::validation`]).
     /// - The best chain is re-selected by cumulative work; a fork only wins
     ///   when it is strictly heavier.
     /// - A fork whose `forkpoint` is at or below the finalized floor is refused
     ///   ([`Error::ForkBelowFinalized`]) — the spine's finality floor.
+    ///
+    /// Returns [`Error::NetworkMismatch`] if the store was seeded for a
+    /// different network than this [`Chain`] validates against.
     ///
     /// The whole operation — reads, validation, writes and the automatic
     /// finalization below — runs inside one [`WriteTxn`], so nothing can change
@@ -213,6 +231,17 @@ impl Chain {
                 best_fork: prev_best,
                 tip_height: tip,
                 finalized: None,
+            });
+        }
+
+        // The store records the network it was seeded for; refuse to validate
+        // real headers against the wrong consensus parameters.
+        if let Some(seeded) = self.store.network()?
+            && seeded != self.network
+        {
+            return Err(Error::NetworkMismatch {
+                seeded,
+                opened: self.network,
             });
         }
 
@@ -271,9 +300,26 @@ impl Chain {
             (id, forkpoint)
         };
 
-        // Validate continuity + PoW for the new run.
+        // Validate continuity, expected difficulty, median-time-past and PoW
+        // for the new run. Earlier headers of this batch are visible to later
+        // ones, so a long run validates itself.
+        let params = Params::new(self.network);
+        let enforce_difficulty = validation::enforces_difficulty(&params);
+        let new_headers = &headers[start..];
+        // Header at `height` on the chain being extended: a header already
+        // accepted in this batch, or a stored ancestor (walking to ancestor
+        // forks below the forkpoint).
+        let at = |height: u64| -> Result<Option<BitcoinHeader>, Error> {
+            if height >= forkpoint
+                && let Some(header) = new_headers.get((height - forkpoint) as usize)
+            {
+                return Ok(Some(*header));
+            }
+            chain_header(&txn, target_fork, height)
+        };
+
         let mut prev = parent;
-        for (offset, header) in headers[start..].iter().enumerate() {
+        for (offset, header) in new_headers.iter().enumerate() {
             let height = forkpoint + offset as u64;
             if header.prev_blockhash != prev {
                 return Err(Error::LinkBreak {
@@ -281,6 +327,39 @@ impl Chain {
                     expected: prev,
                 });
             }
+
+            if enforce_difficulty {
+                let parent_header = at(height - 1)?
+                    .ok_or_else(|| Error::Internal(format!("missing parent at {height}")))?;
+                let period_start = match height.checked_sub(DIFFICULTY_PERIOD) {
+                    Some(h) => at(h)?,
+                    None => None,
+                };
+                if let Some(expected) = validation::expected_bits(
+                    height,
+                    &parent_header,
+                    period_start.as_ref(),
+                    &params,
+                ) && header.bits != expected
+                {
+                    return Err(Error::BadDifficulty {
+                        height,
+                        expected: expected.to_consensus(),
+                        got: header.bits.to_consensus(),
+                    });
+                }
+            }
+
+            if let Some(median) = median_time_past_at(&at, height)?
+                && header.time <= median
+            {
+                return Err(Error::BadTimestamp {
+                    height,
+                    median,
+                    got: header.time,
+                });
+            }
+
             header
                 .validate_pow(header.target())
                 .map_err(|e| Error::BadPow {
@@ -407,6 +486,48 @@ fn finalize_in_txn(txn: &WriteTxn) -> Result<Option<u64>, Error> {
     Ok(Some(boundary))
 }
 
+// ── validation helpers ──────────────────────────────────────────────────────
+
+/// The header at `height` on `fork`, walking to ancestor forks below the
+/// forkpoint. Mirrors [`Chain::canonical_header`], but reads through an open
+/// [`WriteTxn`] so validation and the writes it feeds stay atomic.
+fn chain_header(txn: &WriteTxn, fork: u64, height: u64) -> Result<Option<BitcoinHeader>, Error> {
+    let mut f = fork;
+    loop {
+        let Some(meta) = txn.fork_meta(f)? else {
+            return Ok(None);
+        };
+        if height >= meta.forkpoint {
+            return txn.header_at(f, height);
+        }
+        let Some(parent) = meta.parent else {
+            return Ok(None);
+        };
+        f = parent;
+    }
+}
+
+/// The median-time-past the header at `height` must exceed: the median of the
+/// previous [`validation::MEDIAN_TIME_PAST`] timestamps. Returns `None` when
+/// any of them is unavailable (e.g. just above a checkpoint that stores only
+/// period boundaries), in which case the check is skipped for that header.
+fn median_time_past_at(
+    at: &impl Fn(u64) -> Result<Option<BitcoinHeader>, Error>,
+    height: u64,
+) -> Result<Option<u32>, Error> {
+    let mut times = [0u32; validation::MEDIAN_TIME_PAST];
+    for (k, slot) in times.iter_mut().enumerate() {
+        let Some(h) = height.checked_sub(1 + k as u64) else {
+            return Ok(None);
+        };
+        match at(h)? {
+            Some(header) => *slot = header.time,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(validation::median_time_past(times)))
+}
+
 // ── proof-of-work helper ────────────────────────────────────────────────────
 
 /// Compute the `Work` carried by a header (needed by callers that assemble
@@ -418,12 +539,18 @@ pub fn header_work(header: &BitcoinHeader) -> Work {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::Network;
     use bitcoin::block::Version;
     use bitcoin::consensus::Decodable;
     use bitcoin::pow::CompactTarget;
 
+    /// A fixed base timestamp for synthetic headers.
+    const BASE_TIME: u32 = 1_600_000_000;
+
     /// The easiest valid Bitcoin target (`0x207fffff`): nearly any hash passes,
-    /// so we can synthesize long chains quickly without a real miner.
+    /// so we can synthesize long chains quickly without a real miner. It is
+    /// also exactly the regtest proof-of-work limit, which is the network the
+    /// synthetic tests use.
     const EASY_BITS: u32 = 0x207f_ffff;
 
     /// Targets with per-block work exactly 20 and 22 (a 1.1x difficulty step).
@@ -436,10 +563,8 @@ mod tests {
     const WORK20_BITS: u32 = 0x200c_cccc;
     const WORK22_BITS: u32 = 0x200b_a2e8;
 
-    /// Mine a header on top of `prev` whose hash meets the given target. `tag`
-    /// makes the header unique (used as the timestamp) so two headers with the
-    /// same parent never collide.
-    fn mine_with_target(prev: BlockHash, bits: u32, tag: u32) -> BitcoinHeader {
+    /// Mine a header on top of `prev` with an explicit timestamp and target.
+    fn mine_at(prev: BlockHash, time: u32, bits: u32) -> BitcoinHeader {
         let target = CompactTarget::from_consensus(bits);
         let mut nonce = 0u32;
         loop {
@@ -447,7 +572,7 @@ mod tests {
                 version: Version::ONE,
                 prev_blockhash: prev,
                 merkle_root: bitcoin::hashes::Hash::all_zeros(),
-                time: 1_600_000_000 + tag,
+                time,
                 bits: target,
                 nonce,
             };
@@ -459,59 +584,65 @@ mod tests {
         }
     }
 
-    /// Mine `n` contiguous headers above `prev` with the given target bits.
-    fn mine_chain_with_target(prev: BlockHash, n: usize, bits: u32) -> Vec<BitcoinHeader> {
+    /// Mine a child of `parent`. `tag` shifts the timestamp forward from the
+    /// parent's, which keeps timestamps monotonic across separate runs (so the
+    /// median-time-past rule holds) and makes two children of the same parent
+    /// distinct.
+    fn mine_child(parent: &BitcoinHeader, bits: u32, tag: u32) -> BitcoinHeader {
+        mine_at(parent.block_hash(), parent.time + 1 + tag, bits)
+    }
+
+    /// Mine `n` contiguous headers above `parent` with the given target bits.
+    fn mine_chain_from(
+        parent: &BitcoinHeader,
+        n: usize,
+        bits: u32,
+        tag_offset: u32,
+    ) -> Vec<BitcoinHeader> {
         let mut out = Vec::with_capacity(n);
-        let mut parent = prev;
+        let mut cur = *parent;
         for i in 0..n {
-            let h = mine_with_target(parent, bits, i as u32);
-            parent = h.block_hash();
+            let h = mine_child(&cur, bits, tag_offset + i as u32);
+            cur = h;
             out.push(h);
         }
         out
     }
 
-    /// Mine a header on top of `prev` whose hash meets the easy target. The
-    /// returned header is PoW-valid by construction; `tag` makes the header
-    /// unique (used as the timestamp) so two headers with the same parent never
-    /// collide.
-    fn mine(prev: BlockHash, tag: u32) -> BitcoinHeader {
-        mine_with_target(prev, EASY_BITS, tag)
+    /// Mine the synthetic genesis (parent is the virtual all-zero block).
+    fn mine_genesis(tag: u32) -> BitcoinHeader {
+        mine_at(BlockHash::all_zeros(), BASE_TIME + tag, EASY_BITS)
     }
 
-    /// Mine `n` contiguous headers above `prev` (chain order: parent first).
-    /// `tag_offset` shifts the per-header timestamp so two runs above the same
-    /// parent produce distinct chains.
-    fn mine_chain_off(prev: BlockHash, n: usize, tag_offset: u32) -> Vec<BitcoinHeader> {
-        let mut out = Vec::with_capacity(n);
-        let mut parent = prev;
-        for i in 0..n {
-            let h = mine(parent, tag_offset + i as u32);
-            parent = h.block_hash();
-            out.push(h);
-        }
-        out
+    /// Easy-target chain above `parent`; `tag_offset` separates competing forks.
+    fn easy_chain(parent: &BitcoinHeader, n: usize, tag_offset: u32) -> Vec<BitcoinHeader> {
+        mine_chain_from(parent, n, EASY_BITS, tag_offset)
     }
 
-    fn mine_chain(prev: BlockHash, n: usize) -> Vec<BitcoinHeader> {
-        mine_chain_off(prev, n, 1)
-    }
-
-    /// A fresh in-memory chain seeded with a synthetic checkpoint at height 0.
+    /// A fresh in-memory regtest chain seeded with a synthetic checkpoint at 0.
+    ///
+    /// Regtest permits minimum-difficulty blocks, so (like Electrum) the
+    /// difficulty rule is skipped; the tests here exercise the fork/finality
+    /// machinery and the median-time-past rule. The difficulty rule itself is
+    /// tested in [`crate::validation`] and against real mainnet data.
     fn seeded() -> Chain {
-        let chain = Chain::in_memory().expect("in-memory store");
-        let genesis = mine(BlockHash::all_zeros(), 0);
+        let chain = Chain::in_memory(Network::Regtest).expect("in-memory store");
+        let genesis = mine_genesis(0);
         chain.seed_checkpoints(&[(0, genesis)]).expect("seed");
         chain
     }
 
-    /// The hash of the block at `height` on the canonical chain.
-    fn canonical_hash(chain: &Chain, height: u64) -> BlockHash {
+    /// The header at `height` on the canonical chain.
+    fn canonical(chain: &Chain, height: u64) -> BitcoinHeader {
         chain
             .header_at(height)
             .unwrap()
             .unwrap_or_else(|| panic!("no canonical header at {height}"))
-            .block_hash()
+    }
+
+    /// The hash of the block at `height` on the canonical chain.
+    fn canonical_hash(chain: &Chain, height: u64) -> BlockHash {
+        canonical(chain, height).block_hash()
     }
 
     fn real_genesis() -> BitcoinHeader {
@@ -528,7 +659,7 @@ mod tests {
         assert_eq!(chain.finalized_height()?, Some(0));
         assert_eq!(chain.best_fork()?, Some(0));
 
-        let run = mine_chain(canonical_hash(&chain, 0), 5);
+        let run = easy_chain(&canonical(&chain, 0), 5, 1);
         let out = chain.connect_headers(&run)?;
         assert_eq!(out.connected, 5);
         assert_eq!(out.best_fork, Some(0));
@@ -543,14 +674,14 @@ mod tests {
     #[test]
     fn seeding_twice_is_refused_and_leaves_the_chain_intact() -> eyre::Result<()> {
         let chain = seeded();
-        let run = mine_chain(canonical_hash(&chain, 0), 5);
+        let run = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.connect_headers(&run)?;
         let tip = chain.tip_height()?;
         let work = chain.chainwork()?;
 
         // Re-seeding an anchored store is refused rather than clobbering the
         // taller tip and the finality floor.
-        let other = mine(BlockHash::all_zeros(), 42);
+        let other = mine_genesis(42);
         let err = chain.seed_checkpoints(&[(0, other)]).unwrap_err();
         assert!(matches!(err, Error::AlreadySeeded), "got {err:?}");
 
@@ -562,7 +693,7 @@ mod tests {
     #[test]
     fn rejects_bad_pow() -> eyre::Result<()> {
         let chain = seeded();
-        let mut bad = mine_chain(canonical_hash(&chain, 0), 1);
+        let mut bad = easy_chain(&canonical(&chain, 0), 1, 1);
         bad[0].bits = CompactTarget::from_consensus(0x1d00_ffff);
         let err = chain.connect_headers(&bad).unwrap_err();
         assert!(matches!(err, Error::BadPow { .. }), "got {err:?}");
@@ -572,7 +703,7 @@ mod tests {
     #[test]
     fn rejects_unknown_ancestor() -> eyre::Result<()> {
         let chain = seeded();
-        let run = mine_chain(BlockHash::all_zeros(), 1); // links to nothing stored
+        let run = [mine_at(BlockHash::all_zeros(), BASE_TIME + 1, EASY_BITS)]; // links to nothing stored
         let err = chain.connect_headers(&run).unwrap_err();
         assert!(matches!(err, Error::UnknownAncestor(_)), "got {err:?}");
         Ok(())
@@ -581,7 +712,7 @@ mod tests {
     #[test]
     fn single_header_connects() -> eyre::Result<()> {
         let chain = seeded();
-        let h = mine(canonical_hash(&chain, 0), 1);
+        let h = mine_child(&canonical(&chain, 0), EASY_BITS, 1);
         let out = chain.connect_header(&h)?;
         assert_eq!(out.connected, 1);
         assert_eq!(out.tip_height, 1);
@@ -592,15 +723,14 @@ mod tests {
     #[test]
     fn lighter_fork_is_kept_not_rejected() -> eyre::Result<()> {
         let chain = seeded();
-        let main = mine_chain(canonical_hash(&chain, 0), 5);
+        let main = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.connect_headers(&main)?;
         assert_eq!(chain.tip_height()?, Some(5));
 
         // A lighter fork from height 3 (parent = main[2]) with 2 blocks. Its
         // tip (height 5) ties, but with strictly less work it must not become
         // best — and crucially it must be *stored*, not rejected.
-        let fork_base = main[2].block_hash();
-        let fork = mine_chain_off(fork_base, 2, 1000);
+        let fork = easy_chain(&main[2], 2, 1000);
         let out = chain.connect_headers(&fork)?;
         assert_eq!(out.connected, 2);
         assert_eq!(out.best_fork, Some(0), "best chain must stay the root");
@@ -621,14 +751,13 @@ mod tests {
         // header in the same batch fails validation, the fork must be rolled
         // back too — the whole read/validate/write/finalize runs in one txn.
         let chain = seeded();
-        let main = mine_chain(canonical_hash(&chain, 0), 5);
+        let main = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.connect_headers(&main)?;
         assert_eq!(chain.store.fork_count()?, 1);
 
         // Fork from height 3 (parent = main[2], not the tip), second header
         // with bad PoW (a much harder target than it was mined for).
-        let fork_base = main[2].block_hash();
-        let mut fork = mine_chain_off(fork_base, 2, 1000);
+        let mut fork = easy_chain(&main[2], 2, 1000);
         fork[1].bits = CompactTarget::from_consensus(0x1d00_ffff);
         let err = chain.connect_headers(&fork).unwrap_err();
         assert!(matches!(err, Error::BadPow { .. }), "got {err:?}");
@@ -642,12 +771,11 @@ mod tests {
     #[test]
     fn heavier_fork_wins() -> eyre::Result<()> {
         let chain = seeded();
-        let main = mine_chain(canonical_hash(&chain, 0), 5);
+        let main = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.connect_headers(&main)?;
 
         // Fork from height 3 with 5 blocks → tip 8, strictly more work.
-        let fork_base = main[2].block_hash();
-        let fork = mine_chain_off(fork_base, 5, 1000);
+        let fork = easy_chain(&main[2], 5, 1000);
         let out = chain.connect_headers(&fork)?;
         assert_eq!(out.connected, 5);
         assert_eq!(out.tip_height, 8);
@@ -666,7 +794,7 @@ mod tests {
     #[test]
     fn fork_below_finalized_is_refused() -> eyre::Result<()> {
         let chain = seeded();
-        let main = mine_chain(canonical_hash(&chain, 0), 6);
+        let main = easy_chain(&canonical(&chain, 0), 6, 1);
         chain.connect_headers(&main)?;
 
         // Advance the floor to height 1 (via store pruning path).
@@ -674,7 +802,7 @@ mod tests {
         assert_eq!(chain.finalized_height()?, Some(1));
 
         // A fork starting at height 1 (forkpoint 1 <= finalized 1) is refused.
-        let fork = mine_chain_off(canonical_hash(&chain, 0), 3, 1000);
+        let fork = easy_chain(&canonical(&chain, 0), 3, 1000);
         let err = chain.connect_headers(&fork).unwrap_err();
         assert!(
             matches!(err, Error::ForkBelowFinalized { .. }),
@@ -688,19 +816,18 @@ mod tests {
         // Electrum's grace: a fork is kept even while lighter, so it can win
         // later when more of its headers arrive.
         let chain = seeded();
-        let main = mine_chain(canonical_hash(&chain, 0), 5);
+        let main = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.connect_headers(&main)?;
         assert_eq!(chain.best_fork()?, Some(0));
 
         // First arrives a short, lighter slice of a fork from height 3.
-        let fork_base = main[2].block_hash();
-        let fork_part1 = mine_chain_off(fork_base, 1, 1000);
+        let fork_part1 = easy_chain(&main[2], 1, 1000);
         let out = chain.connect_headers(&fork_part1)?;
         assert_eq!(out.connected, 1);
         assert_eq!(chain.best_fork()?, Some(0), "still root while lighter");
 
         // Later, more headers of the same fork arrive, tipping it heavier.
-        let fork_part2 = mine_chain_off(fork_part1[0].block_hash(), 4, 1001);
+        let fork_part2 = easy_chain(&fork_part1[0], 4, 1001);
         let out = chain.connect_headers(&fork_part2)?;
         assert_eq!(out.connected, 4);
         assert_eq!(out.tip_height, 8);
@@ -719,9 +846,10 @@ mod tests {
         let chain = seeded();
         // Build past two full difficulty periods (4032) plus a bit, so
         // boundary 2016 is a full period below the tip and becomes final.
-        let run = mine_chain(
-            canonical_hash(&chain, 0),
+        let run = easy_chain(
+            &canonical(&chain, 0),
             2 * DIFFICULTY_PERIOD as usize + 100,
+            1,
         );
         let out = chain.connect_headers(&run)?;
         assert_eq!(chain.tip_height()?, Some(2 * DIFFICULTY_PERIOD + 100));
@@ -749,9 +877,10 @@ mod tests {
     #[test]
     fn checkpoint_spine_survives_pruning() -> eyre::Result<()> {
         let chain = seeded();
-        let run = mine_chain(
-            canonical_hash(&chain, 0),
+        let run = easy_chain(
+            &canonical(&chain, 0),
             2 * DIFFICULTY_PERIOD as usize + 100,
+            1,
         );
         // The connect finalizes and prunes automatically.
         let out = chain.connect_headers(&run)?;
@@ -774,9 +903,9 @@ mod tests {
         // 2016 blocks in the intervening period were stored:
         //   work_at(0)     = w                    (just the boundary block)
         //   work_at(2016)  = w + 2015*w + w = 2017*w
-        let chain = Chain::in_memory().unwrap();
-        let g0 = mine(BlockHash::all_zeros(), 0);
-        let g2016 = mine(BlockHash::all_zeros(), 1);
+        let chain = Chain::in_memory(Network::Regtest).unwrap();
+        let g0 = mine_genesis(0);
+        let g2016 = mine_genesis(1);
         let w = header_work(&g0);
         chain
             .seed_checkpoints(&[(0, g0), (DIFFICULTY_PERIOD, g2016)])
@@ -804,7 +933,7 @@ mod tests {
         genesis
             .validate_pow(genesis.target())
             .expect("real genesis PoW");
-        let chain = Chain::in_memory().unwrap();
+        let chain = Chain::in_memory(Network::Regtest).unwrap();
         chain.seed_checkpoints(&[(0, genesis)]).unwrap();
         assert_eq!(
             chain.header_at(0)?.unwrap().block_hash(),
@@ -812,7 +941,7 @@ mod tests {
         );
         // And we can extend on top of the real genesis hash with synthetic
         // headers (continuity is what matters here, not difficulty).
-        let run = mine_chain(genesis.block_hash(), 2);
+        let run = mine_chain_from(&genesis, 2, EASY_BITS, 1);
         let out = chain.connect_headers(&run)?;
         assert_eq!(out.connected, 2);
         assert_eq!(out.tip_height, 2);
@@ -828,15 +957,12 @@ mod tests {
         let checkpoint = DIFFICULTY_PERIOD as usize;
 
         // Build a chain to the checkpoint height.
-        let run1 = mine_chain(canonical_hash(&chain, 0), checkpoint);
+        let run1 = easy_chain(&canonical(&chain, 0), checkpoint, 1);
         chain.connect_headers(&run1)?;
         assert_eq!(chain.tip_height()?, Some(checkpoint as u64));
 
         // Now extend past the checkpoint with blocks at the same difficulty.
-        let run2 = mine_chain(
-            canonical_hash(&chain, checkpoint as u64),
-            checkpoint + 100, // one full period + 100 more
-        );
+        let run2 = easy_chain(&canonical(&chain, checkpoint as u64), checkpoint + 100, 1);
         let out = chain.connect_headers(&run2)?;
         assert_eq!(chain.tip_height()?, Some((2 * checkpoint + 100) as u64));
 
@@ -858,22 +984,23 @@ mod tests {
         let period = DIFFICULTY_PERIOD as usize;
 
         // Guard the constants: 11 * 20 == 10 * 22.
-        let w20 = header_work(&mine_with_target(BlockHash::all_zeros(), WORK20_BITS, 0));
-        let w22 = header_work(&mine_with_target(BlockHash::all_zeros(), WORK22_BITS, 0));
+        let w20 = header_work(&mine_at(BlockHash::all_zeros(), BASE_TIME, WORK20_BITS));
+        let w22 = header_work(&mine_at(BlockHash::all_zeros(), BASE_TIME, WORK22_BITS));
         let times = |w: Work, n: u32| (0..n).fold(Work::from_be_bytes([0; 32]), |acc, _| acc + w);
         assert_eq!(times(w20, 11), times(w22, 10));
 
         // The period before the checkpoint: 2016 blocks at work 22.
-        let run1 = mine_chain_with_target(canonical_hash(&chain, 0), period, WORK22_BITS);
+        let run1 = mine_chain_from(&canonical(&chain, 0), period, WORK22_BITS, 1);
         chain.connect_headers(&run1)?;
         assert_eq!(chain.tip_height()?, Some(period as u64));
 
         // Smallest tail at work 20 that reaches 2016 * 22: ceil(44352 / 20).
         let tail_needed = (period * 22).div_ceil(20);
-        let tail = mine_chain_with_target(
-            canonical_hash(&chain, period as u64),
+        let tail = mine_chain_from(
+            &canonical(&chain, period as u64),
             tail_needed,
             WORK20_BITS,
+            1,
         );
 
         // One block short of enough: the automatic finalization is refused.
@@ -889,6 +1016,54 @@ mod tests {
         let out = chain.connect_headers(&tail[tail_needed - 1..])?;
         assert_eq!(out.finalized, Some(DIFFICULTY_PERIOD));
         assert_eq!(chain.finalized_height()?, Some(DIFFICULTY_PERIOD));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_timestamp_at_or_below_median_time_past() -> eyre::Result<()> {
+        let chain = seeded();
+        // 11 headers so a 12th has a full median-time-past window.
+        let run = easy_chain(&canonical(&chain, 0), 11, 1);
+        chain.connect_headers(&run)?;
+
+        // A sibling of height 12 whose timestamp is below the median of the
+        // previous 11 (the median is the 6th, well above the first block's time).
+        let parent = canonical(&chain, 11);
+        let too_early = canonical(&chain, 1).time;
+        let bad = mine_at(parent.block_hash(), too_early, EASY_BITS);
+        let err = chain.connect_headers(&[bad]).unwrap_err();
+        assert!(
+            matches!(err, Error::BadTimestamp { height: 12, .. }),
+            "got {err:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn connecting_with_the_wrong_network_is_refused() -> eyre::Result<()> {
+        let chain = Chain::in_memory(Network::Regtest)?;
+        chain.seed_checkpoints(&[(0, mine_genesis(0))])?;
+        assert_eq!(chain.store.network()?, Some(Network::Regtest));
+
+        // Re-open the same store believing it is mainnet: the recorded network
+        // wins over the caller's claim.
+        let Chain { store, .. } = chain;
+        let chain = Chain {
+            store,
+            network: Network::Bitcoin,
+        };
+        let header = mine_child(&canonical(&chain, 0), EASY_BITS, 1);
+        let err = chain.connect_headers(&[header]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::NetworkMismatch {
+                    seeded: Network::Regtest,
+                    opened: Network::Bitcoin,
+                }
+            ),
+            "got {err:?}"
+        );
         Ok(())
     }
 }

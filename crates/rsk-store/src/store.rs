@@ -13,6 +13,9 @@ use crate::error::StoreError;
 const BTC_HEADERS: TableDefinition<u64, &[u8]> = TableDefinition::new("btc_headers");
 const BTC_HASH_TO_HEIGHT: TableDefinition<&[u8], u64> = TableDefinition::new("btc_hash_to_height");
 const BTC_META: TableDefinition<&str, &[u8]> = TableDefinition::new("btc_meta");
+/// Raw Bitcoin coinbase transactions, keyed by Bitcoin height. The Armadillo /
+/// ephemeral-sidechain anchor reads the `RSKBLOCK:` tags out of these.
+const BTC_COINBASE: TableDefinition<u64, &[u8]> = TableDefinition::new("btc_coinbase");
 
 // RSK tables
 const RSK_HEADERS: TableDefinition<u64, &[u8]> = TableDefinition::new("rsk_headers");
@@ -59,6 +62,7 @@ impl Store {
         txn.open_table(BTC_HEADERS)?;
         txn.open_table(BTC_HASH_TO_HEIGHT)?;
         txn.open_table(BTC_META)?;
+        txn.open_table(BTC_COINBASE)?;
         // RSK tables
         txn.open_table(RSK_HEADERS)?;
         txn.open_table(RSK_MERGE_MINING)?;
@@ -110,6 +114,50 @@ impl Store {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(BTC_HASH_TO_HEIGHT)?;
         Ok(table.get(hash.as_slice())?.is_some())
+    }
+
+    /// The Bitcoin height of a block this store holds, if any.
+    pub fn btc_height_of_hash(&self, hash: &[u8; 32]) -> Result<Option<u64>, StoreError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BTC_HASH_TO_HEIGHT)?;
+        Ok(table.get(hash.as_slice())?.map(|v| v.value()))
+    }
+
+    /// Sum of the proof-of-work carried by stored Bitcoin headers from `from`
+    /// to `to` (inclusive). Used to size the Bitcoin window an ephemeral
+    /// sidechain anchor must out-work.
+    pub fn btc_range_work(&self, from: u64, to: u64) -> Result<U256, StoreError> {
+        let mut total = U256::zero();
+        for h in from..=to {
+            if let Some(header) = self.btc_get_header_at_height(h)? {
+                total = total.checked_add(header_work(&header)).unwrap_or(total);
+            }
+        }
+        Ok(total)
+    }
+
+    /// The raw coinbase transaction of the Bitcoin block at `height`, if the
+    /// Armadillo pass has cached it.
+    pub fn btc_coinbase_at(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BTC_COINBASE)?;
+        Ok(table.get(height)?.map(|v| v.value().to_vec()))
+    }
+
+    /// Cache a batch of Bitcoin coinbase transactions.
+    pub fn btc_set_coinbases(&self, entries: &[(u64, &[u8])]) -> Result<(), StoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(BTC_COINBASE)?;
+            for (height, raw) in entries {
+                table.insert(*height, *raw)?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     /// Append validated Bitcoin headers. Returns the number of headers stored.
@@ -400,6 +448,56 @@ impl Store {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// The height of this node's accepted canonical RSK tip (the last block
+    /// the syncer verified and promoted). `None` on a fresh store.
+    pub fn rsk_canonical_tip(&self) -> Result<Option<u64>, StoreError> {
+        Ok(match self.rsk_get_meta("canonical_tip")? {
+            Some(bytes) => {
+                Some(u64::from_be_bytes(bytes.try_into().map_err(|_| {
+                    StoreError::Internal("bad canonical_tip".into())
+                })?))
+            }
+            None => None,
+        })
+    }
+
+    /// Record the canonical tip (the end of a completed, accepted sync).
+    pub fn rsk_set_canonical_tip(&self, height: u64) -> Result<(), StoreError> {
+        self.rsk_set_meta("canonical_tip", &height.to_be_bytes())
+    }
+
+    /// Roll the RSK chain back to `height` (inclusive): every stored header,
+    /// merge-mining row and canonical entry strictly above it is removed. Used
+    /// when the peer's chain reorgs below our tip; `height` is the last common
+    /// ancestor. Returns how many headers were removed.
+    pub fn rsk_truncate_above(&self, height: u64) -> Result<u64, StoreError> {
+        let current_tip = self.rsk_get_tip_height()?.unwrap_or(0);
+        if height >= current_tip {
+            return Ok(0);
+        }
+        let txn = self.db.begin_write()?;
+        let mut removed = 0u64;
+        {
+            let mut headers = txn.open_table(RSK_HEADERS)?;
+            let mut mm = txn.open_table(RSK_MERGE_MINING)?;
+            let mut canonical = txn.open_table(RSK_CANONICAL)?;
+            for h in (height + 1)..=current_tip {
+                if headers.remove(h)?.is_some() {
+                    removed += 1;
+                }
+                mm.remove(h)?;
+                canonical.remove(h)?;
+            }
+        }
+        {
+            let mut meta = txn.open_table(RSK_META)?;
+            meta.insert("tip_height", height.to_be_bytes().as_slice())?;
+            meta.insert("canonical_tip", height.to_be_bytes().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(removed)
     }
 
     /// Get RSK headers in range (inclusive).

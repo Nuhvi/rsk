@@ -31,11 +31,12 @@
 //!   wholesale (no ancestor validation). One header per period is enough to
 //!   know the *entire* chain's work, because Bitcoin difficulty is constant
 //!   within a period.
-//! - Headers above the spine are PoW- and continuity-validated and kept as a
-//!   **tree of chains** (forks), each with a forkpoint and a parent. The best
-//!   chain is the one with the most cumulative work; a fork that is lighter is
-//!   kept (not rejected) and can win later if it becomes heavier. This is
-//!   Electrum's `BlockchainManager` model.
+//! - Headers above the spine are PoW-, continuity-, difficulty- and
+//!   timestamp-validated (see [`validation`]) and kept as a **tree of chains**
+//!   (forks), each with a forkpoint and a parent. The best chain is the one
+//!   with the most cumulative work; a fork that is lighter is kept (not
+//!   rejected) and can win later if it becomes heavier. This is Electrum's
+//!   `BlockchainManager` model.
 //! - Once a difficulty period is a full period below the tip, its boundary is
 //!   finalized and everything at or below it is pruned — forks cannot cross the
 //!   finalized point (like Electrum's hardcoded max checkpoint).
@@ -54,7 +55,9 @@
 pub mod chain;
 pub mod error;
 pub mod store;
+pub mod validation;
 
 pub use chain::{Chain, ConnectOutcome, FINALITY_MARGIN_BLOCKS, header_work};
 pub use error::Error;
 pub use store::{DIFFICULTY_PERIOD, ForkMeta, Store};
+pub use validation::MEDIAN_TIME_PAST;

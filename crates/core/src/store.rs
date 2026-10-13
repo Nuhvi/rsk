@@ -4,9 +4,9 @@
 //! `BlockchainManager`: a **tree of chains** (forks), each with a `forkpoint`
 //! and a `parent`, plus a trusted **checkpoint spine** (one header per
 //! difficulty period) that makes the whole chain's work computable without
-//! holding every block. All validation lives in [`crate::chain`]. Tests
-//! construct the store with the redb **in-memory** backend, so the exact same
-//! code path runs with zero disk I/O.
+//! holding every block. Header validation lives in [`crate::validation`] and
+//! [`crate::chain`]. Tests construct the store with the redb **in-memory**
+//! backend, so the exact same code path runs with zero disk I/O.
 //!
 //! Reads and writes that must be atomic (in particular, the read-modify-write
 //! of connecting headers) go through a single [`WriteTxn`]: redb serialises
@@ -16,6 +16,7 @@
 
 use std::path::Path;
 
+use bitcoin::Network;
 use bitcoin::block::BlockHash;
 use bitcoin::block::Header as BitcoinHeader;
 use bitcoin::consensus::{Decodable, Encodable};
@@ -48,6 +49,7 @@ const META_SEED_HEIGHT: &str = "seed_height";
 const META_FINALIZED: &str = "finalized_height";
 const META_BEST_FORK: &str = "best_fork";
 const META_NEXT_FORK: &str = "next_fork";
+const META_NETWORK: &str = "network";
 
 /// Metadata for one chain (fork) in the tree. The root chain (id 0) has
 /// `forkpoint == 0`, `parent == None`, and is the initial best chain.
@@ -282,6 +284,15 @@ impl Store {
         self.meta_u64(META_FINALIZED)
     }
 
+    /// The network the chain was seeded for, if any. Recorded at seed time so
+    /// a resume with the wrong network is refused rather than silently
+    /// validated against the wrong consensus parameters.
+    pub fn network(&self) -> Result<Option<Network>, Error> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(BTC_META)?;
+        read_meta_network(&table)
+    }
+
     fn meta_u64(&self, key: &str) -> Result<Option<u64>, Error> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(BTC_META)?;
@@ -332,6 +343,13 @@ impl Store {
     pub fn set_best_fork(&self, fork_id: u64) -> Result<(), Error> {
         let txn = self.write()?;
         txn.set_best_fork(fork_id)?;
+        txn.commit()
+    }
+
+    /// Record the network this chain is seeded for. See [`Store::network`].
+    pub fn set_network(&self, network: Network) -> Result<(), Error> {
+        let txn = self.write()?;
+        txn.set_network(network)?;
         txn.commit()
     }
 
@@ -408,6 +426,11 @@ impl WriteTxn {
 
     pub fn finalized_height(&self) -> Result<Option<u64>, Error> {
         self.meta_u64(META_FINALIZED)
+    }
+
+    pub fn network(&self) -> Result<Option<Network>, Error> {
+        let table = self.txn.open_table(BTC_META)?;
+        read_meta_network(&table)
     }
 
     fn meta_u64(&self, key: &str) -> Result<Option<u64>, Error> {
@@ -502,6 +525,13 @@ impl WriteTxn {
     pub fn set_best_fork(&self, fork_id: u64) -> Result<(), Error> {
         let mut meta = self.txn.open_table(BTC_META)?;
         meta.insert(META_BEST_FORK, fork_id.to_be_bytes().as_slice())?;
+        Ok(())
+    }
+
+    /// Record the network this chain is seeded for. See [`Store::network`].
+    pub fn set_network(&self, network: Network) -> Result<(), Error> {
+        let mut meta = self.txn.open_table(BTC_META)?;
+        meta.insert(META_NETWORK, network.to_string().as_bytes())?;
         Ok(())
     }
 
@@ -637,6 +667,18 @@ where
     Ok(table
         .get(key)?
         .map(|v| u64::from_be_bytes(v.value().try_into().expect("8-byte meta"))))
+}
+
+fn read_meta_network<T>(table: &T) -> Result<Option<Network>, Error>
+where
+    T: ReadableTable<&'static str, &'static [u8]>,
+{
+    let Some(value) = table.get(META_NETWORK)? else {
+        return Ok(None);
+    };
+    let text = std::str::from_utf8(value.value())
+        .map_err(|e| Error::Internal(format!("network meta is not utf-8: {e}")))?;
+    Ok(text.parse().ok())
 }
 
 fn encode(header: &BitcoinHeader) -> Result<Vec<u8>, Error> {
