@@ -47,6 +47,8 @@ const BTC_CHECKPOINTS: TableDefinition<u64, &[u8]> = TableDefinition::new("btc_c
 const BTC_META: TableDefinition<&str, &[u8]> = TableDefinition::new("btc_meta");
 
 const META_SEED_HEIGHT: &str = "seed_height";
+/// The latest finalized checkpoint: a difficulty-period boundary whose
+/// above-work outweighs the period before it. Advanced only forward.
 const META_FINALIZED: &str = "finalized_height";
 const META_BEST_FORK: &str = "best_fork";
 const META_NEXT_FORK: &str = "next_fork";
@@ -203,7 +205,8 @@ macro_rules! read_methods {
             }
         }
 
-        /// The current finalized (RSK-tail start) height.
+        /// The latest settled checkpoint, if seeded. Monotonic: only the
+        /// connect path advances it, and only forward.
         pub(crate) fn finalized_height(&self) -> Result<Option<u64>, Error> {
             self.meta_u64(META_FINALIZED)
         }
@@ -437,7 +440,7 @@ impl WriteTxn {
         Ok(())
     }
 
-    /// Record the finalized height (RSK-tail start).
+    /// Record the latest finalized checkpoint.
     pub(crate) fn set_finalized(&self, height: u64) -> Result<(), Error> {
         let mut meta = self.txn.open_table(BTC_META)?;
         meta.insert(META_FINALIZED, height.to_be_bytes().as_slice())?;

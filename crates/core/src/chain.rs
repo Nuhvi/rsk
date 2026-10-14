@@ -11,12 +11,12 @@
 //! (2016 blocks), seeded from this crate's embedded `checkpoints.txt`. Because Bitcoin
 //! difficulty is constant within a period, each spine header pins the work of
 //! its whole period, so the cumulative work of the *entire* chain is known
-//! without holding every block. The spine also sets the **finality floor**:
-//! like Electrum (which refuses forks below its hardcoded max checkpoint), we
-//! refuse forks whose `forkpoint` falls at or below the finalized point (so no
-//! reorg can ever cross a full difficulty period), but we **do not prune**
-//! the chain at finalization — headers are retained until Rootstock reaches
-//! its FINAL block (see the RSK IBD design), at which point pruning can occur.
+//! without holding every block. The spine also sets the **finalized
+//! checkpoint**: like Electrum (which refuses forks below its hardcoded max
+//! checkpoint), we refuse forks whose `forkpoint` falls at or below it (so no
+//! reorg can ever cross a full difficulty period), but we **do not prune** the
+//! chain when it advances — headers are retained until Rootstock reaches its
+//! FINAL block (see the RSK IBD design), at which point pruning can occur.
 //!
 //! Simplifications for this slice, stated explicitly so they are easy to lift:
 //!
@@ -38,7 +38,7 @@ use crate::store::{DIFFICULTY_PERIOD, ForkMeta, ReadTxn, Store, WriteTxn};
 use crate::validation;
 
 /// How far below the tip a period boundary must be before we consider it
-/// settled and prune the non-checkpoint headers below it.
+/// settled and advance the finalized checkpoint to it.
 pub const FINALITY_MARGIN_BLOCKS: u64 = DIFFICULTY_PERIOD;
 
 /// Outcome of a [`Chain::connect_headers`] call.
@@ -53,9 +53,8 @@ pub struct ConnectOutcome {
     pub best_fork: Option<u64>,
     /// Canonical tip height after this batch.
     pub tip_height: u64,
-    /// The new finalized (tail-start) height, if this batch advanced it:
-    /// finalization is applied automatically, inside the same transaction as
-    /// the connect.
+    /// The new finalized checkpoint, if this batch advanced it: the checkpoint
+    /// is advanced automatically, inside the same transaction as the connect.
     pub finalized: Option<u64>,
 }
 
@@ -133,55 +132,34 @@ impl Chain {
         }
     }
 
-    /// The current finalized (RSK-tail start) height.
+    /// The latest finalized checkpoint.
     pub fn finalized_height(&self) -> Result<Option<u64>, Error> {
         self.store.read()?.finalized_height()
     }
 
-    /// Largest work accumulated in any full 2016-block difficulty period ending
-    /// just below the finalized floor.
-    ///
-    /// Concretely: let the finalized boundary be `B`. We look at two consecutive
-    /// periods, both ending at `B`:
-    ///
-    /// - the immediate predecessor `[B - 2016, B)`,
-    /// - the one before that `[B - 4032, B - 2016)`.
-    ///
-    /// The returned value is the larger of the two — the threshold the finality
-    /// test had to clear for `B` to become final.
-    ///
-    /// Returns `None` when there is no finalized floor yet.
-    ///
-    /// Test-only: nothing outside the core reads it.
-    #[cfg(test)]
-    pub fn finalized_work(&self) -> Result<Option<Work>, Error> {
+    /// The work of the first difficulty period after `tail_start`:
+    /// `work[tail_start .. tail_start + DIFFICULTY_PERIOD)`, or `None` if that
+    /// period is not stored. Rootstock's tail work is measured against 2/3 of
+    /// this. The caller picks `tail_start` (typically `finalized_height()`, then
+    /// stepping back a period at a time).
+    pub fn btc_tail_work(&self, tail_start: u64) -> Result<Option<Work>, Error> {
         let txn = self.store.read()?;
-        let Some(finalized) = txn.finalized_height()? else {
+        let (Some(begin), Some(end)) = (
+            txn.work_at(0, tail_start)?,
+            txn.work_at(0, tail_start.saturating_add(DIFFICULTY_PERIOD))?,
+        ) else {
             return Ok(None);
         };
-
-        // Compute work in a 2016-block window ending at `height`.
-        let z = Work::from_be_bytes([0; 32]);
-        let period_work = |height: u64| -> Work {
-            let start = height.saturating_sub(DIFFICULTY_PERIOD);
-            let end = txn.work_at(0, height).ok().flatten().unwrap_or(z);
-            let begin = txn.work_at(0, start).ok().flatten().unwrap_or(z);
-            z + end - begin
-        };
-
-        // The period immediately ending at the boundary, and the one before it.
-        let w1 = period_work(finalized);
-        let w2 = period_work(finalized.saturating_sub(DIFFICULTY_PERIOD));
-        Ok(Some(w1.max(w2)))
+        Ok(Some(end - begin))
     }
 
-    /// The period-boundary headers at or below the finalized floor, in height
-    /// order (height `0` first).
+    /// The period-boundary headers at or below the latest settled checkpoint, in
+    /// height order (height `0` first).
     ///
-    /// These are the checkpoints that have satisfied the finality rule — the
-    /// tail above them outweighs the period before them — so they are safe to
-    /// treat as irreversible, e.g. to embed as a trust anchor. The tip's
-    /// nearest boundary is deliberately **excluded**: it is not final yet.
+    /// These are the checkpoints that have satisfied the rule — the work above
+    /// them outweighs the period before them — so they are safe to treat as
+    /// irreversible, e.g. to embed as a trust anchor. The tip's nearest boundary
+    /// is deliberately **excluded**: it is not settled yet.
     pub fn finalized_checkpoints(&self) -> Result<Vec<(u64, BitcoinHeader)>, Error> {
         let txn = self.store.read()?;
         let Some(finalized) = txn.finalized_height()? else {
@@ -243,18 +221,18 @@ impl Chain {
     ///   median-time-past-checked (see [`crate::validation`]).
     /// - The best chain is re-selected by cumulative work; a fork only wins
     ///   when it is strictly heavier.
-    /// - A fork whose `forkpoint` is at or below the finalized floor is refused
-    ///   ([`Error::ForkBelowFinalized`]) — the spine's finality floor.
+    /// - A fork whose `forkpoint` is at or below the finalized checkpoint is
+    ///   refused ([`Error::ForkBelowFinalized`]) — the checkpoint's floor.
     ///
     /// Returns [`Error::NetworkMismatch`] if the store was seeded for a
     /// different network than this [`Chain`] validates against.
     ///
     /// The whole operation — reads, validation, writes and the automatic
-    /// finalization below — runs inside one write transaction, so nothing can change
-    /// the store between the reads a decision is based on and the writes that
-    /// act on it.
+    /// tail advance below — runs inside one write transaction, so nothing can
+    /// change the store between the reads a decision is based on and the writes
+    /// that act on it.
     pub fn connect_headers(&self, headers: &[BitcoinHeader]) -> Result<ConnectOutcome, Error> {
-        // One transaction for the entire read → validate → write → finalize
+        // One transaction for the entire read → validate → write → advance
         // sequence. Dropping it without committing (the early returns) aborts.
         let txn = self.store.write()?;
 
@@ -436,8 +414,8 @@ impl Chain {
             None => forkpoint + (headers.len() - start) as u64 - 1,
         };
 
-        // Finalization is part of connecting headers: advance the finality
-        // floor if this batch tipped a period boundary over the margin.
+        // Advancing the finalized checkpoint is part of connecting headers: move
+        // it if this batch tipped a period boundary over the margin.
         let finalized = finalize_in_txn(&txn)?;
         txn.commit()?;
 
@@ -458,30 +436,28 @@ impl Chain {
         self.connect_headers(std::slice::from_ref(header))
     }
 
-    /// Advance the finalized checkpoint to the newest difficulty-period
-    /// boundary that is at least a full period below the tip, and return it.
-    /// Returns the new finalized height (now the RSK-tail start), without
-    /// pruning the Bitcoin chain — headers are retained until Rootstock
-    /// itself reaches FINAL (see RSK IBD design). Pruning of the BTC store
-    /// will happen then, at the RSK FINAL height.
+    /// Advance the finalized checkpoint to the newest difficulty-period boundary
+    /// that is at least a full period below the tip, and move the Bitcoin tail to
+    /// it. Returns the new checkpoint.
     ///
     /// This runs automatically at the end of every [`Chain::connect_headers`]
     /// batch (reported in [`ConnectOutcome::finalized`]); you do not normally
     /// need to call it.
     ///
-    /// Only finalizes if the work built on top of the boundary (boundary to tip)
-    /// is at least the work of the full period before it. This prevents
-    /// finalizing across a difficulty drop — e.g. from X to 0.1X — that could
+    /// Only advances if the work built on top of the boundary (boundary to tip)
+    /// is at least the work of the full period before it. This prevents moving
+    /// the checkpoint across a difficulty drop — e.g. from X to 0.1X — that could
     /// otherwise be reorged if the higher-difficulty chain returns: the tail has
     /// to grow until it outweighs what it would be replacing.
     ///
     /// Cumulative work is known at every period boundary (the spine), so both
     /// sides are plain differences of stored cumulative work.
     ///
-    /// Nothing is finalized while a fork is the best chain, since the spine
+    /// Nothing advances while a fork is the best chain, since the spine
     /// (fork 0) is assumed canonical.
     ///
-    /// Test-only: production finalization rides inside [`Chain::connect_headers`].
+    /// Test-only: production advancement rides inside
+    /// [`Chain::connect_headers`].
     #[cfg(test)]
     pub fn finalize_period(&self) -> Result<Option<u64>, Error> {
         let txn = self.store.write()?;
@@ -496,7 +472,7 @@ impl Chain {
     }
 }
 
-/// The finalization rule, applied through an open transaction. Factored out so
+/// The checkpoint rule, applied through an open transaction. Factored out so
 /// `connect_headers` can run it inside the same transaction as the connect.
 fn finalize_in_txn(txn: &WriteTxn) -> Result<Option<u64>, Error> {
     if txn.best_fork()? != Some(0) {
@@ -526,12 +502,9 @@ fn finalize_in_txn(txn: &WriteTxn) -> Result<Option<u64>, Error> {
     }
 
     // RETENTION POLICY (RSK IBD design):
-    // Do NOT prune the Bitcoin chain at finalization. We keep all headers so
-    // Rootstock can cross-link against the full canonical chain; pruning happens
-    // later, when RSK reaches its FINAL and we can drop history below it.
-    //
-    // The returned `boundary` is the *tail start* for the RSK work test:
-    // work(tail_start..btcTip) is what we compare Rootstock's work against.
+    // Do NOT prune the Bitcoin chain here. We keep all headers so Rootstock can
+    // cross-link against the full canonical chain; the caller prunes below the
+    // Bitcoin tail start only once Rootstock reaches FINAL.
     txn.set_finalized(boundary)?;
     Ok(Some(boundary))
 }
@@ -863,7 +836,7 @@ mod tests {
     fn failed_batch_leaves_no_partial_state() -> eyre::Result<()> {
         // A batch whose parent is not a chain tip starts a new fork; if a later
         // header in the same batch fails validation, the fork must be rolled
-        // back too — the whole read/validate/write/finalize runs in one txn.
+        // back too — the whole read/validate/write/advance runs in one txn.
         let chain = seeded();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.connect_headers(&main)?;
@@ -911,7 +884,7 @@ mod tests {
         let main = easy_chain(&canonical(&chain, 0), 6, 1);
         chain.connect_headers(&main)?;
 
-        // Advance the finalized floor to height 1, as finalization would.
+        // Advance the finalized checkpoint to height 1, as an advance would.
         let txn = chain.store.write()?;
         txn.set_finalized(1)?;
         txn.commit()?;
@@ -962,7 +935,7 @@ mod tests {
     fn finalizes_period_retains_headers() -> eyre::Result<()> {
         let chain = seeded();
         // Build past two full difficulty periods (4032) plus a bit, so
-        // boundary 2016 is a full period below the tip and becomes final.
+        // boundary 2016 is a full period below the tip and is finalized.
         let run = easy_chain(
             &canonical(&chain, 0),
             2 * DIFFICULTY_PERIOD as usize + 100,
@@ -971,12 +944,19 @@ mod tests {
         let out = chain.connect_headers(&run)?;
         assert_eq!(chain.tip_height()?, Some(2 * DIFFICULTY_PERIOD + 100));
 
-        // Finalization happened automatically as part of the connect.
+        // The checkpoint was finalized automatically as part of the connect.
         assert_eq!(out.finalized, Some(DIFFICULTY_PERIOD));
         assert_eq!(chain.finalized_height()?, Some(DIFFICULTY_PERIOD));
 
-        // Headers BELOW the boundary are RETAINED (no longer pruned at finalization;
-        // pruning happens later when RSK reaches FINAL).
+        // The tail work is the first period after the checkpoint: work[2016 ..
+        // 4032), computed on the fly.
+        let expected = chain.chainwork_at(2 * DIFFICULTY_PERIOD)?.unwrap()
+            - chain.chainwork_at(DIFFICULTY_PERIOD)?.unwrap();
+        assert_eq!(chain.btc_tail_work(DIFFICULTY_PERIOD)?, Some(expected));
+        assert!(expected > Work::from_be_bytes([0; 32]));
+
+        // Headers BELOW the checkpoint are RETAINED (no pruning when it
+        // finalizes; pruning happens later when RSK reaches FINAL).
         assert!(chain.header_at(1)?.is_some());
         assert!(chain.header_at(DIFFICULTY_PERIOD)?.is_some());
         assert!(
@@ -984,11 +964,6 @@ mod tests {
                 .header_at(2 * DIFFICULTY_PERIOD + 100)
                 .unwrap()
                 .is_some()
-        );
-        assert_eq!(
-            chain.finalized_height()?,
-            Some(2016),
-            "finalized btc block height set"
         );
 
         // Finalizing again with no new period is a no-op.
@@ -999,7 +974,7 @@ mod tests {
     #[test]
     fn finalized_checkpoints_stop_at_the_floor() -> eyre::Result<()> {
         let chain = seeded();
-        // Two full periods plus a bit: boundary 2016 becomes final, and the
+        // Two full periods plus a bit: boundary 2016 is finalized, and the
         // tip's nearest boundary (the next ones up to 4032) is not.
         let parent = canonical(&chain, 0);
         let run = easy_chain(&parent, 2 * DIFFICULTY_PERIOD as usize + 100, 1);
@@ -1031,7 +1006,7 @@ mod tests {
             2 * DIFFICULTY_PERIOD as usize + 100,
             1,
         );
-        // The connect finalizes and does NOT prune at finalization.
+        // The connect advances the tail and does NOT prune.
         let out = chain.connect_headers(&run)?;
         assert_eq!(out.finalized, Some(DIFFICULTY_PERIOD));
 
@@ -1101,7 +1076,7 @@ mod tests {
     fn finalizes_period_only_when_tail_work_exceeds_pre_check() -> eyre::Result<()> {
         // At constant difficulty, the work from the boundary to the tip (a full
         // period plus the extra blocks) exceeds the work of the period before
-        // the boundary, so finalization proceeds.
+        // the boundary, so the checkpoint finalizes.
         let chain = seeded();
         let checkpoint = DIFFICULTY_PERIOD as usize;
 
@@ -1216,48 +1191,37 @@ mod tests {
         Ok(())
     }
 
-    // ── finalized_work tests ────────────────────────────────────────────────
+    // ── btc tail work tests ─────────────────────────────────────────────────
 
-    /// Returns None when there is no finalized floor yet (not even seeded).
+    /// The work is computed on the fly for the given tail start; not seeded,
+    /// there is nothing to compute.
     #[test]
-    fn finalized_work_none_without_seed() -> eyre::Result<()> {
+    fn btc_tail_work_none_without_seed() -> eyre::Result<()> {
         let chain = Chain::in_memory(Network::Regtest)?;
-        assert_eq!(chain.finalized_work()?, None);
+        assert_eq!(chain.finalized_height()?, None);
+        assert_eq!(chain.btc_tail_work(0)?, None);
         Ok(())
     }
 
-    /// Genesis alone carries the easy-target work (~2). After connecting a small
-    /// tail no boundary advances, so final height stays at 0. In `finalized_work`,
-    /// the two candidate 2016-block windows both end at 0:
-    ///   P1: [0..2016) → genesis at height 0 (blocks 1..2016 don't exist)
-    ///   P0: [-2016..0) → empty (saturates) → zero
-    /// Since genesis at 0 is inside P1, its cumulative work shows up in P1 but
-    /// also in P0's subtraction term — they cancel. Result is 0.
+    /// With less than a full period above the start there is no first period to
+    /// measure.
     #[test]
-    fn finalized_work_zero_with_only_genesis() -> eyre::Result<()> {
+    fn btc_tail_work_none_before_a_full_period() -> eyre::Result<()> {
         let chain = seeded();
         assert_eq!(chain.finalized_height()?.unwrap(), 0);
 
-        // Verify no boundary would advance with a small tail.
+        // 100 blocks is less than a period: work[0 .. 2016) is not stored.
         let run = easy_chain(&canonical(&chain, 0), 100, 1);
         chain.connect_headers(&run)?;
-        assert_eq!(chain.finalized_height()?.unwrap(), 0, "100 blocks < margin, no advance");
-
-        // Finalized work = max(window_work[0], window_work[-2016]).
-        // Both windows collapse to 0 because genesis is at exactly boundary 0.
-        let threshold = chain.finalized_work()?.expect("has finalized work");
-        assert_eq!(threshold, Work::from_be_bytes([0; 32]));
+        assert_eq!(chain.finalized_height()?.unwrap(), 0, "no finalize yet");
+        assert_eq!(chain.btc_tail_work(0)?, None);
         Ok(())
     }
 
-    /// After two full periods + 100 blocks, the finalized boundary is 2016.
-    /// The two candidate 2016-period windows ending at 2016 are:
-    ///   P1: blocks 0..2016 (genesis + 2015 regular blocks)
-    ///   P0: blocks -2016..0 (empty/saturated → zero)
-    /// Both are at the same easy target, so P1 must equal the cumulative work
-    /// in that window — verified via chainwork_at.
+    /// After two full periods + 100 blocks the tail work at 2016 is the work of
+    /// the first period after it, [2016 .. 4032).
     #[test]
-    fn finalized_work_matches_cumulative_period() -> eyre::Result<()> {
+    fn btc_tail_work_is_the_first_tail_period() -> eyre::Result<()> {
         let chain = seeded();
         let parent = canonical(&chain, 0);
         let n = 2 * DIFFICULTY_PERIOD as usize + 100;
@@ -1265,47 +1229,43 @@ mod tests {
         chain.connect_headers(&run)?;
 
         assert_eq!(chain.finalized_height()?.unwrap(), DIFFICULTY_PERIOD);
-        let threshold = chain.finalized_work()?.expect("has finalized work");
-
-        // Cumulative work at boundary 2016 minus genesis (at height 0) gives
-        // all work accumulated from block 1 through 2016.
-        let work_up_to_boundary = chain.chainwork_at(DIFFICULTY_PERIOD)?.unwrap();
-        let genesis_work = chain.chainwork_at(0)?.unwrap();
-        let expected_period = work_up_to_boundary - genesis_work;
-        assert_eq!(threshold, expected_period);
-        assert!(threshold > genesis_work);
+        let window = chain.chainwork_at(2 * DIFFICULTY_PERIOD)?.unwrap()
+            - chain.chainwork_at(DIFFICULTY_PERIOD)?.unwrap();
+        assert_eq!(chain.btc_tail_work(DIFFICULTY_PERIOD)?, Some(window));
+        assert!(window > chain.chainwork_at(0)?.unwrap());
         Ok(())
     }
 
-    /// A difficulty drop at the checkpoint boundary means the 2016 blocks
-    /// leading into the previous boundary carry more work than if they'd been
-    /// at the lower difficulty. `finalized_work` returns the larger of the two
-    /// candidate periods — here the one immediately below the boundary wins.
+    /// The work is the first period *after* the tail start, at that period's own
+    /// difficulty — not the (heavier) period before it. With a drop to work 20
+    /// after the boundary, it is 2016 * 20, below the preceding ~2015 * 22.
     #[test]
-    fn finalized_work_picks_larger_period() -> eyre::Result<()> {
+    fn btc_tail_work_uses_the_period_after_the_start() -> eyre::Result<()> {
         let chain = seeded();
         let period = DIFFICULTY_PERIOD as usize;
 
-        // Genesis has easy-target work. Period blocks use work 22.
+        // Genesis has easy-target work. Period 0 blocks use work 22.
         let run1 = mine_chain_from(&canonical(&chain, 0), period, WORK22_BITS, 1);
         chain.connect_headers(&run1)?;
 
-        // Tail after boundary: work per block = work 20. Enough blocks to cross
-        // the finality threshold and advance the boundary to 2016.
+        // Tail after boundary 2016 at the lower work 20, enough to outweigh the
+        // period before it and finalize.
         let tail_needed = (period * 22).div_ceil(20);
-        let tail = mine_chain_from(&canonical(&chain, period as u64), tail_needed, WORK20_BITS, 1);
+        let tail = mine_chain_from(
+            &canonical(&chain, period as u64),
+            tail_needed,
+            WORK20_BITS,
+            1,
+        );
         chain.connect_headers(&tail)?;
 
         assert_eq!(chain.finalized_height()?.unwrap(), DIFFICULTY_PERIOD);
-
-        // Two candidates ending at boundary 2016:
-        //   P1 = [0..2016) → genesis + 2015 blocks at work 22
-        //   P0 = [-2016..0) → empty (saturates) → zero
-        let threshold = chain.finalized_work()?.expect("has finalized work");
-        let p1 = chain.chainwork_at(DIFFICULTY_PERIOD)?.unwrap()
-            - chain.chainwork_at(0)?.unwrap();
-        assert_eq!(threshold, p1);
-        assert!(p1 > Work::from_be_bytes([0; 32]));
+        let after = chain.chainwork_at(2 * DIFFICULTY_PERIOD)?.unwrap()
+            - chain.chainwork_at(DIFFICULTY_PERIOD)?.unwrap();
+        let before =
+            chain.chainwork_at(DIFFICULTY_PERIOD)?.unwrap() - chain.chainwork_at(0)?.unwrap();
+        assert_eq!(chain.btc_tail_work(DIFFICULTY_PERIOD)?, Some(after));
+        assert!(after < before, "the drop makes the after-period lighter");
         Ok(())
     }
 }

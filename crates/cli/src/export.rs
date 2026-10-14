@@ -41,10 +41,10 @@ pub fn run(args: Args) -> Result<()> {
         .finalized_height()?
         .with_context(|| format!("store {} is not seeded", store_path.display()))?;
 
-    // Everything at or below the finalized floor — never the raw tip.
+    // Everything at or below the finalized checkpoint — never the raw tip.
     let checkpoints = chain.finalized_checkpoints()?;
     if checkpoints.is_empty() {
-        bail!("no finalized checkpoints at or below the floor {finalized}");
+        bail!("no finalized checkpoints at or below {finalized}");
     }
 
     let mut text = String::new();
