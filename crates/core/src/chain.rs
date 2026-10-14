@@ -13,8 +13,10 @@
 //! its whole period, so the cumulative work of the *entire* chain is known
 //! without holding every block. The spine also sets the **finality floor**:
 //! like Electrum (which refuses forks below its hardcoded max checkpoint), we
-//! prune forks whose `forkpoint` falls at or below the finalized point — no
-//! reorg can ever cross a full difficulty period.
+//! refuse forks whose `forkpoint` falls at or below the finalized point (so no
+//! reorg can ever cross a full difficulty period), but we **do not prune**
+//! the chain at finalization — headers are retained until Rootstock reaches
+//! its FINAL block (see the RSK IBD design), at which point pruning can occur.
 //!
 //! Simplifications for this slice, stated explicitly so they are easy to lift:
 //!
@@ -117,6 +119,14 @@ impl Chain {
         match self.store.best_fork()? {
             None => Ok(None),
             Some(best) => self.store.fork_chainwork(best),
+        }
+    }
+
+    /// Cumulative proof-of-work of the best chain at `height`.
+    pub fn chainwork_at(&self, height: u64) -> Result<Option<Work>, Error> {
+        match self.store.best_fork()? {
+            None => Ok(None),
+            Some(best) => self.store.work_at(best, height),
         }
     }
 
@@ -442,8 +452,11 @@ impl Chain {
     }
 
     /// Advance the finalized checkpoint to the newest difficulty-period
-    /// boundary that is at least a full period below the tip, and prune
-    /// everything at or below it. Returns the new finalized height, if any.
+    /// boundary that is at least a full period below the tip, and return it.
+    /// Returns the new finalized height (now the RSK-tail start), without
+    /// pruning the Bitcoin chain — headers are retained until Rootstock
+    /// itself reaches FINAL (see RSK IBD design). Pruning of the BTC store
+    /// will happen then, at the RSK FINAL height.
     ///
     /// This runs automatically at the end of every [`Chain::connect_headers`]
     /// batch (reported in [`ConnectOutcome::finalized`]); you do not normally
@@ -504,7 +517,14 @@ fn finalize_in_txn(txn: &WriteTxn) -> Result<Option<u64>, Error> {
         return Ok(None);
     }
 
-    txn.prune_below(boundary)?;
+    // RETENTION POLICY (RSK IBD design):
+    // Do NOT prune the Bitcoin chain at finalization. We keep all headers so
+    // Rootstock can cross-link against the full canonical chain; pruning happens
+    // later, when RSK reaches its FINAL and we can drop history below it.
+    //
+    // The returned `boundary` is the *tail start* for the RSK work test:
+    // work(tail_start..btcTip) is what we compare Rootstock's work against.
+    txn.set_finalized(boundary)?;
     Ok(Some(boundary))
 }
 
@@ -864,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn finalizes_period_and_prunes() -> eyre::Result<()> {
+    fn finalizes_period_retains_headers() -> eyre::Result<()> {
         let chain = seeded();
         // Build past two full difficulty periods (4032) plus a bit, so
         // boundary 2016 is a full period below the tip and becomes final.
@@ -880,15 +900,20 @@ mod tests {
         assert_eq!(out.finalized, Some(DIFFICULTY_PERIOD));
         assert_eq!(chain.finalized_height()?, Some(DIFFICULTY_PERIOD));
 
-        // Non-checkpoint headers below the boundary are pruned; the boundary
-        // checkpoint itself and the tip remain.
-        assert!(chain.header_at(1)?.is_none());
+        // Headers BELOW the boundary are RETAINED (no longer pruned at finalization;
+        // pruning happens later when RSK reaches FINAL).
+        assert!(chain.header_at(1)?.is_some());
         assert!(chain.header_at(DIFFICULTY_PERIOD)?.is_some());
         assert!(
             chain
                 .header_at(2 * DIFFICULTY_PERIOD + 100)
                 .unwrap()
                 .is_some()
+        );
+        assert_eq!(
+            chain.finalized_height()?,
+            Some(2016),
+            "finalized btc block height set"
         );
 
         // Finalizing again with no new period is a no-op.
@@ -931,7 +956,7 @@ mod tests {
             2 * DIFFICULTY_PERIOD as usize + 100,
             1,
         );
-        // The connect finalizes and prunes automatically.
+        // The connect finalizes and does NOT prune at finalization.
         let out = chain.connect_headers(&run)?;
         assert_eq!(out.finalized, Some(DIFFICULTY_PERIOD));
 

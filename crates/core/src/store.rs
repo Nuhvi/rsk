@@ -371,6 +371,13 @@ impl Store {
         txn.commit()?;
         Ok(pruned)
     }
+
+    /// Set the finalized floor (RSK-tail start) without pruning.
+    pub fn set_finalized(&self, height: u64) -> Result<(), Error> {
+        let txn = self.write()?;
+        txn.set_finalized(height)?;
+        txn.commit()
+    }
 }
 
 /// A single read-write transaction: a consistent snapshot plus the exclusive
@@ -532,6 +539,13 @@ impl WriteTxn {
     pub fn set_network(&self, network: Network) -> Result<(), Error> {
         let mut meta = self.txn.open_table(BTC_META)?;
         meta.insert(META_NETWORK, network.to_string().as_bytes())?;
+        Ok(())
+    }
+
+    /// Record the finalized height (RSK-tail start) without pruning.
+    pub fn set_finalized(&self, height: u64) -> Result<(), Error> {
+        let mut meta = self.txn.open_table(BTC_META)?;
+        meta.insert(META_FINALIZED, height.to_be_bytes().as_slice())?;
         Ok(())
     }
 
