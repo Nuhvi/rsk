@@ -4,7 +4,7 @@
 //! `Blockchain.verify_header` / `get_target` plus the Bitcoin Core contextual
 //! rules that make sense without full blocks.
 //!
-//! Checked (in [`crate::chain`], which supplies the surrounding headers):
+//! Checked (in [`crate::btc`], which supplies the surrounding headers):
 //!
 //! - **Proof of work** — the block hash meets the target encoded in `bits`
 //!   (`Header::validate_pow`).

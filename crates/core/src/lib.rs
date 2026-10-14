@@ -8,7 +8,11 @@
 //! redb-backed store, reached only through a transaction: [`Core`] opens a read
 //! snapshot or the writer at the start of each method.
 //!
-//! Design is still in flux; see `CONTRIBUTING.md` (repo root) for the plan.
+//! Modules: [`btc`] (the Bitcoin chain, header rules and checkpoint spine),
+//! [`rsk`] (the Rootstock tree and its finality rules), and `store`/`records`
+//! (the redb state and its record types).
+//!
+//! Design is still in flux; see `CONTRIBUTING.md` (repo root) and `TODO.md`.
 
 // Tests read/write a deterministic in-memory store and conventionally use
 // `unwrap`; keep the strict lint for production code only.
@@ -19,14 +23,12 @@
 #![allow(clippy::result_large_err)]
 
 pub mod btc;
-pub mod checkpoints;
 pub mod error;
 pub mod rsk;
 mod store;
-pub mod validation;
 
-pub use chain::{ConnectOutcome, Core, FINALITY_MARGIN_BLOCKS, header_work};
+pub use btc::validation::MEDIAN_TIME_PAST;
+pub use btc::{ConnectOutcome, Core, FINALITY_MARGIN_BLOCKS, header_work};
 pub use error::Error;
 pub use rsk::{RskConnectOutcome, RskEntry};
 pub use store::DIFFICULTY_PERIOD;
-pub use validation::MEDIAN_TIME_PAST;

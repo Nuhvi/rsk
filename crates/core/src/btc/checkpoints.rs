@@ -9,7 +9,7 @@
 //!
 //! The file holds only **finalized** checkpoints — each one met the finality
 //! rule when it was generated (the tail above it outweighed the period before
-//! it; see [`crate::chain::Core::finalized_checkpoints`]), so none of them is
+//! it; see [`crate::btc::Core::finalized_checkpoints`]), so none of them is
 //! subject to reorg. The tip's nearest boundary is deliberately not included.
 //!
 //! The file lives next to this crate (`data/checkpoints.txt`), is compiled in,
@@ -22,7 +22,7 @@ use crate::error::Error;
 use crate::store::DIFFICULTY_PERIOD;
 
 /// The embedded checkpoint spine, one hex header per line in height order.
-const CHECKPOINTS: &str = include_str!("../data/checkpoints.txt");
+const CHECKPOINTS: &str = include_str!("../../data/checkpoints.txt");
 
 /// The raw spine file contents (one hex header per line).
 pub fn text() -> &'static str {

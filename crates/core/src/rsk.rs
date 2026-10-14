@@ -6,12 +6,13 @@
 //! uncle difficulty)` — and the tree is weighted by **GHOST**: a block's weight
 //! is the sum over its whole subtree, so side branches count, not just the one
 //! chain. `W_rsk(F) = rsk_subtree_work(F)`; the finality test compares it to
-//! `2/3` of the Bitcoin tail's work (see [`crate::rootstock`]).
+//! `2/3` of the Bitcoin tail's work (see [`crate::rsk::finality`]).
+
+pub mod finality;
 
 use std::collections::HashSet;
 
 use alloy_primitives::{B256, U256};
-use redb::ReadableTable;
 use rsk_consensus::Header;
 use rsk_consensus::types::block::Block;
 use rsk_consensus::validation::HeaderVerifier;
@@ -21,9 +22,8 @@ use rsk_consensus::validation::uncles::{
 
 use crate::Core;
 use crate::error::Error;
-use crate::store::{
-    RSK_BLOCKS, RSK_CHILDREN, RSK_HEADERS, RSK_ROOTS, RSK_UNCLES, ReadTxn, WriteTxn,
-};
+use crate::store::records::RskBlock;
+use crate::store::{ReadTxn, WriteTxn};
 
 /// A Rootstock header and the uncle headers it references, each with the wire
 /// bytes its hash is taken over.
@@ -46,134 +46,6 @@ pub struct RskUncle {
 pub struct RskConnectOutcome {
     /// Headers newly stored.
     pub connected: usize,
-}
-
-/// The stored per-block index: `number(8) | parent(32) | own_work(32)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RskBlock {
-    pub number: u64,
-    pub parent: [u8; 32],
-    pub own_work: U256,
-}
-
-impl RskBlock {
-    fn encode(&self) -> [u8; 72] {
-        let mut out = [0u8; 72];
-        out[..8].copy_from_slice(&self.number.to_be_bytes());
-        out[8..40].copy_from_slice(&self.parent);
-        out[40..72].copy_from_slice(&self.own_work.to_be_bytes::<32>());
-        out
-    }
-
-    fn decode(bytes: &[u8]) -> RskBlock {
-        let mut parent = [0u8; 32];
-        parent.copy_from_slice(&bytes[8..40]);
-        RskBlock {
-            number: u64::from_be_bytes(bytes[..8].try_into().expect("8 bytes")),
-            parent,
-            own_work: U256::from_be_slice(&bytes[40..72]),
-        }
-    }
-}
-
-// ── store access (rsk_* tables) ─────────────────────────────────────────────
-
-/// Reads over the RSK tables, shared by [`ReadTxn`] and [`WriteTxn`] so a
-/// connect can validate against what it has already staged.
-macro_rules! rsk_read_methods {
-    () => {
-        pub(crate) fn rsk_raw_header(&self, hash: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-            let table = self.txn.open_table(RSK_HEADERS)?;
-            Ok(table.get(hash)?.map(|v| v.value().to_vec()))
-        }
-
-        pub(crate) fn rsk_block(&self, hash: &[u8]) -> Result<Option<RskBlock>, Error> {
-            let table = self.txn.open_table(RSK_BLOCKS)?;
-            Ok(table.get(hash)?.map(|v| RskBlock::decode(v.value())))
-        }
-
-        pub(crate) fn rsk_has_block(&self, hash: &[u8]) -> Result<bool, Error> {
-            Ok(self.rsk_block(hash)?.is_some())
-        }
-
-        pub(crate) fn rsk_children(&self, hash: &[u8]) -> Result<Vec<[u8; 32]>, Error> {
-            let table = self.txn.open_table(RSK_CHILDREN)?;
-            Ok(table
-                .get(hash)?
-                .map(|v| decode_hashes(v.value()))
-                .unwrap_or_default())
-        }
-
-        pub(crate) fn rsk_uncle_raw(&self, hash: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-            let table = self.txn.open_table(RSK_UNCLES)?;
-            Ok(table
-                .get(hash)?
-                .map(|v| decode_blobs(v.value()))
-                .unwrap_or_default())
-        }
-
-        pub(crate) fn rsk_roots(&self) -> Result<Vec<[u8; 32]>, Error> {
-            let table = self.txn.open_table(RSK_ROOTS)?;
-            let mut out = Vec::new();
-            for entry in table.iter()? {
-                let (key, _) = entry.map_err(Error::Storage)?;
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(key.value());
-                out.push(hash);
-            }
-            Ok(out)
-        }
-    };
-}
-
-#[allow(dead_code)] // some reads are only used on one transaction kind
-impl ReadTxn {
-    rsk_read_methods!();
-}
-
-#[allow(dead_code)] // some reads are only used on one transaction kind
-impl WriteTxn {
-    rsk_read_methods!();
-
-    pub(crate) fn rsk_put_block(
-        &self,
-        hash: &[u8],
-        raw: &[u8],
-        block: &RskBlock,
-    ) -> Result<(), Error> {
-        {
-            let mut table = self.txn.open_table(RSK_HEADERS)?;
-            table.insert(hash, raw)?;
-        }
-        {
-            let mut table = self.txn.open_table(RSK_BLOCKS)?;
-            table.insert(hash, block.encode().as_slice())?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn rsk_put_uncles(&self, hash: &[u8], raws: &[Vec<u8>]) -> Result<(), Error> {
-        let mut table = self.txn.open_table(RSK_UNCLES)?;
-        table.insert(hash, encode_blobs(raws).as_slice())?;
-        Ok(())
-    }
-
-    pub(crate) fn rsk_add_child(&self, parent: &[u8], child: &[u8]) -> Result<(), Error> {
-        let mut table = self.txn.open_table(RSK_CHILDREN)?;
-        let mut buf = table
-            .get(parent)?
-            .map(|v| v.value().to_vec())
-            .unwrap_or_default();
-        buf.extend_from_slice(child);
-        table.insert(parent, buf.as_slice())?;
-        Ok(())
-    }
-
-    pub(crate) fn rsk_put_root(&self, hash: &[u8]) -> Result<(), Error> {
-        let mut table = self.txn.open_table(RSK_ROOTS)?;
-        table.insert(hash, &[][..])?;
-        Ok(())
-    }
 }
 
 // ── the tree on `Core` ──────────────────────────────────────────────────────
@@ -254,7 +126,7 @@ fn store_entry(txn: &WriteTxn, entry: &RskEntry) -> Result<B256, Error> {
         parent: header.parent_hash.0,
         own_work: own_work(header, &entry.uncles),
     };
-    txn.rsk_put_block(hash.as_slice(), &entry.raw, &block)?;
+    txn.rsk_put_block(hash.as_slice(), &entry.raw, block)?;
     let uncle_raws: Vec<Vec<u8>> = entry.uncles.iter().map(|u| u.raw.clone()).collect();
     txn.rsk_put_uncles(hash.as_slice(), &uncle_raws)?;
     if txn.rsk_has_block(header.parent_hash.as_slice())? {
@@ -390,52 +262,6 @@ impl AncestorSource for TxnAncestors<'_> {
             .filter_map(|raw| decode_header(raw))
             .collect()
     }
-}
-
-// ── encodings ───────────────────────────────────────────────────────────────
-
-fn decode_hashes(bytes: &[u8]) -> Vec<[u8; 32]> {
-    bytes
-        .chunks(32)
-        .filter(|chunk| chunk.len() == 32)
-        .map(|chunk| {
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(chunk);
-            hash
-        })
-        .collect()
-}
-
-fn encode_blobs(blobs: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(blobs.len() as u32).to_be_bytes());
-    for blob in blobs {
-        out.extend_from_slice(&(blob.len() as u32).to_be_bytes());
-        out.extend_from_slice(blob);
-    }
-    out
-}
-
-fn decode_blobs(bytes: &[u8]) -> Vec<Vec<u8>> {
-    if bytes.len() < 4 {
-        return Vec::new();
-    }
-    let count = u32::from_be_bytes(bytes[..4].try_into().expect("4 bytes")) as usize;
-    let mut out = Vec::with_capacity(count);
-    let mut at = 4;
-    for _ in 0..count {
-        if at + 4 > bytes.len() {
-            break;
-        }
-        let len = u32::from_be_bytes(bytes[at..at + 4].try_into().expect("4 bytes")) as usize;
-        at += 4;
-        if at + len > bytes.len() {
-            break;
-        }
-        out.push(bytes[at..at + len].to_vec());
-        at += len;
-    }
-    out
 }
 
 #[cfg(test)]

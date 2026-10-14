@@ -105,7 +105,7 @@ fn anchor(chain: &Core, args: &Args) -> Result<u64> {
         return Ok(1);
     }
 
-    let spine = rsk_core::checkpoints::parse()?;
+    let spine = rsk_core::btc::checkpoints::parse()?;
     let cut = args.cut as usize;
     anyhow::ensure!(
         cut < spine.len(),

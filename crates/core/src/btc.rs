@@ -23,7 +23,7 @@
 //! - The spine is trusted wholesale. Nothing before the first checkpoint is
 //!   ever validated.
 //! - Future-time, version and transaction/merkle checks are not made: the core
-//!   has no clock, and the first two add no SPV value. See [`crate::validation`]
+//!   has no clock, and the first two add no SPV value. See [`crate::btc::validation`]
 //!   for the exact rule set.
 
 use bitcoin::Network;
@@ -35,7 +35,9 @@ use bitcoin::pow::Work;
 
 use crate::error::Error;
 use crate::store::{DIFFICULTY_PERIOD, ReadTxn, Store, WriteTxn};
-use crate::validation;
+
+pub mod checkpoints;
+pub mod validation;
 
 /// How far below the tip a period boundary must be before we consider it
 /// settled and advance the finalized checkpoint to it.
@@ -238,7 +240,7 @@ impl Core {
     ///   chain tip, the run extends that chain; otherwise it starts a **new
     ///   fork** (kept, not rejected).
     /// - Every header is PoW-, continuity-, difficulty- and
-    ///   median-time-past-checked (see [`crate::validation`]).
+    ///   median-time-past-checked (see [`crate::btc::validation`]).
     /// - The best chain is re-selected by cumulative work; a fork only wins
     ///   when it is strictly heavier.
     /// - A fork whose `forkpoint` is at or below the finalized checkpoint is
@@ -673,7 +675,7 @@ mod tests {
     /// Regtest permits minimum-difficulty blocks, so (like Electrum) the
     /// difficulty rule is skipped; the tests here exercise the fork/finality
     /// machinery and the median-time-past rule. The difficulty rule itself is
-    /// tested in [`crate::validation`] and against real mainnet data.
+    /// tested in [`crate::btc::validation`] and against real mainnet data.
     fn seeded() -> Core {
         let chain = Core::in_memory(Network::Regtest).expect("in-memory store");
         let genesis = mine_genesis(0);

@@ -1,12 +1,13 @@
-//! Persistent Bitcoin chain state, backed by redb.
+//! Persistent Bitcoin + Rootstock chain state, backed by redb.
 //!
-//! This is the *state* of the side-effect-free core, modelled on Electrum's
-//! `BlockchainManager`: a **tree of chains** (forks), each with a `forkpoint`
-//! and a `parent`, plus a trusted **checkpoint spine** (one header per
-//! difficulty period) that makes the whole chain's work computable without
-//! holding every block. Header validation lives in [`crate::validation`] and
-//! [`crate::chain`]. Tests construct the store with the redb **in-memory**
-//! backend, so the exact same code path runs with zero disk I/O.
+//! This is the *state* of the side-effect-free core. The Bitcoin side is a
+//! **tree of chains** (forks), each with a `forkpoint` and a `parent`, plus a
+//! trusted **checkpoint spine** (one header per difficulty period) that makes
+//! the whole chain's work computable without holding every block. The Rootstock
+//! side is a **forest** of trees, each rooted at a trusted `F`. Header
+//! validation lives in [`crate::validation`] and [`crate::btc`]. Tests construct
+//! the store with the redb **in-memory** backend, so the exact same code path
+//! runs with zero disk I/O.
 //!
 //! The store is only ever touched through a transaction: [`Store::read`] opens
 //! a consistent snapshot ([`ReadTxn`]) and [`Store::write`] opens the single
@@ -14,51 +15,55 @@
 //! headers) therefore runs entirely inside one [`WriteTxn`]: redb serialises
 //! writers, so nothing can change between the reads a decision is based on and
 //! the writes that act on it.
+//!
+//! Table values are the record types in [`records`], so a table reads as
+//! `TableDefinition<Key, Record>` rather than `TableDefinition<_, &[u8]>`.
 
 use std::path::Path;
 
 use bitcoin::Network;
 use bitcoin::block::BlockHash;
 use bitcoin::block::Header as BitcoinHeader;
-use bitcoin::consensus::{Decodable, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::pow::Work;
 use redb::{Database, ReadTransaction, ReadableTable, TableDefinition, WriteTransaction};
 
+pub mod records;
+
 use crate::error::Error;
+use records::{BlobList, BtcHeader, BtcRow, ForkMeta, HashList, Meta, RskBlock};
 
 /// Bitcoin difficulty period, in blocks. Difficulty retargets only at period
 /// boundaries, so every block in a period carries the same work.
 pub const DIFFICULTY_PERIOD: u64 = 2016;
 
-/// Sentinel `parent` for the root chain (fork id 0).
-const NO_PARENT: u64 = u64::MAX;
+// ── Bitcoin tables ──────────────────────────────────────────────────────────
 
-/// Headers+work keyed by `(fork_id, height)`: value is 80-byte header followed
-/// by the 32-byte cumulative work at that height.
-const BTC_HEADERS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("btc_headers");
+/// Headers + cumulative work keyed by `(fork_id, height)`.
+const BTC_HEADERS: TableDefinition<(u64, u64), BtcRow> = TableDefinition::new("btc_headers");
 /// `hash → (fork_id, height)`.
 const BTC_HASH_LOC: TableDefinition<&[u8], (u64, u64)> = TableDefinition::new("btc_hash_loc");
-/// Fork metadata: `fork_id → ForkMeta` (see `ForkMeta::encode`).
-const BTC_FORKS: TableDefinition<u64, &[u8]> = TableDefinition::new("btc_forks");
+/// Fork metadata: `fork_id → ForkMeta`.
+const BTC_FORKS: TableDefinition<u64, ForkMeta> = TableDefinition::new("btc_forks");
 /// The checkpoint spine: one trusted header per difficulty period, never
 /// pruned — the cheap whole-chain work ladder.
-const BTC_CHECKPOINTS: TableDefinition<u64, &[u8]> = TableDefinition::new("btc_checkpoints");
-const BTC_META: TableDefinition<&str, &[u8]> = TableDefinition::new("btc_meta");
+const BTC_CHECKPOINTS: TableDefinition<u64, BtcHeader> = TableDefinition::new("btc_checkpoints");
+const BTC_META: TableDefinition<&str, Meta> = TableDefinition::new("btc_meta");
 
-// ── RSK tables (one tree per trusted root `F`) ──────────────────────────────
+// ── Rootstock tables (one tree per trusted root `F`) ────────────────────────
 
 /// RSK headers, keyed by block hash: raw RLP bytes.
 pub(crate) const RSK_HEADERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rsk_headers");
-/// `hash → number(8) parent(32) own_work(32)`.
-pub(crate) const RSK_BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rsk_blocks");
-/// `hash → concatenated 32-byte child hashes` (the GHOST subtree edges).
-pub(crate) const RSK_CHILDREN: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rsk_children");
-/// `hash → concatenated raw uncle headers` (for the uncle rule's ancestry).
-pub(crate) const RSK_UNCLES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rsk_uncles");
-/// Trusted root anchors (`F`): `hash → cumulative work at F (32 bytes)`.
-pub(crate) const RSK_ROOTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rsk_roots");
-pub(crate) const RSK_META: TableDefinition<&str, &[u8]> = TableDefinition::new("rsk_meta");
+/// `hash → RskBlock`.
+pub(crate) const RSK_BLOCKS: TableDefinition<&[u8], RskBlock> = TableDefinition::new("rsk_blocks");
+/// `hash → child hashes` (the GHOST subtree edges).
+pub(crate) const RSK_CHILDREN: TableDefinition<&[u8], HashList> =
+    TableDefinition::new("rsk_children");
+/// `hash → raw uncle headers` (for the uncle rule's ancestry).
+pub(crate) const RSK_UNCLES: TableDefinition<&[u8], BlobList> = TableDefinition::new("rsk_uncles");
+/// Trusted root anchors (`F`): a set of block hashes.
+pub(crate) const RSK_ROOTS: TableDefinition<&[u8], ()> = TableDefinition::new("rsk_roots");
+pub(crate) const RSK_META: TableDefinition<&str, Meta> = TableDefinition::new("rsk_meta");
 
 const META_SEED_HEIGHT: &str = "seed_height";
 /// The latest finalized checkpoint: a difficulty-period boundary whose
@@ -68,58 +73,10 @@ const META_BEST_FORK: &str = "best_fork";
 const META_NEXT_FORK: &str = "next_fork";
 const META_NETWORK: &str = "network";
 
-/// Metadata for one chain (fork) in the tree. The root chain (id 0) has
-/// `forkpoint == 0`, `parent == None`, and is the initial best chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ForkMeta {
-    /// Height of this fork's first header.
-    pub forkpoint: u64,
-    /// The chain this one diverged from; `None` for the root chain.
-    pub parent: Option<u64>,
-    /// Hash of the block at `forkpoint` (this fork's identity).
-    pub forkpoint_hash: BlockHash,
-    /// Highest connected height on this fork.
-    pub tip_height: u64,
-    /// Hash of the block at `tip_height`.
-    pub tip_hash: BlockHash,
-    /// Cumulative work at `tip_height`.
-    pub tip_work: Work,
-}
-
-impl ForkMeta {
-    /// Wire encoding: `forkpoint(8) parent(8) forkpoint_hash(32) tip_height(8)
-    /// tip_hash(32) tip_work(32)` = 120 bytes.
-    fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(120);
-        out.extend(self.forkpoint.to_be_bytes());
-        out.extend(self.parent.unwrap_or(NO_PARENT).to_be_bytes());
-        out.extend(self.forkpoint_hash.as_byte_array());
-        out.extend(self.tip_height.to_be_bytes());
-        out.extend(self.tip_hash.as_byte_array());
-        out.extend(self.tip_work.to_be_bytes());
-        out
-    }
-
-    fn decode(bytes: &[u8]) -> ForkMeta {
-        let parent = u64::from_be_bytes(bytes[8..16].try_into().expect("8 bytes"));
-        let mut fp_hash = [0u8; 32];
-        fp_hash.copy_from_slice(&bytes[16..48]);
-        let tip_work = Work::from_be_bytes(bytes[80..112].try_into().expect("32 bytes"));
-        ForkMeta {
-            forkpoint: u64::from_be_bytes(bytes[0..8].try_into().expect("8 bytes")),
-            parent: (parent != NO_PARENT).then_some(parent),
-            forkpoint_hash: BlockHash::from_byte_array(fp_hash),
-            tip_height: u64::from_be_bytes(bytes[48..56].try_into().expect("8 bytes")),
-            tip_hash: BlockHash::from_byte_array(bytes[56..88].try_into().expect("32 bytes")),
-            tip_work,
-        }
-    }
-}
-
-/// redb-backed Bitcoin chain state, threaded by [`crate::Core`]. It is only
-/// reachable through [`Store::read`] and [`Store::write`]: there are no
-/// per-call read or write shortcuts, so every operation declares up front
-/// whether it takes a read snapshot or the writer.
+/// redb-backed chain state, threaded by [`crate::Core`]. It is only reachable
+/// through [`Store::read`] and [`Store::write`]: there are no per-call read or
+/// write shortcuts, so every operation declares up front whether it takes a
+/// read snapshot or the writer.
 pub(crate) struct Store {
     db: Database,
 }
@@ -183,7 +140,7 @@ macro_rules! read_methods {
     () => {
         pub(crate) fn fork_meta(&self, fork_id: u64) -> Result<Option<ForkMeta>, Error> {
             let table = self.txn.open_table(BTC_FORKS)?;
-            read_fork_meta(&table, fork_id)
+            Ok(table.get(fork_id)?.map(|v| v.value()))
         }
 
         /// The current best (heaviest) chain id.
@@ -199,7 +156,9 @@ macro_rules! read_methods {
         /// Where `hash` lives, if stored: `(fork_id, height)`.
         pub(crate) fn locate(&self, hash: &BlockHash) -> Result<Option<(u64, u64)>, Error> {
             let table = self.txn.open_table(BTC_HASH_LOC)?;
-            read_loc(&table, hash.as_byte_array())
+            Ok(table
+                .get(hash.as_byte_array().as_slice())?
+                .map(|v| v.value()))
         }
 
         /// The header at `height` on `fork_id`'s chain: the fork's own row, or an
@@ -213,7 +172,7 @@ macro_rules! read_methods {
                 return Ok(None);
             };
             let table = self.txn.open_table(BTC_HEADERS)?;
-            Ok(read_row(&table, owner, height)?.map(|(h, _)| h))
+            Ok(table.get((owner, height))?.map(|v| v.value().header))
         }
 
         /// The cumulative work at `height` on `fork_id`'s chain. Resolves the
@@ -223,7 +182,7 @@ macro_rules! read_methods {
                 return Ok(None);
             };
             let table = self.txn.open_table(BTC_HEADERS)?;
-            Ok(read_row(&table, owner, height)?.map(|(_, w)| w))
+            Ok(table.get((owner, height))?.map(|v| v.value().work))
         }
 
         /// The fork on `fork_id`'s ancestor chain that owns `height`: the first
@@ -254,7 +213,7 @@ macro_rules! read_methods {
             }
         }
 
-        /// The latest settled checkpoint, if seeded. Monotonic: only the
+        /// The latest finalized checkpoint, if seeded. Monotonic: only the
         /// connect path advances it, and only forward.
         pub(crate) fn finalized_height(&self) -> Result<Option<u64>, Error> {
             self.meta_u64(META_FINALIZED)
@@ -262,7 +221,7 @@ macro_rules! read_methods {
 
         fn meta_u64(&self, key: &str) -> Result<Option<u64>, Error> {
             let table = self.txn.open_table(BTC_META)?;
-            read_meta_u64(&table, key)
+            Ok(table.get(key)?.and_then(|v| v.value().as_u64()))
         }
     };
 }
@@ -287,7 +246,9 @@ impl ReadTxn {
     #[cfg(test)]
     pub(crate) fn network(&self) -> Result<Option<Network>, Error> {
         let table = self.txn.open_table(BTC_META)?;
-        read_meta_network(&table)
+        Ok(table
+            .get(META_NETWORK)?
+            .and_then(|v| v.value().as_text().and_then(|t| t.parse().ok())))
     }
 }
 
@@ -307,7 +268,9 @@ impl WriteTxn {
     /// validated against the wrong consensus parameters.
     pub(crate) fn network(&self) -> Result<Option<Network>, Error> {
         let table = self.txn.open_table(BTC_META)?;
-        read_meta_network(&table)
+        Ok(table
+            .get(META_NETWORK)?
+            .and_then(|v| v.value().as_text().and_then(|t| t.parse().ok())))
     }
 
     /// Plant the trust anchor: one header per difficulty period (the
@@ -359,15 +322,17 @@ impl WriteTxn {
                 cum + work_scaled(prev_w, DIFFICULTY_PERIOD - 1) + w
             };
             prev_w = w;
-            let bytes = encode(header)?;
-            checkpoints.insert(*height, bytes.as_slice())?;
+            checkpoints.insert(*height, BtcHeader(*header))?;
             hash_loc.insert(header.block_hash().as_byte_array().as_slice(), (0, *height))?;
             // The spine doubles as the root chain's headers at these
             // heights, with cumulative work.
-            let mut row = Vec::with_capacity(112);
-            row.extend_from_slice(&bytes);
-            row.extend_from_slice(&cum.to_be_bytes());
-            headers.insert((0, *height), row.as_slice())?;
+            headers.insert(
+                (0, *height),
+                BtcRow {
+                    header: *header,
+                    work: cum,
+                },
+            )?;
         }
         let first = sorted.first().expect("checked non-empty above").0;
         let last = sorted.last().expect("checked non-empty above").0;
@@ -384,11 +349,11 @@ impl WriteTxn {
             tip_hash: last_hash,
             tip_work: cum,
         };
-        forks.insert(0, root.encode().as_slice())?;
-        meta.insert(META_SEED_HEIGHT, first.to_be_bytes().as_slice())?;
-        meta.insert(META_FINALIZED, last.to_be_bytes().as_slice())?;
-        meta.insert(META_BEST_FORK, 0u64.to_be_bytes().as_slice())?;
-        meta.insert(META_NEXT_FORK, 1u64.to_be_bytes().as_slice())?;
+        forks.insert(0, root)?;
+        meta.insert(META_SEED_HEIGHT, Meta::U64(first))?;
+        meta.insert(META_FINALIZED, Meta::U64(last))?;
+        meta.insert(META_BEST_FORK, Meta::U64(0))?;
+        meta.insert(META_NEXT_FORK, Meta::U64(1))?;
         Ok(())
     }
 
@@ -407,9 +372,9 @@ impl WriteTxn {
             let mut meta = self.txn.open_table(BTC_META)?;
             let next = meta
                 .get(META_NEXT_FORK)?
-                .map(|v| u64::from_be_bytes(v.value().try_into().expect("8 bytes")))
+                .and_then(|v| v.value().as_u64())
                 .unwrap_or(1);
-            meta.insert(META_NEXT_FORK, (next + 1).to_be_bytes().as_slice())?;
+            meta.insert(META_NEXT_FORK, Meta::U64(next + 1))?;
             next
         };
         let meta = ForkMeta {
@@ -422,7 +387,7 @@ impl WriteTxn {
         };
         {
             let mut forks = self.txn.open_table(BTC_FORKS)?;
-            forks.insert(id, meta.encode().as_slice())?;
+            forks.insert(id, meta)?;
         }
         Ok(id)
     }
@@ -445,11 +410,13 @@ impl WriteTxn {
             let mut checkpoints = self.txn.open_table(BTC_CHECKPOINTS)?;
             let mut forks = self.txn.open_table(BTC_FORKS)?;
             for &(height, header, cum) in entries {
-                let bytes = encode(header)?;
-                let mut row = Vec::with_capacity(112);
-                row.extend_from_slice(&bytes);
-                row.extend_from_slice(&cum.to_be_bytes());
-                headers.insert((fork_id, height), row.as_slice())?;
+                headers.insert(
+                    (fork_id, height),
+                    BtcRow {
+                        header: *header,
+                        work: cum,
+                    },
+                )?;
                 hash_loc.insert(
                     header.block_hash().as_byte_array().as_slice(),
                     (fork_id, height),
@@ -457,19 +424,19 @@ impl WriteTxn {
                 // Extend the spine when the root chain crosses a period
                 // boundary (the spine stays a full-chain work ladder).
                 if fork_id == 0 && height % DIFFICULTY_PERIOD == 0 {
-                    checkpoints.insert(height, bytes.as_slice())?;
+                    checkpoints.insert(height, BtcHeader(*header))?;
                 }
             }
             let last = entries.last().expect("checked non-empty above");
             let last_hash = last.1.block_hash();
-            let mut meta = forks.get(fork_id)?.map(|v| ForkMeta::decode(v.value()));
+            let mut meta = forks.get(fork_id)?.map(|v| v.value());
             if let Some(m) = meta.as_mut() {
                 m.tip_height = last.0;
                 m.tip_hash = last_hash;
                 m.tip_work = last.2;
             }
             let meta = meta.expect("fork meta must exist before appending headers");
-            forks.insert(fork_id, meta.encode().as_slice())?;
+            forks.insert(fork_id, meta)?;
         }
         Ok(())
     }
@@ -477,7 +444,7 @@ impl WriteTxn {
     /// Mark `fork_id` as the best (heaviest) chain.
     pub(crate) fn set_best_fork(&self, fork_id: u64) -> Result<(), Error> {
         let mut meta = self.txn.open_table(BTC_META)?;
-        meta.insert(META_BEST_FORK, fork_id.to_be_bytes().as_slice())?;
+        meta.insert(META_BEST_FORK, Meta::U64(fork_id))?;
         Ok(())
     }
 
@@ -485,14 +452,14 @@ impl WriteTxn {
     /// check at the top of [`crate::Core::connect_headers`]).
     pub(crate) fn set_network(&self, network: Network) -> Result<(), Error> {
         let mut meta = self.txn.open_table(BTC_META)?;
-        meta.insert(META_NETWORK, network.to_string().as_bytes())?;
+        meta.insert(META_NETWORK, Meta::Text(network.to_string()))?;
         Ok(())
     }
 
     /// Record the latest finalized checkpoint.
     pub(crate) fn set_finalized(&self, height: u64) -> Result<(), Error> {
         let mut meta = self.txn.open_table(BTC_META)?;
-        meta.insert(META_FINALIZED, height.to_be_bytes().as_slice())?;
+        meta.insert(META_FINALIZED, Meta::U64(height))?;
         Ok(())
     }
 
@@ -503,64 +470,102 @@ impl WriteTxn {
     }
 }
 
-// ── shared read helpers (used by both ReadTxn and WriteTxn) ─────────────────
+// ── Rootstock table access ──────────────────────────────────────────────────
 
-fn decode_row(bytes: &[u8]) -> (BitcoinHeader, Work) {
-    let mut reader = &bytes[..80];
-    let header =
-        BitcoinHeader::consensus_decode(&mut reader).expect("stored header is always valid");
-    let work = Work::from_be_bytes(bytes[80..112].try_into().expect("32-byte work"));
-    (header, work)
-}
+/// Reads over the RSK tables, shared by [`ReadTxn`] and [`WriteTxn`] so a
+/// connect can validate against what it has already staged.
+macro_rules! rsk_read_methods {
+    () => {
+        /// Raw wire header bytes for `hash`.
+        pub(crate) fn rsk_raw_header(&self, hash: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+            let table = self.txn.open_table(RSK_HEADERS)?;
+            Ok(table.get(hash)?.map(|v| v.value().to_vec()))
+        }
 
-fn read_row<T>(table: &T, fork_id: u64, height: u64) -> Result<Option<(BitcoinHeader, Work)>, Error>
-where
-    T: ReadableTable<(u64, u64), &'static [u8]>,
-{
-    Ok(table.get((fork_id, height))?.map(|v| decode_row(v.value())))
-}
+        /// The stored block index for `hash`.
+        pub(crate) fn rsk_block(&self, hash: &[u8]) -> Result<Option<RskBlock>, Error> {
+            let table = self.txn.open_table(RSK_BLOCKS)?;
+            Ok(table.get(hash)?.map(|v| v.value()))
+        }
 
-fn read_fork_meta<T>(table: &T, fork_id: u64) -> Result<Option<ForkMeta>, Error>
-where
-    T: ReadableTable<u64, &'static [u8]>,
-{
-    Ok(table.get(fork_id)?.map(|v| ForkMeta::decode(v.value())))
-}
+        pub(crate) fn rsk_has_block(&self, hash: &[u8]) -> Result<bool, Error> {
+            Ok(self.rsk_block(hash)?.is_some())
+        }
 
-fn read_loc<T>(table: &T, hash: &[u8; 32]) -> Result<Option<(u64, u64)>, Error>
-where
-    T: ReadableTable<&'static [u8], (u64, u64)>,
-{
-    Ok(table.get(hash.as_slice())?.map(|v| v.value()))
-}
+        /// Child hashes of `hash` (the GHOST subtree edges).
+        pub(crate) fn rsk_children(&self, hash: &[u8]) -> Result<Vec<[u8; 32]>, Error> {
+            let table = self.txn.open_table(RSK_CHILDREN)?;
+            Ok(table.get(hash)?.map(|v| v.value().0).unwrap_or_default())
+        }
 
-fn read_meta_u64<T>(table: &T, key: &str) -> Result<Option<u64>, Error>
-where
-    T: ReadableTable<&'static str, &'static [u8]>,
-{
-    Ok(table
-        .get(key)?
-        .map(|v| u64::from_be_bytes(v.value().try_into().expect("8-byte meta"))))
-}
+        /// Raw uncle headers of `hash`.
+        pub(crate) fn rsk_uncle_raw(&self, hash: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+            let table = self.txn.open_table(RSK_UNCLES)?;
+            Ok(table.get(hash)?.map(|v| v.value().0).unwrap_or_default())
+        }
 
-fn read_meta_network<T>(table: &T) -> Result<Option<Network>, Error>
-where
-    T: ReadableTable<&'static str, &'static [u8]>,
-{
-    let Some(value) = table.get(META_NETWORK)? else {
-        return Ok(None);
+        /// The trusted root (`F`) hashes.
+        pub(crate) fn rsk_roots(&self) -> Result<Vec<[u8; 32]>, Error> {
+            let table = self.txn.open_table(RSK_ROOTS)?;
+            let mut out = Vec::new();
+            for entry in table.iter()? {
+                let (key, _) = entry.map_err(Error::Storage)?;
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(key.value());
+                out.push(hash);
+            }
+            Ok(out)
+        }
     };
-    let text = std::str::from_utf8(value.value())
-        .map_err(|e| Error::Internal(format!("network meta is not utf-8: {e}")))?;
-    Ok(text.parse().ok())
 }
 
-fn encode(header: &BitcoinHeader) -> Result<Vec<u8>, Error> {
-    let mut buf = Vec::with_capacity(80);
-    header
-        .consensus_encode(&mut buf)
-        .map_err(|e| Error::Internal(format!("encode header: {e}")))?;
-    Ok(buf)
+#[allow(dead_code)] // some reads are only used on one transaction kind
+impl ReadTxn {
+    rsk_read_methods!();
+}
+
+#[allow(dead_code)] // some reads are only used on one transaction kind
+impl WriteTxn {
+    rsk_read_methods!();
+
+    pub(crate) fn rsk_put_block(
+        &self,
+        hash: &[u8],
+        raw: &[u8],
+        block: RskBlock,
+    ) -> Result<(), Error> {
+        {
+            let mut table = self.txn.open_table(RSK_HEADERS)?;
+            table.insert(hash, raw)?;
+        }
+        {
+            let mut table = self.txn.open_table(RSK_BLOCKS)?;
+            table.insert(hash, block)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rsk_put_uncles(&self, hash: &[u8], raws: &[Vec<u8>]) -> Result<(), Error> {
+        let mut table = self.txn.open_table(RSK_UNCLES)?;
+        table.insert(hash, BlobList(raws.to_vec()))?;
+        Ok(())
+    }
+
+    pub(crate) fn rsk_add_child(&self, parent: &[u8], child: &[u8]) -> Result<(), Error> {
+        let mut table = self.txn.open_table(RSK_CHILDREN)?;
+        let mut children = table.get(parent)?.map(|v| v.value()).unwrap_or_default();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(child);
+        children.0.push(hash);
+        table.insert(parent, children)?;
+        Ok(())
+    }
+
+    pub(crate) fn rsk_put_root(&self, hash: &[u8]) -> Result<(), Error> {
+        let mut table = self.txn.open_table(RSK_ROOTS)?;
+        table.insert(hash, ())?;
+        Ok(())
+    }
 }
 
 /// `work` added to itself `n` times. (`Work` has no `Mul`, and the per-period
