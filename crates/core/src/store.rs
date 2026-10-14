@@ -182,18 +182,47 @@ macro_rules! read_methods {
             read_loc(&table, hash.as_byte_array())
         }
 
+        /// The header at `height` on `fork_id`'s chain: the fork's own row, or an
+        /// ancestor's below its forkpoint.
         pub(crate) fn header_at(
             &self,
             fork_id: u64,
             height: u64,
         ) -> Result<Option<BitcoinHeader>, Error> {
+            let Some(owner) = self.owner_fork(fork_id, height)? else {
+                return Ok(None);
+            };
             let table = self.txn.open_table(BTC_HEADERS)?;
-            Ok(read_row(&table, fork_id, height)?.map(|(h, _)| h))
+            Ok(read_row(&table, owner, height)?.map(|(h, _)| h))
         }
 
+        /// The cumulative work at `height` on `fork_id`'s chain. Resolves the
+        /// owning fork exactly as [`header_at`](Self::header_at) does.
         pub(crate) fn work_at(&self, fork_id: u64, height: u64) -> Result<Option<Work>, Error> {
+            let Some(owner) = self.owner_fork(fork_id, height)? else {
+                return Ok(None);
+            };
             let table = self.txn.open_table(BTC_HEADERS)?;
-            Ok(read_row(&table, fork_id, height)?.map(|(_, w)| w))
+            Ok(read_row(&table, owner, height)?.map(|(_, w)| w))
+        }
+
+        /// The fork on `fork_id`'s ancestor chain that owns `height`: the first
+        /// fork whose forkpoint is at or below it. `None` when even the root
+        /// chain starts above `height`.
+        fn owner_fork(&self, fork_id: u64, height: u64) -> Result<Option<u64>, Error> {
+            let mut f = fork_id;
+            loop {
+                let Some(meta) = self.fork_meta(f)? else {
+                    return Ok(None);
+                };
+                if height >= meta.forkpoint {
+                    return Ok(Some(f));
+                }
+                let Some(parent) = meta.parent else {
+                    return Ok(None);
+                };
+                f = parent;
+            }
         }
 
         /// Cumulative work of a fork at its tip — the number chain selection

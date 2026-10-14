@@ -34,7 +34,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::pow::Work;
 
 use crate::error::Error;
-use crate::store::{DIFFICULTY_PERIOD, ForkMeta, ReadTxn, Store, WriteTxn};
+use crate::store::{DIFFICULTY_PERIOD, ReadTxn, Store, WriteTxn};
 use crate::validation;
 
 /// How far below the tip a period boundary must be before we consider it
@@ -126,10 +126,10 @@ impl Chain {
     /// Cumulative proof-of-work of the best chain at `height`.
     pub fn chainwork_at(&self, height: u64) -> Result<Option<Work>, Error> {
         let txn = self.store.read()?;
-        match txn.best_fork()? {
-            None => Ok(None),
-            Some(best) => txn.work_at(best, height),
-        }
+        let Some(best) = txn.best_fork()? else {
+            return Ok(None);
+        };
+        txn.work_at(best, height)
     }
 
     /// The latest finalized checkpoint.
@@ -144,9 +144,13 @@ impl Chain {
     /// stepping back a period at a time).
     pub fn btc_tail_work(&self, tail_start: u64) -> Result<Option<Work>, Error> {
         let txn = self.store.read()?;
+        let Some(best) = txn.best_fork()? else {
+            return Ok(None);
+        };
+        let end_height = tail_start.saturating_add(DIFFICULTY_PERIOD);
         let (Some(begin), Some(end)) = (
-            txn.work_at(0, tail_start)?,
-            txn.work_at(0, tail_start.saturating_add(DIFFICULTY_PERIOD))?,
+            txn.work_at(best, tail_start)?,
+            txn.work_at(best, end_height)?,
         ) else {
             return Ok(None);
         };
@@ -171,7 +175,7 @@ impl Chain {
         let mut out = Vec::new();
         let mut height = 0u64;
         while height <= finalized {
-            if let Some(header) = canonical_header(&txn, best, height)? {
+            if let Some(header) = txn.header_at(best, height)? {
                 out.push((height, header));
             }
             height += DIFFICULTY_PERIOD;
@@ -194,7 +198,7 @@ impl Chain {
         let Some(best) = txn.best_fork()? else {
             return Ok(None);
         };
-        canonical_header(&txn, best, height)
+        txn.header_at(best, height)
     }
 
     /// True if `hash` is the canonical block at `height`.
@@ -206,7 +210,9 @@ impl Chain {
         let Some(best) = txn.best_fork()? else {
             return Ok(false);
         };
-        Ok(canonical_header(&txn, best, height)?.is_some_and(|h| h.block_hash() == *hash))
+        Ok(txn
+            .header_at(best, height)?
+            .is_some_and(|h| h.block_hash() == *hash))
     }
 
     /// Validate and store a contiguous ascending run of headers, attaching them
@@ -329,7 +335,7 @@ impl Chain {
             {
                 return Ok(Some(*header));
             }
-            canonical_header(&txn, target_fork, height)
+            txn.header_at(target_fork, height)
         };
 
         let mut prev = parent;
@@ -509,66 +515,8 @@ fn finalize_in_txn(txn: &WriteTxn) -> Result<Option<u64>, Error> {
     Ok(Some(boundary))
 }
 
-// ── chain reads through either transaction ──────────────────────────────────
-
-/// The read operations the ancestor walk needs, so one implementation serves
-/// both the read-only ([`ReadTxn`]) and the atomic read-modify-write
-/// ([`WriteTxn`]) callers.
-trait HeaderSource {
-    fn fork_meta(&self, fork_id: u64) -> Result<Option<ForkMeta>, Error>;
-    fn header_at(&self, fork_id: u64, height: u64) -> Result<Option<BitcoinHeader>, Error>;
-    fn best_fork(&self) -> Result<Option<u64>, Error>;
-}
-
-impl HeaderSource for ReadTxn {
-    fn fork_meta(&self, fork_id: u64) -> Result<Option<ForkMeta>, Error> {
-        ReadTxn::fork_meta(self, fork_id)
-    }
-    fn header_at(&self, fork_id: u64, height: u64) -> Result<Option<BitcoinHeader>, Error> {
-        ReadTxn::header_at(self, fork_id, height)
-    }
-    fn best_fork(&self) -> Result<Option<u64>, Error> {
-        ReadTxn::best_fork(self)
-    }
-}
-
-impl HeaderSource for WriteTxn {
-    fn fork_meta(&self, fork_id: u64) -> Result<Option<ForkMeta>, Error> {
-        WriteTxn::fork_meta(self, fork_id)
-    }
-    fn header_at(&self, fork_id: u64, height: u64) -> Result<Option<BitcoinHeader>, Error> {
-        WriteTxn::header_at(self, fork_id, height)
-    }
-    fn best_fork(&self) -> Result<Option<u64>, Error> {
-        WriteTxn::best_fork(self)
-    }
-}
-
-/// The header at `height` on chain `fork` (falling back to its ancestors below
-/// the forkpoint, and to the spine on the root chain). Generic over the
-/// transaction, so the read path and the atomic connect path share one walk.
-fn canonical_header(
-    txn: &impl HeaderSource,
-    fork: u64,
-    height: u64,
-) -> Result<Option<BitcoinHeader>, Error> {
-    let mut f = fork;
-    loop {
-        let Some(meta) = txn.fork_meta(f)? else {
-            return Ok(None);
-        };
-        if height >= meta.forkpoint {
-            return txn.header_at(f, height);
-        }
-        let Some(parent) = meta.parent else {
-            return Ok(None);
-        };
-        f = parent;
-    }
-}
-
 /// Whether a stored `(fork, height)` block lies on the canonical chain.
-fn is_canonical_at(txn: &impl HeaderSource, fork: u64, height: u64) -> Result<bool, Error> {
+fn is_canonical_at(txn: &ReadTxn, fork: u64, height: u64) -> Result<bool, Error> {
     let Some(best) = txn.best_fork()? else {
         return Ok(false);
     };
@@ -829,6 +777,31 @@ mod tests {
         assert_ne!(f, 0);
         // The fork's blocks are not canonical.
         assert!(!chain.is_canonical(4, &fork[0].block_hash())?);
+        Ok(())
+    }
+
+    /// A fork's cumulative work below its forkpoint lives on its ancestors, so
+    /// `chainwork_at` must resolve through them rather than read the fork's own
+    /// (absent) rows.
+    #[test]
+    fn chainwork_at_resolves_the_ancestor_fork() -> eyre::Result<()> {
+        let chain = seeded();
+        let main = easy_chain(&canonical(&chain, 0), 5, 1);
+        chain.connect_headers(&main)?;
+
+        // A heavier fork from height 3 (parent = main[2]) wins; its forkpoint is
+        // 4, so heights below it live on the root chain.
+        let fork = easy_chain(&main[2], 5, 1000);
+        chain.connect_headers(&fork)?;
+        let best = chain.best_fork()?.expect("a best fork");
+        assert_ne!(best, 0);
+
+        let txn = chain.store.read()?;
+        // Below the forkpoint both reads resolve to the root chain's row.
+        assert_eq!(chain.chainwork_at(2)?, txn.work_at(0, 2)?);
+        assert_eq!(txn.work_at(best, 2)?, txn.work_at(0, 2)?);
+        // At/above the forkpoint the fork's own row is used.
+        assert_eq!(chain.chainwork_at(4)?, txn.work_at(best, 4)?);
         Ok(())
     }
 
