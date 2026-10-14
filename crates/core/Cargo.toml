@@ -5,9 +5,12 @@ edition = "2024"
 description = "Side-effect-free Rootstock/Bitcoin core: deterministic chain state in redb, no concurrency or I/O in the logic"
 
 [dependencies]
+alloy-primitives = { version = "1.5.4", features = ["rlp"] }
+alloy-rlp = "0.3.13"
 bitcoin = "0.32.8"
 hex = "0.4.3"
 redb = "2"
+rsk-consensus = { path = "../rsk-consensus" }
 thiserror = "2.0.18"
 
 [lints.clippy]

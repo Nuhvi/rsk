@@ -24,7 +24,7 @@ use bitcoin::block::BlockHash;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::hashes::Hash as _;
 use bitcoin::pow::Work;
-use rsk_core::{Chain, DIFFICULTY_PERIOD};
+use rsk_core::{Core, DIFFICULTY_PERIOD};
 use tracing::{info, warn};
 
 use crate::DEFAULT_DATA_DIR;
@@ -74,7 +74,7 @@ pub fn run(mut args: Args) -> Result<()> {
     info!("data directory: {}", data_dir.display());
     info!("chain store:    {}", store_path.display());
 
-    let chain = Chain::open(&store_path, Network::Bitcoin)?;
+    let chain = Core::open(&store_path, Network::Bitcoin)?;
 
     let from = anchor(&chain, &args)?;
     info!("syncing from height {from} …");
@@ -93,7 +93,7 @@ pub fn run(mut args: Args) -> Result<()> {
 
 /// Plant the trust anchor once and return the first height to download. On a
 /// store that is already anchored this is just the height above the tip.
-fn anchor(chain: &Chain, args: &Args) -> Result<u64> {
+fn anchor(chain: &Core, args: &Args) -> Result<u64> {
     if let Some(tip) = chain.tip_height()? {
         info!("resume: store already anchored at tip {tip}; continuing above it");
         return Ok(tip + 1);
@@ -132,7 +132,7 @@ fn anchor(chain: &Chain, args: &Args) -> Result<u64> {
 /// A locator for our canonical tip: the last few headers (newest first), then
 /// genesis as the universal fallback. A peer walks it to find the fork point
 /// and serves headers after the first hash it knows.
-fn locator(chain: &Chain) -> Result<Vec<BlockHash>> {
+fn locator(chain: &Core) -> Result<Vec<BlockHash>> {
     let Some(tip) = chain.tip_height()? else {
         return Ok(Vec::new());
     };
@@ -151,7 +151,7 @@ fn locator(chain: &Chain) -> Result<Vec<BlockHash>> {
     Ok(out)
 }
 
-fn start_height(chain: &Chain) -> Result<i32> {
+fn start_height(chain: &Core) -> Result<i32> {
     Ok(chain.tip_height()?.unwrap_or(0).min(i32::MAX as u64) as i32)
 }
 
@@ -165,7 +165,7 @@ struct Stats {
     peer_height: u64,
 }
 
-fn sync(chain: &Chain, candidates: &mut VecDeque<SocketAddr>, args: &Args) -> Result<()> {
+fn sync(chain: &Core, candidates: &mut VecDeque<SocketAddr>, args: &Args) -> Result<()> {
     let want = args.peers.max(1);
     let mut pool = Pool::new();
     pool.fill(candidates, want, args.limit, start_height(chain)?);
@@ -288,7 +288,7 @@ fn prefetch(peers: &mut [Peer], alive: &mut [bool], from: usize, last: BlockHash
 }
 
 /// The end-of-run summary and the invariants that say the sync was real.
-fn report(chain: &Chain, stats: &Stats) -> Result<()> {
+fn report(chain: &Core, stats: &Stats) -> Result<()> {
     let tip = chain.tip_height()?.context("no tip after sync")?;
     let elapsed = stats.started.elapsed().as_secs_f64();
     info!(

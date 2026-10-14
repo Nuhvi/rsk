@@ -24,7 +24,7 @@ pub enum Error {
     #[error("commit error: {0}")]
     Commit(#[from] redb::CommitError),
 
-    #[error("no chain seeded: call Chain::seed_checkpoints first")]
+    #[error("no chain seeded: call Core::seed_checkpoints first")]
     Unseeded,
 
     #[error("chain already seeded: checkpoints are planted once; resume by connecting headers")]
@@ -57,6 +57,9 @@ pub enum Error {
 
     #[error("fork at height {fork} is at or below the finalized checkpoint {finalized}")]
     ForkBelowFinalized { fork: u64, finalized: u64 },
+
+    #[error("rootstock: {0}")]
+    Rootstock(String),
 
     #[error("internal: {0}")]
     Internal(String),

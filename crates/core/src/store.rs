@@ -46,6 +46,20 @@ const BTC_FORKS: TableDefinition<u64, &[u8]> = TableDefinition::new("btc_forks")
 const BTC_CHECKPOINTS: TableDefinition<u64, &[u8]> = TableDefinition::new("btc_checkpoints");
 const BTC_META: TableDefinition<&str, &[u8]> = TableDefinition::new("btc_meta");
 
+// ── RSK tables (one tree per trusted root `F`) ──────────────────────────────
+
+/// RSK headers, keyed by block hash: raw RLP bytes.
+pub(crate) const RSK_HEADERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rsk_headers");
+/// `hash → number(8) parent(32) own_work(32)`.
+pub(crate) const RSK_BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rsk_blocks");
+/// `hash → concatenated 32-byte child hashes` (the GHOST subtree edges).
+pub(crate) const RSK_CHILDREN: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rsk_children");
+/// `hash → concatenated raw uncle headers` (for the uncle rule's ancestry).
+pub(crate) const RSK_UNCLES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rsk_uncles");
+/// Trusted root anchors (`F`): `hash → cumulative work at F (32 bytes)`.
+pub(crate) const RSK_ROOTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rsk_roots");
+pub(crate) const RSK_META: TableDefinition<&str, &[u8]> = TableDefinition::new("rsk_meta");
+
 const META_SEED_HEIGHT: &str = "seed_height";
 /// The latest finalized checkpoint: a difficulty-period boundary whose
 /// above-work outweighs the period before it. Advanced only forward.
@@ -102,7 +116,7 @@ impl ForkMeta {
     }
 }
 
-/// redb-backed Bitcoin chain state, threaded by [`crate::Chain`]. It is only
+/// redb-backed Bitcoin chain state, threaded by [`crate::Core`]. It is only
 /// reachable through [`Store::read`] and [`Store::write`]: there are no
 /// per-call read or write shortcuts, so every operation declares up front
 /// whether it takes a read snapshot or the writer.
@@ -132,6 +146,12 @@ impl Store {
         txn.open_table(BTC_FORKS)?;
         txn.open_table(BTC_CHECKPOINTS)?;
         txn.open_table(BTC_META)?;
+        txn.open_table(RSK_HEADERS)?;
+        txn.open_table(RSK_BLOCKS)?;
+        txn.open_table(RSK_CHILDREN)?;
+        txn.open_table(RSK_UNCLES)?;
+        txn.open_table(RSK_ROOTS)?;
+        txn.open_table(RSK_META)?;
         txn.commit()?;
         Ok(Self { db })
     }
@@ -250,7 +270,7 @@ macro_rules! read_methods {
 /// A read-only snapshot: a consistent view of committed state for the life of
 /// the transaction.
 pub(crate) struct ReadTxn {
-    txn: ReadTransaction,
+    pub(crate) txn: ReadTransaction,
 }
 
 impl ReadTxn {
@@ -276,7 +296,7 @@ impl ReadTxn {
 /// sequence of reads feeding a decision and the writes acting on it are atomic
 /// with respect to any other writer.
 pub(crate) struct WriteTxn {
-    txn: WriteTransaction,
+    pub(crate) txn: WriteTransaction,
 }
 
 impl WriteTxn {
@@ -462,7 +482,7 @@ impl WriteTxn {
     }
 
     /// Record the network this chain is seeded for (read back by the network
-    /// check at the top of [`crate::Chain::connect_headers`]).
+    /// check at the top of [`crate::Core::connect_headers`]).
     pub(crate) fn set_network(&self, network: Network) -> Result<(), Error> {
         let mut meta = self.txn.open_table(BTC_META)?;
         meta.insert(META_NETWORK, network.to_string().as_bytes())?;

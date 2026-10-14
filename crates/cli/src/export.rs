@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use bitcoin::Network;
 use bitcoin::consensus::Encodable;
-use rsk_core::Chain;
+use rsk_core::Core;
 
 use crate::DEFAULT_DATA_DIR;
 
@@ -35,7 +35,7 @@ pub struct Args {
 
 pub fn run(args: Args) -> Result<()> {
     let store_path = args.data_dir.join("chain.redb");
-    let chain = Chain::open(&store_path, Network::Bitcoin)
+    let chain = Core::open(&store_path, Network::Bitcoin)
         .with_context(|| format!("opening store {}", store_path.display()))?;
     let finalized = chain
         .finalized_height()?

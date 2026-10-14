@@ -9,7 +9,7 @@
 //!
 //! The file holds only **finalized** checkpoints — each one met the finality
 //! rule when it was generated (the tail above it outweighed the period before
-//! it; see [`crate::chain::Chain::finalized_checkpoints`]), so none of them is
+//! it; see [`crate::chain::Core::finalized_checkpoints`]), so none of them is
 //! subject to reorg. The tip's nearest boundary is deliberately not included.
 //!
 //! The file lives next to this crate (`data/checkpoints.txt`), is compiled in,

@@ -41,7 +41,7 @@ use crate::validation;
 /// settled and advance the finalized checkpoint to it.
 pub const FINALITY_MARGIN_BLOCKS: u64 = DIFFICULTY_PERIOD;
 
-/// Outcome of a [`Chain::connect_headers`] call.
+/// Outcome of a [`Core::connect_headers`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectOutcome {
     /// Headers newly accepted and stored (across whatever fork they landed on).
@@ -63,17 +63,30 @@ pub struct ConnectOutcome {
 ///
 /// No concurrency, no network, no clock, no hidden I/O — the caller supplies
 /// headers and reads back outcomes.
-pub struct Chain {
-    store: Store,
+pub struct Core {
+    pub(crate) store: Store,
     network: Network,
+    /// Rootstock consensus parameters the RSK tree validates against.
+    pub(crate) rsk_chain: std::sync::Arc<rsk_consensus::config::ChainConfig>,
 }
 
-impl Chain {
+/// The Rootstock consensus config matching a Bitcoin [`Network`].
+fn rsk_config(network: Network) -> std::sync::Arc<rsk_consensus::config::ChainConfig> {
+    use rsk_consensus::config::ChainConfig;
+    std::sync::Arc::new(match network {
+        Network::Bitcoin => ChainConfig::mainnet(),
+        Network::Testnet | Network::Testnet4 | Network::Signet => ChainConfig::testnet(),
+        Network::Regtest => ChainConfig::regtest(),
+    })
+}
+
+impl Core {
     /// Open a file-backed chain store for the given network.
     pub fn open(path: &std::path::Path, network: Network) -> Result<Self, Error> {
         Ok(Self {
             store: Store::open(path)?,
             network,
+            rsk_chain: rsk_config(network),
         })
     }
 
@@ -83,6 +96,7 @@ impl Chain {
         Ok(Self {
             store: Store::in_memory()?,
             network,
+            rsk_chain: rsk_config(network),
         })
     }
 
@@ -231,7 +245,7 @@ impl Chain {
     ///   refused ([`Error::ForkBelowFinalized`]) — the checkpoint's floor.
     ///
     /// Returns [`Error::NetworkMismatch`] if the store was seeded for a
-    /// different network than this [`Chain`] validates against.
+    /// different network than this [`Core`] validates against.
     ///
     /// The whole operation — reads, validation, writes and the automatic
     /// tail advance below — runs inside one write transaction, so nothing can
@@ -436,7 +450,7 @@ impl Chain {
 
     /// Connect a single header (Electrum's near-tip `save_header` path).
     ///
-    /// Test-only: the sync callers use [`Chain::connect_headers`] directly.
+    /// Test-only: the sync callers use [`Core::connect_headers`] directly.
     #[cfg(test)]
     pub fn connect_header(&self, header: &BitcoinHeader) -> Result<ConnectOutcome, Error> {
         self.connect_headers(std::slice::from_ref(header))
@@ -446,7 +460,7 @@ impl Chain {
     /// that is at least a full period below the tip, and move the Bitcoin tail to
     /// it. Returns the new checkpoint.
     ///
-    /// This runs automatically at the end of every [`Chain::connect_headers`]
+    /// This runs automatically at the end of every [`Core::connect_headers`]
     /// batch (reported in [`ConnectOutcome::finalized`]); you do not normally
     /// need to call it.
     ///
@@ -463,7 +477,7 @@ impl Chain {
     /// (fork 0) is assumed canonical.
     ///
     /// Test-only: production advancement rides inside
-    /// [`Chain::connect_headers`].
+    /// [`Core::connect_headers`].
     #[cfg(test)]
     pub fn finalize_period(&self) -> Result<Option<u64>, Error> {
         let txn = self.store.write()?;
@@ -566,7 +580,7 @@ fn median_time_past_at(
 // ── proof-of-work helper ────────────────────────────────────────────────────
 
 /// Compute the `Work` carried by a header (needed by callers that assemble
-/// branches before handing them to [`Chain::connect_headers`]).
+/// branches before handing them to [`Core::connect_headers`]).
 pub fn header_work(header: &BitcoinHeader) -> Work {
     header.target().to_work()
 }
@@ -660,15 +674,15 @@ mod tests {
     /// difficulty rule is skipped; the tests here exercise the fork/finality
     /// machinery and the median-time-past rule. The difficulty rule itself is
     /// tested in [`crate::validation`] and against real mainnet data.
-    fn seeded() -> Chain {
-        let chain = Chain::in_memory(Network::Regtest).expect("in-memory store");
+    fn seeded() -> Core {
+        let chain = Core::in_memory(Network::Regtest).expect("in-memory store");
         let genesis = mine_genesis(0);
         chain.seed_checkpoints(&[(0, genesis)]).expect("seed");
         chain
     }
 
     /// The header at `height` on the canonical chain.
-    fn canonical(chain: &Chain, height: u64) -> BitcoinHeader {
+    fn canonical(chain: &Core, height: u64) -> BitcoinHeader {
         chain
             .header_at(height)
             .unwrap()
@@ -676,7 +690,7 @@ mod tests {
     }
 
     /// The hash of the block at `height` on the canonical chain.
-    fn canonical_hash(chain: &Chain, height: u64) -> BlockHash {
+    fn canonical_hash(chain: &Core, height: u64) -> BlockHash {
         canonical(chain, height).block_hash()
     }
 
@@ -1000,7 +1014,7 @@ mod tests {
         // 2016 blocks in the intervening period were stored:
         //   work_at(0)     = w                    (just the boundary block)
         //   work_at(2016)  = w + 2015*w + w = 2017*w
-        let chain = Chain::in_memory(Network::Regtest).unwrap();
+        let chain = Core::in_memory(Network::Regtest).unwrap();
         let g0 = mine_genesis(0);
         let g2016 = mine_genesis(1);
         let w = header_work(&g0);
@@ -1030,7 +1044,7 @@ mod tests {
         genesis
             .validate_pow(genesis.target())
             .expect("real genesis PoW");
-        let chain = Chain::in_memory(Network::Regtest).unwrap();
+        let chain = Core::in_memory(Network::Regtest).unwrap();
         chain.seed_checkpoints(&[(0, genesis)]).unwrap();
         assert_eq!(
             chain.header_at(0)?.unwrap().block_hash(),
@@ -1138,16 +1152,17 @@ mod tests {
 
     #[test]
     fn connecting_with_the_wrong_network_is_refused() -> eyre::Result<()> {
-        let chain = Chain::in_memory(Network::Regtest)?;
+        let chain = Core::in_memory(Network::Regtest)?;
         chain.seed_checkpoints(&[(0, mine_genesis(0))])?;
         assert_eq!(chain.store.read()?.network()?, Some(Network::Regtest));
 
         // Re-open the same store believing it is mainnet: the recorded network
         // wins over the caller's claim.
-        let Chain { store, .. } = chain;
-        let chain = Chain {
+        let Core { store, .. } = chain;
+        let chain = Core {
             store,
             network: Network::Bitcoin,
+            rsk_chain: rsk_config(Network::Bitcoin),
         };
         let header = mine_child(&canonical(&chain, 0), EASY_BITS, 1);
         let err = chain.connect_headers(&[header]).unwrap_err();
@@ -1170,7 +1185,7 @@ mod tests {
     /// there is nothing to compute.
     #[test]
     fn btc_tail_work_none_without_seed() -> eyre::Result<()> {
-        let chain = Chain::in_memory(Network::Regtest)?;
+        let chain = Core::in_memory(Network::Regtest)?;
         assert_eq!(chain.finalized_height()?, None);
         assert_eq!(chain.btc_tail_work(0)?, None);
         Ok(())
