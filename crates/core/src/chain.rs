@@ -34,7 +34,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::pow::Work;
 
 use crate::error::Error;
-use crate::store::{DIFFICULTY_PERIOD, Store, WriteTxn};
+use crate::store::{DIFFICULTY_PERIOD, ForkMeta, ReadTxn, Store, WriteTxn};
 use crate::validation;
 
 /// How far below the tip a period boundary must be before we consider it
@@ -53,13 +53,14 @@ pub struct ConnectOutcome {
     pub best_fork: Option<u64>,
     /// Canonical tip height after this batch.
     pub tip_height: u64,
-    /// The new finalized (pruned) height, if this batch advanced it. This is
-    /// the same value [`Chain::finalize_period`] would return: finalization is
-    /// applied automatically, inside the same transaction as the connect.
+    /// The new finalized (tail-start) height, if this batch advanced it:
+    /// finalization is applied automatically, inside the same transaction as
+    /// the connect.
     pub finalized: Option<u64>,
 }
 
-/// The canonical-chain engine: a thin, deterministic layer over [`Store`].
+/// The canonical-chain engine: a thin, deterministic layer over a redb-backed
+/// store.
 ///
 /// No concurrency, no network, no clock, no hidden I/O — the caller supplies
 /// headers and reads back outcomes.
@@ -78,6 +79,7 @@ impl Chain {
     }
 
     /// Open an in-memory chain store (tests, no disk I/O) for the given network.
+    #[cfg(test)]
     pub fn in_memory(network: Network) -> Result<Self, Error> {
         Ok(Self {
             store: Store::in_memory()?,
@@ -85,30 +87,29 @@ impl Chain {
         })
     }
 
-    /// The network this chain validates against.
-    pub fn network(&self) -> Network {
-        self.network
-    }
-
     /// Plant the trust anchor: the checkpoint spine, one header per difficulty
     /// period, accepted without validating its ancestors. This makes the whole
     /// chain's work computable and creates the root chain. The network is
-    /// recorded so a later connect with different parameters is refused.
+    /// recorded in the same transaction so a later connect with different
+    /// parameters is refused.
     pub fn seed_checkpoints(&self, entries: &[(u64, BitcoinHeader)]) -> Result<(), Error> {
-        self.store.seed_checkpoints(entries)?;
-        self.store.set_network(self.network)
+        let txn = self.store.write()?;
+        txn.seed_checkpoints(entries)?;
+        txn.set_network(self.network)?;
+        txn.commit()
     }
 
     /// The best (heaviest) chain id, if seeded.
     pub fn best_fork(&self) -> Result<Option<u64>, Error> {
-        self.store.best_fork()
+        self.store.read()?.best_fork()
     }
 
     /// The canonical tip height, if the chain has been seeded.
     pub fn tip_height(&self) -> Result<Option<u64>, Error> {
-        match self.store.best_fork()? {
+        let txn = self.store.read()?;
+        match txn.best_fork()? {
             None => Ok(None),
-            Some(f) => Ok(self.store.fork_tip(f)?.map(|(h, _)| h)),
+            Some(f) => Ok(txn.fork_tip(f)?.map(|(h, _)| h)),
         }
     }
 
@@ -116,23 +117,62 @@ impl Chain {
     /// chain selection compares across forks, observable from outside the
     /// crate (drivers print it; nothing in the logic depends on it).
     pub fn chainwork(&self) -> Result<Option<Work>, Error> {
-        match self.store.best_fork()? {
+        let txn = self.store.read()?;
+        match txn.best_fork()? {
             None => Ok(None),
-            Some(best) => self.store.fork_chainwork(best),
+            Some(best) => txn.fork_chainwork(best),
         }
     }
 
     /// Cumulative proof-of-work of the best chain at `height`.
     pub fn chainwork_at(&self, height: u64) -> Result<Option<Work>, Error> {
-        match self.store.best_fork()? {
+        let txn = self.store.read()?;
+        match txn.best_fork()? {
             None => Ok(None),
-            Some(best) => self.store.work_at(best, height),
+            Some(best) => txn.work_at(best, height),
         }
     }
 
-    /// The current finalized (pruned) height.
+    /// The current finalized (RSK-tail start) height.
     pub fn finalized_height(&self) -> Result<Option<u64>, Error> {
-        self.store.finalized_height()
+        self.store.read()?.finalized_height()
+    }
+
+    /// Largest work accumulated in any full 2016-block difficulty period ending
+    /// just below the finalized floor.
+    ///
+    /// Concretely: let the finalized boundary be `B`. We look at two consecutive
+    /// periods, both ending at `B`:
+    ///
+    /// - the immediate predecessor `[B - 2016, B)`,
+    /// - the one before that `[B - 4032, B - 2016)`.
+    ///
+    /// The returned value is the larger of the two — the threshold the finality
+    /// test had to clear for `B` to become final.
+    ///
+    /// Returns `None` when there is no finalized floor yet.
+    ///
+    /// Test-only: nothing outside the core reads it.
+    #[cfg(test)]
+    pub fn finalized_work(&self) -> Result<Option<Work>, Error> {
+        let txn = self.store.read()?;
+        let Some(finalized) = txn.finalized_height()? else {
+            return Ok(None);
+        };
+
+        // Compute work in a 2016-block window ending at `height`.
+        let z = Work::from_be_bytes([0; 32]);
+        let period_work = |height: u64| -> Work {
+            let start = height.saturating_sub(DIFFICULTY_PERIOD);
+            let end = txn.work_at(0, height).ok().flatten().unwrap_or(z);
+            let begin = txn.work_at(0, start).ok().flatten().unwrap_or(z);
+            z + end - begin
+        };
+
+        // The period immediately ending at the boundary, and the one before it.
+        let w1 = period_work(finalized);
+        let w2 = period_work(finalized.saturating_sub(DIFFICULTY_PERIOD));
+        Ok(Some(w1.max(w2)))
     }
 
     /// The period-boundary headers at or below the finalized floor, in height
@@ -143,13 +183,17 @@ impl Chain {
     /// treat as irreversible, e.g. to embed as a trust anchor. The tip's
     /// nearest boundary is deliberately **excluded**: it is not final yet.
     pub fn finalized_checkpoints(&self) -> Result<Vec<(u64, BitcoinHeader)>, Error> {
-        let Some(finalized) = self.finalized_height()? else {
+        let txn = self.store.read()?;
+        let Some(finalized) = txn.finalized_height()? else {
+            return Ok(Vec::new());
+        };
+        let Some(best) = txn.best_fork()? else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
         let mut height = 0u64;
         while height <= finalized {
-            if let Some(header) = self.header_at(height)? {
+            if let Some(header) = canonical_header(&txn, best, height)? {
                 out.push((height, header));
             }
             height += DIFFICULTY_PERIOD;
@@ -159,68 +203,32 @@ impl Chain {
 
     /// Height of a known block hash on the canonical chain, if it is canonical.
     pub fn height_of(&self, hash: &BlockHash) -> Result<Option<u64>, Error> {
-        let Some((fork, height)) = self.store.locate(hash)? else {
+        let txn = self.store.read()?;
+        let Some((fork, height)) = txn.locate(hash)? else {
             return Ok(None);
         };
-        Ok(self.is_canonical_at(fork, height)?.then_some(height))
+        Ok(is_canonical_at(&txn, fork, height)?.then_some(height))
     }
 
     /// The header at `height` on the canonical chain, if stored.
     pub fn header_at(&self, height: u64) -> Result<Option<BitcoinHeader>, Error> {
-        let Some(best) = self.store.best_fork()? else {
+        let txn = self.store.read()?;
+        let Some(best) = txn.best_fork()? else {
             return Ok(None);
         };
-        self.canonical_header(best, height)
+        canonical_header(&txn, best, height)
     }
 
     /// True if `hash` is the canonical block at `height`.
+    ///
+    /// Test-only: nothing outside the core reads it.
+    #[cfg(test)]
     pub fn is_canonical(&self, height: u64, hash: &BlockHash) -> Result<bool, Error> {
-        Ok(self
-            .header_at(height)?
-            .is_some_and(|h| h.block_hash() == *hash))
-    }
-
-    /// Whether a stored `(fork, height)` block lies on the canonical chain.
-    fn is_canonical_at(&self, fork: u64, height: u64) -> Result<bool, Error> {
-        let Some(best) = self.store.best_fork()? else {
+        let txn = self.store.read()?;
+        let Some(best) = txn.best_fork()? else {
             return Ok(false);
         };
-        if fork == best {
-            return Ok(true);
-        }
-        // Walk the fork's ancestry: a block is canonical if it is at or below
-        // the best chain's forkpoint and on the best chain's ancestors.
-        let mut f = best;
-        loop {
-            let Some(meta) = self.store.fork_meta(f)? else {
-                return Ok(false);
-            };
-            if fork == f {
-                return Ok(height >= meta.forkpoint);
-            }
-            let Some(parent) = meta.parent else {
-                return Ok(false);
-            };
-            f = parent;
-        }
-    }
-
-    /// The header at `height` on chain `fork` (falling back to its ancestors
-    /// below the forkpoint, and to the spine on the root chain).
-    fn canonical_header(&self, fork: u64, height: u64) -> Result<Option<BitcoinHeader>, Error> {
-        let mut f = fork;
-        loop {
-            let Some(meta) = self.store.fork_meta(f)? else {
-                return Ok(None);
-            };
-            if height >= meta.forkpoint {
-                return self.store.header_at(f, height);
-            }
-            let Some(parent) = meta.parent else {
-                return Ok(None);
-            };
-            f = parent;
-        }
+        Ok(canonical_header(&txn, best, height)?.is_some_and(|h| h.block_hash() == *hash))
     }
 
     /// Validate and store a contiguous ascending run of headers, attaching them
@@ -242,19 +250,31 @@ impl Chain {
     /// different network than this [`Chain`] validates against.
     ///
     /// The whole operation — reads, validation, writes and the automatic
-    /// finalization below — runs inside one [`WriteTxn`], so nothing can change
+    /// finalization below — runs inside one write transaction, so nothing can change
     /// the store between the reads a decision is based on and the writes that
     /// act on it.
     pub fn connect_headers(&self, headers: &[BitcoinHeader]) -> Result<ConnectOutcome, Error> {
+        // One transaction for the entire read → validate → write → finalize
+        // sequence. Dropping it without committing (the early returns) aborts.
+        let txn = self.store.write()?;
+
+        // The store records the network it was seeded for; refuse to validate
+        // real headers against the wrong consensus parameters.
+        if let Some(seeded) = txn.network()?
+            && seeded != self.network
+        {
+            return Err(Error::NetworkMismatch {
+                seeded,
+                opened: self.network,
+            });
+        }
+
+        let prev_best = txn.best_fork()?;
+
+        // Nothing to connect: report the current tip (the transaction aborts).
         if headers.is_empty() {
-            let prev_best = self.store.best_fork()?;
             let tip = match prev_best {
-                Some(f) => {
-                    self.store
-                        .fork_tip(f)?
-                        .unwrap_or((0, BlockHash::all_zeros()))
-                        .0
-                }
+                Some(f) => txn.fork_tip(f)?.unwrap_or((0, BlockHash::all_zeros())).0,
                 None => 0,
             };
             return Ok(ConnectOutcome {
@@ -265,22 +285,6 @@ impl Chain {
                 finalized: None,
             });
         }
-
-        // The store records the network it was seeded for; refuse to validate
-        // real headers against the wrong consensus parameters.
-        if let Some(seeded) = self.store.network()?
-            && seeded != self.network
-        {
-            return Err(Error::NetworkMismatch {
-                seeded,
-                opened: self.network,
-            });
-        }
-
-        // One transaction for the entire read → validate → write → finalize
-        // sequence. Dropping it without committing (the early returns) aborts.
-        let txn = self.store.write()?;
-        let prev_best = txn.best_fork()?;
 
         // Skip a leading prefix that is already stored anywhere (reconnects).
         let mut start = 0usize;
@@ -347,7 +351,7 @@ impl Chain {
             {
                 return Ok(Some(*header));
             }
-            chain_header(&txn, target_fork, height)
+            canonical_header(&txn, target_fork, height)
         };
 
         let mut prev = parent;
@@ -447,6 +451,9 @@ impl Chain {
     }
 
     /// Connect a single header (Electrum's near-tip `save_header` path).
+    ///
+    /// Test-only: the sync callers use [`Chain::connect_headers`] directly.
+    #[cfg(test)]
     pub fn connect_header(&self, header: &BitcoinHeader) -> Result<ConnectOutcome, Error> {
         self.connect_headers(std::slice::from_ref(header))
     }
@@ -460,8 +467,7 @@ impl Chain {
     ///
     /// This runs automatically at the end of every [`Chain::connect_headers`]
     /// batch (reported in [`ConnectOutcome::finalized`]); you do not normally
-    /// need to call it. It is kept public for callers that want to finalize
-    /// without connecting anything.
+    /// need to call it.
     ///
     /// Only finalizes if the work built on top of the boundary (boundary to tip)
     /// is at least the work of the full period before it. This prevents
@@ -472,8 +478,11 @@ impl Chain {
     /// Cumulative work is known at every period boundary (the spine), so both
     /// sides are plain differences of stored cumulative work.
     ///
-    /// Pruning assumes the root chain is canonical, so nothing is finalized
-    /// while a fork is the best chain.
+    /// Nothing is finalized while a fork is the best chain, since the spine
+    /// (fork 0) is assumed canonical.
+    ///
+    /// Test-only: production finalization rides inside [`Chain::connect_headers`].
+    #[cfg(test)]
     pub fn finalize_period(&self) -> Result<Option<u64>, Error> {
         let txn = self.store.write()?;
         match finalize_in_txn(&txn)? {
@@ -487,8 +496,7 @@ impl Chain {
     }
 }
 
-/// The finalization rule, applied through an open transaction. See
-/// [`Chain::finalize_period`] for what it means; factored out so
+/// The finalization rule, applied through an open transaction. Factored out so
 /// `connect_headers` can run it inside the same transaction as the connect.
 fn finalize_in_txn(txn: &WriteTxn) -> Result<Option<u64>, Error> {
     if txn.best_fork()? != Some(0) {
@@ -528,12 +536,49 @@ fn finalize_in_txn(txn: &WriteTxn) -> Result<Option<u64>, Error> {
     Ok(Some(boundary))
 }
 
-// ── validation helpers ──────────────────────────────────────────────────────
+// ── chain reads through either transaction ──────────────────────────────────
 
-/// The header at `height` on `fork`, walking to ancestor forks below the
-/// forkpoint. Mirrors [`Chain::canonical_header`], but reads through an open
-/// [`WriteTxn`] so validation and the writes it feeds stay atomic.
-fn chain_header(txn: &WriteTxn, fork: u64, height: u64) -> Result<Option<BitcoinHeader>, Error> {
+/// The read operations the ancestor walk needs, so one implementation serves
+/// both the read-only ([`ReadTxn`]) and the atomic read-modify-write
+/// ([`WriteTxn`]) callers.
+trait HeaderSource {
+    fn fork_meta(&self, fork_id: u64) -> Result<Option<ForkMeta>, Error>;
+    fn header_at(&self, fork_id: u64, height: u64) -> Result<Option<BitcoinHeader>, Error>;
+    fn best_fork(&self) -> Result<Option<u64>, Error>;
+}
+
+impl HeaderSource for ReadTxn {
+    fn fork_meta(&self, fork_id: u64) -> Result<Option<ForkMeta>, Error> {
+        ReadTxn::fork_meta(self, fork_id)
+    }
+    fn header_at(&self, fork_id: u64, height: u64) -> Result<Option<BitcoinHeader>, Error> {
+        ReadTxn::header_at(self, fork_id, height)
+    }
+    fn best_fork(&self) -> Result<Option<u64>, Error> {
+        ReadTxn::best_fork(self)
+    }
+}
+
+impl HeaderSource for WriteTxn {
+    fn fork_meta(&self, fork_id: u64) -> Result<Option<ForkMeta>, Error> {
+        WriteTxn::fork_meta(self, fork_id)
+    }
+    fn header_at(&self, fork_id: u64, height: u64) -> Result<Option<BitcoinHeader>, Error> {
+        WriteTxn::header_at(self, fork_id, height)
+    }
+    fn best_fork(&self) -> Result<Option<u64>, Error> {
+        WriteTxn::best_fork(self)
+    }
+}
+
+/// The header at `height` on chain `fork` (falling back to its ancestors below
+/// the forkpoint, and to the spine on the root chain). Generic over the
+/// transaction, so the read path and the atomic connect path share one walk.
+fn canonical_header(
+    txn: &impl HeaderSource,
+    fork: u64,
+    height: u64,
+) -> Result<Option<BitcoinHeader>, Error> {
     let mut f = fork;
     loop {
         let Some(meta) = txn.fork_meta(f)? else {
@@ -548,6 +593,33 @@ fn chain_header(txn: &WriteTxn, fork: u64, height: u64) -> Result<Option<Bitcoin
         f = parent;
     }
 }
+
+/// Whether a stored `(fork, height)` block lies on the canonical chain.
+fn is_canonical_at(txn: &impl HeaderSource, fork: u64, height: u64) -> Result<bool, Error> {
+    let Some(best) = txn.best_fork()? else {
+        return Ok(false);
+    };
+    if fork == best {
+        return Ok(true);
+    }
+    // Walk the fork's ancestry: a block is canonical if it is at or below the
+    // best chain's forkpoint and on the best chain's ancestors.
+    let mut f = best;
+    loop {
+        let Some(meta) = txn.fork_meta(f)? else {
+            return Ok(false);
+        };
+        if fork == f {
+            return Ok(height >= meta.forkpoint);
+        }
+        let Some(parent) = meta.parent else {
+            return Ok(false);
+        };
+        f = parent;
+    }
+}
+
+// ── validation helpers ──────────────────────────────────────────────────────
 
 /// The median-time-past the header at `height` must exceed: the median of the
 /// previous [`validation::MEDIAN_TIME_PAST`] timestamps. Returns `None` when
@@ -778,8 +850,8 @@ mod tests {
         assert_eq!(out.best_fork, Some(0), "best chain must stay the root");
 
         // The fork survives in the tree and its headers are locatable.
-        assert_eq!(chain.store.fork_count()?, 2);
-        let (f, h) = chain.store.locate(&fork[0].block_hash())?.unwrap();
+        assert_eq!(chain.store.read()?.fork_count()?, 2);
+        let (f, h) = chain.store.read()?.locate(&fork[0].block_hash())?.unwrap();
         assert_eq!(h, 4);
         assert_ne!(f, 0);
         // The fork's blocks are not canonical.
@@ -795,7 +867,7 @@ mod tests {
         let chain = seeded();
         let main = easy_chain(&canonical(&chain, 0), 5, 1);
         chain.connect_headers(&main)?;
-        assert_eq!(chain.store.fork_count()?, 1);
+        assert_eq!(chain.store.read()?.fork_count()?, 1);
 
         // Fork from height 3 (parent = main[2], not the tip), second header
         // with bad PoW (a much harder target than it was mined for).
@@ -805,8 +877,8 @@ mod tests {
         assert!(matches!(err, Error::BadPow { .. }), "got {err:?}");
 
         // No orphan fork, and no header of the batch was committed.
-        assert_eq!(chain.store.fork_count()?, 1, "no orphan fork");
-        assert!(chain.store.locate(&fork[0].block_hash())?.is_none());
+        assert_eq!(chain.store.read()?.fork_count()?, 1, "no orphan fork");
+        assert!(chain.store.read()?.locate(&fork[0].block_hash())?.is_none());
         Ok(())
     }
 
@@ -839,8 +911,10 @@ mod tests {
         let main = easy_chain(&canonical(&chain, 0), 6, 1);
         chain.connect_headers(&main)?;
 
-        // Advance the floor to height 1 (via store pruning path).
-        chain.store.prune_below(1)?;
+        // Advance the finalized floor to height 1, as finalization would.
+        let txn = chain.store.write()?;
+        txn.set_finalized(1)?;
+        txn.commit()?;
         assert_eq!(chain.finalized_height()?, Some(1));
 
         // A fork starting at height 1 (forkpoint 1 <= finalized 1) is refused.
@@ -876,8 +950,9 @@ mod tests {
         let best = chain.best_fork()?.unwrap();
         assert_ne!(best, 0, "fork wins once it becomes heavier");
         // The two batches landed on the same fork.
-        let (f1, _) = chain.store.locate(&fork_part1[0].block_hash())?.unwrap();
-        let (f2, _) = chain.store.locate(&fork_part2[3].block_hash())?.unwrap();
+        let txn = chain.store.read()?;
+        let (f1, _) = txn.locate(&fork_part1[0].block_hash())?.unwrap();
+        let (f2, _) = txn.locate(&fork_part2[3].block_hash())?.unwrap();
         assert_eq!(f1, f2);
         assert!(chain.is_canonical(8, &fork_part2[3].block_hash())?);
         Ok(())
@@ -965,7 +1040,7 @@ mod tests {
         assert!(chain.header_at(0)?.is_some());
         let genesis_hash = canonical_hash(&chain, 0);
         assert_eq!(chain.height_of(&genesis_hash)?, Some(0));
-        assert!(chain.store.work_at(0, 0)?.is_some());
+        assert!(chain.store.read()?.work_at(0, 0)?.is_some());
 
         Ok(())
     }
@@ -985,7 +1060,7 @@ mod tests {
             .seed_checkpoints(&[(0, g0), (DIFFICULTY_PERIOD, g2016)])
             .unwrap();
 
-        assert_eq!(chain.store.work_at(0, 0).unwrap(), Some(w));
+        assert_eq!(chain.store.read()?.work_at(0, 0).unwrap(), Some(w));
         let expected = {
             let mut acc = w; // block 0
             for _ in 1..DIFFICULTY_PERIOD {
@@ -994,7 +1069,7 @@ mod tests {
             acc + header_work(&g2016) // this boundary block
         };
         assert_eq!(
-            chain.store.work_at(0, DIFFICULTY_PERIOD).unwrap(),
+            chain.store.read()?.work_at(0, DIFFICULTY_PERIOD).unwrap(),
             Some(expected)
         );
         Ok(())
@@ -1117,7 +1192,7 @@ mod tests {
     fn connecting_with_the_wrong_network_is_refused() -> eyre::Result<()> {
         let chain = Chain::in_memory(Network::Regtest)?;
         chain.seed_checkpoints(&[(0, mine_genesis(0))])?;
-        assert_eq!(chain.store.network()?, Some(Network::Regtest));
+        assert_eq!(chain.store.read()?.network()?, Some(Network::Regtest));
 
         // Re-open the same store believing it is mainnet: the recorded network
         // wins over the caller's claim.
@@ -1138,6 +1213,99 @@ mod tests {
             ),
             "got {err:?}"
         );
+        Ok(())
+    }
+
+    // ── finalized_work tests ────────────────────────────────────────────────
+
+    /// Returns None when there is no finalized floor yet (not even seeded).
+    #[test]
+    fn finalized_work_none_without_seed() -> eyre::Result<()> {
+        let chain = Chain::in_memory(Network::Regtest)?;
+        assert_eq!(chain.finalized_work()?, None);
+        Ok(())
+    }
+
+    /// Genesis alone carries the easy-target work (~2). After connecting a small
+    /// tail no boundary advances, so final height stays at 0. In `finalized_work`,
+    /// the two candidate 2016-block windows both end at 0:
+    ///   P1: [0..2016) → genesis at height 0 (blocks 1..2016 don't exist)
+    ///   P0: [-2016..0) → empty (saturates) → zero
+    /// Since genesis at 0 is inside P1, its cumulative work shows up in P1 but
+    /// also in P0's subtraction term — they cancel. Result is 0.
+    #[test]
+    fn finalized_work_zero_with_only_genesis() -> eyre::Result<()> {
+        let chain = seeded();
+        assert_eq!(chain.finalized_height()?.unwrap(), 0);
+
+        // Verify no boundary would advance with a small tail.
+        let run = easy_chain(&canonical(&chain, 0), 100, 1);
+        chain.connect_headers(&run)?;
+        assert_eq!(chain.finalized_height()?.unwrap(), 0, "100 blocks < margin, no advance");
+
+        // Finalized work = max(window_work[0], window_work[-2016]).
+        // Both windows collapse to 0 because genesis is at exactly boundary 0.
+        let threshold = chain.finalized_work()?.expect("has finalized work");
+        assert_eq!(threshold, Work::from_be_bytes([0; 32]));
+        Ok(())
+    }
+
+    /// After two full periods + 100 blocks, the finalized boundary is 2016.
+    /// The two candidate 2016-period windows ending at 2016 are:
+    ///   P1: blocks 0..2016 (genesis + 2015 regular blocks)
+    ///   P0: blocks -2016..0 (empty/saturated → zero)
+    /// Both are at the same easy target, so P1 must equal the cumulative work
+    /// in that window — verified via chainwork_at.
+    #[test]
+    fn finalized_work_matches_cumulative_period() -> eyre::Result<()> {
+        let chain = seeded();
+        let parent = canonical(&chain, 0);
+        let n = 2 * DIFFICULTY_PERIOD as usize + 100;
+        let run = mine_chain_from(&parent, n, EASY_BITS, 1);
+        chain.connect_headers(&run)?;
+
+        assert_eq!(chain.finalized_height()?.unwrap(), DIFFICULTY_PERIOD);
+        let threshold = chain.finalized_work()?.expect("has finalized work");
+
+        // Cumulative work at boundary 2016 minus genesis (at height 0) gives
+        // all work accumulated from block 1 through 2016.
+        let work_up_to_boundary = chain.chainwork_at(DIFFICULTY_PERIOD)?.unwrap();
+        let genesis_work = chain.chainwork_at(0)?.unwrap();
+        let expected_period = work_up_to_boundary - genesis_work;
+        assert_eq!(threshold, expected_period);
+        assert!(threshold > genesis_work);
+        Ok(())
+    }
+
+    /// A difficulty drop at the checkpoint boundary means the 2016 blocks
+    /// leading into the previous boundary carry more work than if they'd been
+    /// at the lower difficulty. `finalized_work` returns the larger of the two
+    /// candidate periods — here the one immediately below the boundary wins.
+    #[test]
+    fn finalized_work_picks_larger_period() -> eyre::Result<()> {
+        let chain = seeded();
+        let period = DIFFICULTY_PERIOD as usize;
+
+        // Genesis has easy-target work. Period blocks use work 22.
+        let run1 = mine_chain_from(&canonical(&chain, 0), period, WORK22_BITS, 1);
+        chain.connect_headers(&run1)?;
+
+        // Tail after boundary: work per block = work 20. Enough blocks to cross
+        // the finality threshold and advance the boundary to 2016.
+        let tail_needed = (period * 22).div_ceil(20);
+        let tail = mine_chain_from(&canonical(&chain, period as u64), tail_needed, WORK20_BITS, 1);
+        chain.connect_headers(&tail)?;
+
+        assert_eq!(chain.finalized_height()?.unwrap(), DIFFICULTY_PERIOD);
+
+        // Two candidates ending at boundary 2016:
+        //   P1 = [0..2016) → genesis + 2015 blocks at work 22
+        //   P0 = [-2016..0) → empty (saturates) → zero
+        let threshold = chain.finalized_work()?.expect("has finalized work");
+        let p1 = chain.chainwork_at(DIFFICULTY_PERIOD)?.unwrap()
+            - chain.chainwork_at(0)?.unwrap();
+        assert_eq!(threshold, p1);
+        assert!(p1 > Work::from_be_bytes([0; 32]));
         Ok(())
     }
 }

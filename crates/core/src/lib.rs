@@ -7,18 +7,19 @@
 //! ## What "side-effect free" means here
 //!
 //! This crate has no concurrency, no network, no clock and no hidden I/O. The
-//! only state is a redb-backed [`store::Store`]; all logic is synchronous and
-//! driven entirely by the caller:
+//! only state is a redb-backed store; all logic is synchronous and driven
+//! entirely by the caller:
 //!
 //! ```text
 //! seed_checkpoints  →  connect_headers  (finalizes automatically; repeat)
 //! ```
 //!
 //! Every read-modify-write — connecting headers, selecting the best chain and
-//! advancing the finality floor — happens inside a single redb transaction
-//! ([`store::WriteTxn`]), so the store cannot change under a decision. A
-//! [`Chain::finalize_period`] method remains for callers that want to finalize
-//! without connecting anything, but it is not part of the normal flow.
+//! advancing the finality floor — happens inside a single redb write
+//! transaction, so the store cannot change under a decision. All store access
+//! goes through a transaction: read-only methods open a consistent snapshot and
+//! mutating methods open the single writer, at the start of every [`Chain`]
+//! method.
 //!
 //! Tests construct the store over redb's **in-memory backend**, so the exact
 //! production code path runs with zero disk access and a fully deterministic
@@ -38,8 +39,9 @@
 //!   rejected) and can win later if it becomes heavier. This is Electrum's
 //!   `BlockchainManager` model.
 //! - Once a difficulty period is a full period below the tip, its boundary is
-//!   finalized and everything at or below it is pruned — forks cannot cross the
-//!   finalized point (like Electrum's hardcoded max checkpoint).
+//!   finalized as the store's **tail start**, and forks cannot cross it (like
+//!   Electrum's hardcoded max checkpoint). The Bitcoin headers themselves are
+//!   retained until Rootstock reaches FINAL, when they can be pruned.
 //!
 //! The same tree will later carry Rootstock headers and reorg them with the
 //! same machinery. See `CONTRIBUTING.md` (repo root) for the working plan.
@@ -55,10 +57,10 @@
 pub mod chain;
 pub mod checkpoints;
 pub mod error;
-pub mod store;
+mod store;
 pub mod validation;
 
 pub use chain::{Chain, ConnectOutcome, FINALITY_MARGIN_BLOCKS, header_work};
 pub use error::Error;
-pub use store::{DIFFICULTY_PERIOD, ForkMeta, Store};
+pub use store::DIFFICULTY_PERIOD;
 pub use validation::MEDIAN_TIME_PAST;
