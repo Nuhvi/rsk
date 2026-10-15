@@ -1,14 +1,14 @@
 //! The Rootstock header tree.
 //!
-//! Each trusted root `F` (supplied by the p2p layer) roots a **forest**:
+//! Each proposed checkpoint block (found by the p2p layer) roots a **forest**:
 //! headers are stored keyed by hash and each block links to its parent. Work
 //! follows rskj's rule — a block's own contribution is `difficulty + Σ(included
 //! uncle difficulty)` — and the tree is weighted by **GHOST**: a block's weight
 //! is the sum over its whole subtree, so side branches count, not just the one
-//! chain. `W_rsk(F) = rsk_subtree_work(F)`; the finality test compares it to
-//! `2/3` of the Bitcoin tail's work (see [`crate::rsk::finality`]).
+//! chain. A tree is trusted once its work exceeds `2/3` of the Bitcoin tail's
+//! work (see [`crate::rsk::checkpoint`]).
 
-pub mod finality;
+pub mod checkpoint;
 
 use std::collections::HashSet;
 
@@ -58,14 +58,55 @@ pub struct RskUncle {
 pub struct RskConnectOutcome {
     /// Headers newly stored.
     pub connected: usize,
+    /// The checkpoint this batch established, if any: a proposed checkpoint
+    /// whose tree first cleared the trust threshold.
+    pub checkpoint: Option<EphemeralChainCheckpoint>,
+}
+
+/// A trusted place to start syncing from: a proposed checkpoint block whose
+/// tree carries more than `2/3` of the Bitcoin tail's work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EphemeralChainCheckpoint {
+    /// The Rootstock block hash of the checkpoint.
+    pub hash: B256,
+    /// Its Rootstock block number.
+    pub number: u64,
+    /// The GHOST work of its tree.
+    pub work: U256,
+    /// The Bitcoin tail work it was measured against.
+    pub btc_tail_work: U256,
+    /// The Bitcoin tail start the measurement used.
+    pub tail_start: u64,
 }
 
 // ── the tree on `Core` ──────────────────────────────────────────────────────
 
 impl Core {
-    /// Store a trusted root `F` and mark it a root of the forest. `F` is taken
-    /// on faith (its anchor proved by the p2p layer); it is not validated.
-    pub fn seed_rsk_root(&self, entry: &RskEntry) -> Result<B256, Error> {
+    /// Propose a checkpoint block and mark it a root of the forest.
+    ///
+    /// The p2p layer only *finds* the candidate; the core checks it here: the
+    /// header's merge-mining anchor must be a canonical Bitcoin block inside the
+    /// trust tail (see [`checkpoint::in_tail`]). A candidate that fails is
+    /// refused, so a tree is only ever rooted at a block tied to Bitcoin.
+    pub fn propose_checkpoint(&self, entry: &RskEntry) -> Result<B256, Error> {
+        let Some(btc_tip) = self.tip_height()? else {
+            return Err(Error::Unseeded);
+        };
+        let btc_tail_start = self.finalized_height()?.unwrap_or(0);
+        let anchor = checkpoint::anchor_height(self, &entry.header)?.ok_or_else(|| {
+            Error::Rootstock(format!(
+                "checkpoint #{}: anchor is not a canonical bitcoin block",
+                entry.header.number
+            ))
+        })?;
+        if !checkpoint::in_tail(anchor, btc_tail_start, btc_tip) {
+            return Err(Error::Rootstock(format!(
+                "checkpoint #{}: anchor {anchor} is not in the bitcoin tail \
+                 [{btc_tail_start}, {btc_tip} - {}]",
+                entry.header.number,
+                checkpoint::ANCHOR_DEPTH
+            )));
+        }
         let txn = self.store.write()?;
         let hash = store_entry(&txn, entry)?;
         txn.rsk_put_root(hash.as_slice())?;
@@ -81,7 +122,12 @@ impl Core {
     /// `ommers_hash` commitment on the uncle list, and the full uncle rule
     /// (generation window, no reuse, and the uncle's parent must be one of the
     /// including block's ancestors) against a store-backed [`AncestorSource`].
+    ///
+    /// Batches are incremental — feed them as they arrive, ascending, each
+    /// parent already stored. After storing, the call attempts to establish a
+    /// checkpoint and reports it in [`RskConnectOutcome::checkpoint`].
     pub fn connect_rsk_headers(&self, entries: &[RskEntry]) -> Result<RskConnectOutcome, Error> {
+        let tail = self.checkpoint_tail()?;
         let txn = self.store.write()?;
         let verifier = HeaderVerifier::default_rsk(self.rsk_chain.clone());
         let mut connected = 0usize;
@@ -90,19 +136,42 @@ impl Core {
             store_entry(&txn, entry)?;
             connected += 1;
         }
+        let checkpoint = match tail {
+            Some((tail_start, btc_tail_work)) => {
+                attempt_checkpoint(&txn, tail_start, btc_tail_work)?
+            }
+            None => None,
+        };
         txn.commit()?;
-        Ok(RskConnectOutcome { connected })
+        Ok(RskConnectOutcome {
+            connected,
+            checkpoint,
+        })
     }
 
-    /// GHOST weight of the subtree rooted at `root`: `Σ own_work` over `root`
-    /// and every descendant. This is `W_rsk(F)`.
+    /// The Bitcoin tail a checkpoint is measured against: `(tail_start, its
+    /// work)`, or `None` while no tail work is stored yet.
+    fn checkpoint_tail(&self) -> Result<Option<(u64, U256)>, Error> {
+        let Some(tail_start) = self.finalized_height()? else {
+            return Ok(None);
+        };
+        let Some(work) = self.btc_tail_work(tail_start)? else {
+            return Ok(None);
+        };
+        Ok(Some((tail_start, U256::from_be_slice(&work.to_be_bytes()))))
+    }
+
+    /// GHOST weight of the subtree rooted at `root`: `Σ cumulative_difficulty`
+    /// over `root` and every descendant.
+    #[cfg(test)]
     pub fn rsk_subtree_work(&self, root: &B256) -> Result<U256, Error> {
         let txn = self.store.read()?;
         subtree_work(&txn, root.as_slice())
     }
 
     /// The root with the heaviest subtree, if any.
-    pub fn rsk_best_root(&self) -> Result<Option<(B256, U256)>, Error> {
+    #[cfg(test)]
+    pub fn rsk_best_checkpoint(&self) -> Result<Option<(B256, U256)>, Error> {
         let txn = self.store.read()?;
         let mut best: Option<(B256, U256)> = None;
         for root in txn.rsk_roots()? {
@@ -113,20 +182,6 @@ impl Core {
         }
         Ok(best)
     }
-
-    /// The header stored under `hash`, if any.
-    pub fn rsk_header(&self, hash: &B256) -> Result<Option<Header>, Error> {
-        Ok(self
-            .store
-            .read()?
-            .rsk_raw_header(hash.as_slice())?
-            .and_then(|raw| decode_header(&raw)))
-    }
-
-    /// Whether `hash` is a stored RSK block.
-    pub fn rsk_has_block(&self, hash: &B256) -> Result<bool, Error> {
-        self.store.read()?.rsk_has_block(hash.as_slice())
-    }
 }
 
 /// Store a header, its uncle list, and the child edge to its parent.
@@ -136,7 +191,7 @@ fn store_entry(txn: &WriteTxn, entry: &RskEntry) -> Result<B256, Error> {
     let block = RskBlock {
         number: header.number,
         parent: header.parent_hash.0,
-        own_work: own_work(header, &entry.uncles),
+        cumulative_difficulty: cumulative_difficulty(header, &entry.uncles),
     };
     txn.rsk_put_block(hash.as_slice(), &entry.raw, block)?;
     let uncle_raws: Vec<Vec<u8>> = entry.uncles.iter().map(|u| u.raw.clone()).collect();
@@ -148,7 +203,7 @@ fn store_entry(txn: &WriteTxn, entry: &RskEntry) -> Result<B256, Error> {
 }
 
 /// rskj's per-block contribution: `difficulty + Σ(included uncle difficulty)`.
-fn own_work(header: &Header, uncles: &[RskUncle]) -> U256 {
+fn cumulative_difficulty(header: &Header, uncles: &[RskUncle]) -> U256 {
     let mut work = header.difficulty;
     for uncle in uncles {
         work = work.saturating_add(uncle.header.difficulty);
@@ -156,8 +211,35 @@ fn own_work(header: &Header, uncles: &[RskUncle]) -> U256 {
     work
 }
 
-/// Sum `own_work` over `root`'s whole subtree (GHOST).
-fn subtree_work(txn: &ReadTxn, root: &[u8]) -> Result<U256, Error> {
+/// The two RSK reads the GHOST walk needs, so it can run over either a read
+/// snapshot or the writer.
+trait SubtreeReads {
+    fn block_at(&self, hash: &[u8]) -> Result<Option<RskBlock>, Error>;
+    fn children_of(&self, hash: &[u8]) -> Result<Vec<[u8; 32]>, Error>;
+}
+
+impl SubtreeReads for ReadTxn {
+    fn block_at(&self, hash: &[u8]) -> Result<Option<RskBlock>, Error> {
+        self.rsk_block(hash)
+    }
+
+    fn children_of(&self, hash: &[u8]) -> Result<Vec<[u8; 32]>, Error> {
+        self.rsk_children(hash)
+    }
+}
+
+impl SubtreeReads for WriteTxn {
+    fn block_at(&self, hash: &[u8]) -> Result<Option<RskBlock>, Error> {
+        self.rsk_block(hash)
+    }
+
+    fn children_of(&self, hash: &[u8]) -> Result<Vec<[u8; 32]>, Error> {
+        self.rsk_children(hash)
+    }
+}
+
+/// Sum `cumulative_difficulty` over `root`'s whole subtree (GHOST).
+fn subtree_work(txn: &impl SubtreeReads, root: &[u8]) -> Result<U256, Error> {
     let mut total = U256::ZERO;
     let mut stack: Vec<Vec<u8>> = vec![root.to_vec()];
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
@@ -165,14 +247,44 @@ fn subtree_work(txn: &ReadTxn, root: &[u8]) -> Result<U256, Error> {
         if !seen.insert(hash.clone()) {
             continue;
         }
-        if let Some(block) = txn.rsk_block(&hash)? {
-            total = total.saturating_add(block.own_work);
+        if let Some(block) = txn.block_at(&hash)? {
+            total = total.saturating_add(block.cumulative_difficulty);
         }
-        for child in txn.rsk_children(&hash)? {
+        for child in txn.children_of(&hash)? {
             stack.push(child.to_vec());
         }
     }
     Ok(total)
+}
+
+/// The checkpoint attempt: among the proposed roots, the heaviest whose tree
+/// clears `2/3` of the Bitcoin tail's work. `None` if none does.
+fn attempt_checkpoint(
+    txn: &WriteTxn,
+    tail_start: u64,
+    btc_tail_work: U256,
+) -> Result<Option<EphemeralChainCheckpoint>, Error> {
+    let mut best: Option<EphemeralChainCheckpoint> = None;
+    for root in txn.rsk_roots()? {
+        let work = subtree_work(txn, &root)?;
+        if !checkpoint::clears_threshold(work, btc_tail_work) {
+            continue;
+        }
+        let Some(block) = txn.rsk_block(&root)? else {
+            continue;
+        };
+        let candidate = EphemeralChainCheckpoint {
+            hash: B256::from(root),
+            number: block.number,
+            work,
+            btc_tail_work,
+            tail_start,
+        };
+        if best.is_none_or(|b| candidate.work > b.work) {
+            best = Some(candidate);
+        }
+    }
+    Ok(best)
 }
 
 /// Validate one entry: commitment, header rules against its parent, and the
@@ -281,6 +393,9 @@ mod tests {
     use super::*;
     use alloy_rlp::Encodable;
     use bitcoin::Network;
+    use bitcoin::block::BlockHash;
+    use bitcoin::block::Header as BitcoinHeader;
+    use bitcoin::hashes::Hash;
     use rsk_consensus::config::ChainConfig;
     use rsk_consensus::types::header::Header as RskHeader;
     use std::sync::Arc;
@@ -340,6 +455,75 @@ mod tests {
         hash
     }
 
+    /// The easiest valid Bitcoin target (regtest's proof-of-work limit).
+    const EASY_BITS: u32 = 0x207f_ffff;
+
+    /// Mine a Bitcoin header on top of `prev` at `time`.
+    fn mine(prev: BlockHash, time: u32) -> BitcoinHeader {
+        use bitcoin::block::Version;
+        use bitcoin::pow::CompactTarget;
+        let target = CompactTarget::from_consensus(EASY_BITS);
+        let mut nonce = 0u32;
+        loop {
+            let header = BitcoinHeader {
+                version: Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: Hash::all_zeros(),
+                time,
+                bits: target,
+                nonce,
+            };
+            if header.validate_pow(header.target()).is_ok() {
+                return header;
+            }
+            nonce += 1;
+        }
+    }
+
+    /// A regtest chain with a usable Bitcoin tail: the spine at 0 and 2016, then
+    /// easy headers up to 4032, so `btc_tail_work(2016) = work[2016..4032)`.
+    fn btc_with_tail() -> Core {
+        let core = Core::in_memory(Network::Regtest).unwrap();
+        let g0 = mine(BlockHash::all_zeros(), 1_600_000_000);
+        let g2016 = mine(g0.block_hash(), 1_600_000_001);
+        core.seed_checkpoints(&[(0, g0), (2016, g2016)]).unwrap();
+
+        let mut cur = g2016;
+        let mut run = Vec::new();
+        for i in 0..2016u32 {
+            cur = mine(cur.block_hash(), 1_600_000_002 + i);
+            run.push(cur);
+        }
+        core.connect_headers(&run).unwrap();
+        core
+    }
+
+    /// An entry whose merge-mining header points at the Bitcoin block `anchor`.
+    fn anchored(number: u64, anchor: BlockHash, difficulty: u64) -> RskEntry {
+        use bitcoin::block::Version;
+        use bitcoin::consensus::Encodable as _;
+        use bitcoin::pow::CompactTarget;
+        let solution = BitcoinHeader {
+            version: Version::ONE,
+            prev_blockhash: anchor,
+            merkle_root: Hash::all_zeros(),
+            time: 1_600_000_000,
+            bits: CompactTarget::from_consensus(EASY_BITS),
+            nonce: 0,
+        };
+        let mut mm = Vec::new();
+        solution.consensus_encode(&mut mm).unwrap();
+        let mut header = header(number, B256::ZERO, difficulty, 0);
+        header.bitcoin_merged_mining_header = Some(mm.into());
+        let mut raw = Vec::new();
+        header.encode(&mut raw);
+        RskEntry {
+            header,
+            raw,
+            uncles: Vec::new(),
+        }
+    }
+
     #[test]
     fn ghost_weight_counts_side_branches() {
         let core = core();
@@ -378,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn roots_are_ranked_by_subtree_work() {
+    fn checkpoints_are_ranked_by_subtree_work() {
         let core = core();
         let small = put(&core, &entry(0, B256::ZERO, 10, 0));
         let big = put(&core, &entry(100, B256::ZERO, 1000, 0));
@@ -389,7 +573,7 @@ mod tests {
             txn.commit().unwrap();
         }
 
-        let (best, work) = core.rsk_best_root().unwrap().unwrap();
+        let (best, work) = core.rsk_best_checkpoint().unwrap().unwrap();
         assert_eq!(best, big);
         assert_eq!(work, U256::from(1000));
     }
@@ -403,6 +587,78 @@ mod tests {
         let mut bad = entry(1, f, 10, 0);
         bad.header.uncle_count = 1;
         let err = core.connect_rsk_headers(&[bad]).unwrap_err();
+        assert!(matches!(err, Error::Rootstock(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn the_attempt_trusts_the_heaviest_qualifying_tree() {
+        let core = core();
+        let light = put(&core, &entry(0, B256::ZERO, 10, 0));
+        let heavy = put(&core, &entry(0, B256::ZERO, 100, 1));
+        put(&core, &entry(1, heavy, 50, 0));
+        {
+            let txn = core.store.write().unwrap();
+            txn.rsk_put_root(light.as_slice()).unwrap();
+            txn.rsk_put_root(heavy.as_slice()).unwrap();
+            txn.commit().unwrap();
+        }
+
+        // light = 10, heavy = 150; 2/3 of 100 is ~67, so only `heavy` qualifies.
+        let txn = core.store.write().unwrap();
+        let cp = attempt_checkpoint(&txn, 2016, U256::from(100))
+            .unwrap()
+            .expect("a checkpoint");
+        assert_eq!(cp.hash, heavy);
+        assert_eq!(cp.number, 0);
+        assert_eq!(cp.work, U256::from(150));
+        assert_eq!(cp.tail_start, 2016);
+
+        // 2/3 of 300 is 200: nothing qualifies.
+        assert!(
+            attempt_checkpoint(&txn, 2016, U256::from(300))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn connect_rsk_headers_reports_an_established_checkpoint() {
+        let core = btc_with_tail();
+        assert_eq!(core.finalized_height().unwrap(), Some(2016));
+
+        // A single, very heavy root clears 2/3 of the (easy-target) tail work.
+        let f = put(&core, &entry(0, B256::ZERO, u64::MAX, 0));
+        {
+            let txn = core.store.write().unwrap();
+            txn.rsk_put_root(f.as_slice()).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let out = core.connect_rsk_headers(&[]).unwrap();
+        assert_eq!(out.connected, 0);
+        let cp = out.checkpoint.expect("a checkpoint");
+        assert_eq!(cp.hash, f);
+        assert_eq!(cp.tail_start, 2016);
+        assert_eq!(cp.work, U256::from(u64::MAX));
+    }
+
+    #[test]
+    fn propose_checkpoint_requires_an_in_tail_anchor() {
+        let core = btc_with_tail();
+        assert_eq!(core.tip_height().unwrap(), Some(4032));
+
+        // Height 3000 is canonical and buried well over ANCHOR_DEPTH below the tip.
+        let good = core.header_at(3000).unwrap().unwrap();
+        assert!(
+            core.propose_checkpoint(&anchored(0, good.block_hash(), 10))
+                .is_ok()
+        );
+
+        // Height 4030 is too near the tip to trust.
+        let shallow = core.header_at(4030).unwrap().unwrap();
+        let err = core
+            .propose_checkpoint(&anchored(1, shallow.block_hash(), 10))
+            .unwrap_err();
         assert!(matches!(err, Error::Rootstock(_)), "got {err:?}");
     }
 

@@ -170,7 +170,7 @@ impl Value for ForkMeta {
 pub(crate) struct RskBlock {
     pub number: u64,
     pub parent: [u8; 32],
-    pub own_work: U256,
+    pub cumulative_difficulty: U256,
 }
 
 impl Value for RskBlock {
@@ -190,7 +190,7 @@ impl Value for RskBlock {
         RskBlock {
             number: u64::from_be_bytes(data[..8].try_into().expect("8 bytes")),
             parent,
-            own_work: U256::from_be_slice(&data[40..72]),
+            cumulative_difficulty: U256::from_be_slice(&data[40..72]),
         }
     }
 
@@ -201,7 +201,7 @@ impl Value for RskBlock {
         let mut out = [0u8; 72];
         out[..8].copy_from_slice(&value.number.to_be_bytes());
         out[8..40].copy_from_slice(&value.parent);
-        out[40..72].copy_from_slice(&value.own_work.to_be_bytes::<32>());
+        out[40..72].copy_from_slice(&value.cumulative_difficulty.to_be_bytes::<32>());
         out
     }
 

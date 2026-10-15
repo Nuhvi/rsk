@@ -15,8 +15,8 @@
 //! checkpoint**: like Electrum (which refuses forks below its hardcoded max
 //! checkpoint), we refuse forks whose `forkpoint` falls at or below it (so no
 //! reorg can ever cross a full difficulty period), but we **do not prune** the
-//! chain when it advances — headers are retained until Rootstock reaches its
-//! FINAL block (see the RSK IBD design), at which point pruning can occur.
+//! chain when it advances — headers are retained until Rootstock establishes a
+//! checkpoint (see the RSK IBD design), at which point pruning can occur.
 //!
 //! Simplifications for this slice, stated explicitly so they are easy to lift:
 //!
@@ -485,7 +485,7 @@ fn finalize_in_txn(txn: &WriteTxn) -> Result<Option<u64>, Error> {
     // RETENTION POLICY (RSK IBD design):
     // Do NOT prune the Bitcoin chain here. We keep all headers so Rootstock can
     // cross-link against the full canonical chain; the caller prunes below the
-    // Bitcoin tail start only once Rootstock reaches FINAL.
+    // Bitcoin tail start only once Rootstock establishes a checkpoint.
     txn.set_finalized(boundary)?;
     Ok(Some(boundary))
 }
@@ -904,7 +904,7 @@ mod tests {
         assert!(expected > Work::from_be_bytes([0; 32]));
 
         // Headers BELOW the checkpoint are RETAINED (no pruning when it
-        // finalizes; pruning happens later when RSK reaches FINAL).
+        // finalizes; pruning happens later when RSK establishes a checkpoint).
         assert!(chain.header_at(1)?.is_some());
         assert!(chain.header_at(DIFFICULTY_PERIOD)?.is_some());
         assert!(

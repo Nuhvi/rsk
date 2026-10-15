@@ -9,10 +9,8 @@
 //! snapshot or the writer at the start of each method.
 //!
 //! Modules: [`btc`] (the Bitcoin chain, header rules and checkpoint spine),
-//! [`rsk`] (the Rootstock tree and its finality rules), and `store`/`records`
+//! [`rsk`] (the Rootstock tree and its checkpoint rules), and `store`/`records`
 //! (the redb state and its record types).
-//!
-//! Design is still in flux; see `CONTRIBUTING.md` (repo root) and `TODO.md`.
 
 // Tests read/write a deterministic in-memory store and conventionally use
 // `unwrap`; keep the strict lint for production code only.
@@ -32,5 +30,5 @@ pub use btc::validation::MEDIAN_TIME_PAST;
 pub use btc::{ConnectOutcome, FINALITY_MARGIN_BLOCKS, header_work};
 pub use core::Core;
 pub use error::Error;
-pub use rsk::{RskConnectOutcome, RskEntry};
+pub use rsk::{EphemeralChainCheckpoint, RskConnectOutcome, RskEntry};
 pub use store::DIFFICULTY_PERIOD;

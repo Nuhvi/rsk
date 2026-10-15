@@ -4,8 +4,8 @@
 //! **tree of chains** (forks), each with a `forkpoint` and a `parent`, plus a
 //! trusted **checkpoint spine** (one header per difficulty period) that makes
 //! the whole chain's work computable without holding every block. The Rootstock
-//! side is a **forest** of trees, each rooted at a trusted `F`. Header
-//! validation lives in [`crate::validation`] and [`crate::btc`]. Tests construct
+//! side is a **forest** of trees, each rooted at a proposed checkpoint block.
+//! Header validation lives in [`crate::rsk`] and [`crate::btc`]. Tests construct
 //! the store with the redb **in-memory** backend, so the exact same code path
 //! runs with zero disk I/O.
 //!
@@ -50,7 +50,7 @@ const BTC_FORKS: TableDefinition<u64, ForkMeta> = TableDefinition::new("btc_fork
 const BTC_CHECKPOINTS: TableDefinition<u64, BtcHeader> = TableDefinition::new("btc_checkpoints");
 const BTC_META: TableDefinition<&str, Meta> = TableDefinition::new("btc_meta");
 
-// ── Rootstock tables (one tree per trusted root `F`) ────────────────────────
+// ── Rootstock tables (one tree per proposed checkpoint block) ───────────────
 
 /// RSK headers, keyed by block hash: raw RLP bytes.
 pub(crate) const RSK_HEADERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rsk_headers");
@@ -61,7 +61,7 @@ pub(crate) const RSK_CHILDREN: TableDefinition<&[u8], HashList> =
     TableDefinition::new("rsk_children");
 /// `hash → raw uncle headers` (for the uncle rule's ancestry).
 pub(crate) const RSK_UNCLES: TableDefinition<&[u8], BlobList> = TableDefinition::new("rsk_uncles");
-/// Trusted root anchors (`F`): a set of block hashes.
+/// Proposed checkpoint blocks: the roots of the forest, a set of hashes.
 pub(crate) const RSK_ROOTS: TableDefinition<&[u8], ()> = TableDefinition::new("rsk_roots");
 pub(crate) const RSK_META: TableDefinition<&str, Meta> = TableDefinition::new("rsk_meta");
 
@@ -504,7 +504,7 @@ macro_rules! rsk_read_methods {
             Ok(table.get(hash)?.map(|v| v.value().0).unwrap_or_default())
         }
 
-        /// The trusted root (`F`) hashes.
+        /// The proposed checkpoint (forest root) hashes.
         pub(crate) fn rsk_roots(&self) -> Result<Vec<[u8; 32]>, Error> {
             let table = self.txn.open_table(RSK_ROOTS)?;
             let mut out = Vec::new();
