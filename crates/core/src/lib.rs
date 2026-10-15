@@ -8,9 +8,6 @@
 //! redb-backed store, reached only through a transaction: [`Core`] opens a read
 //! snapshot or the writer at the start of each method.
 //!
-//! Modules: [`btc`] (the Bitcoin chain, header rules and checkpoint spine),
-//! [`rsk`] (the Rootstock tree and its checkpoint rules), and `store`/`records`
-//! (the redb state and its record types).
 
 // Tests read/write a deterministic in-memory store and conventionally use
 // `unwrap`; keep the strict lint for production code only.

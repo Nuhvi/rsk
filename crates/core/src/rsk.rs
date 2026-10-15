@@ -10,8 +10,6 @@
 
 pub mod checkpoint;
 
-use std::collections::HashSet;
-
 use alloy_primitives::{B256, U256};
 use bitcoin::Network;
 use rsk_consensus::Header;
@@ -23,8 +21,7 @@ use rsk_consensus::validation::uncles::{
 
 use crate::Core;
 use crate::error::Error;
-use crate::store::records::RskBlock;
-use crate::store::{ReadTxn, WriteTxn};
+use crate::store::WriteTxn;
 
 /// The Rootstock consensus config matching a Bitcoin [`Network`]. Used when
 /// [`Core`] is opened.
@@ -108,10 +105,10 @@ impl Core {
             )));
         }
         let txn = self.store.write()?;
-        let hash = store_entry(&txn, entry)?;
+        let hash = txn.rsk_put_entry(entry)?;
         txn.rsk_put_root(hash.as_slice())?;
         txn.commit()?;
-        Ok(hash)
+        Ok(B256::from(hash))
     }
 
     /// Validate and store a contiguous ascending run of RSK headers (with their
@@ -133,7 +130,7 @@ impl Core {
         let mut connected = 0usize;
         for entry in entries {
             validate_entry(&txn, &verifier, entry)?;
-            store_entry(&txn, entry)?;
+            txn.rsk_put_entry(entry)?;
             connected += 1;
         }
         let checkpoint = match tail {
@@ -165,8 +162,7 @@ impl Core {
     /// over `root` and every descendant.
     #[cfg(test)]
     pub fn rsk_subtree_work(&self, root: &B256) -> Result<U256, Error> {
-        let txn = self.store.read()?;
-        subtree_work(&txn, root.as_slice())
+        self.store.read()?.rsk_subtree_work(root.as_slice())
     }
 
     /// The root with the heaviest subtree, if any.
@@ -175,86 +171,13 @@ impl Core {
         let txn = self.store.read()?;
         let mut best: Option<(B256, U256)> = None;
         for root in txn.rsk_roots()? {
-            let work = subtree_work(&txn, &root)?;
+            let work = txn.rsk_subtree_work(&root)?;
             if best.as_ref().is_none_or(|(_, w)| work > *w) {
                 best = Some((B256::from(root), work));
             }
         }
         Ok(best)
     }
-}
-
-/// Store a header, its uncle list, and the child edge to its parent.
-fn store_entry(txn: &WriteTxn, entry: &RskEntry) -> Result<B256, Error> {
-    let header = &entry.header;
-    let hash = header.hash();
-    let block = RskBlock {
-        number: header.number,
-        parent: header.parent_hash.0,
-        cumulative_difficulty: cumulative_difficulty(header, &entry.uncles),
-    };
-    txn.rsk_put_block(hash.as_slice(), &entry.raw, block)?;
-    let uncle_raws: Vec<Vec<u8>> = entry.uncles.iter().map(|u| u.raw.clone()).collect();
-    txn.rsk_put_uncles(hash.as_slice(), &uncle_raws)?;
-    if txn.rsk_has_block(header.parent_hash.as_slice())? {
-        txn.rsk_add_child(header.parent_hash.as_slice(), hash.as_slice())?;
-    }
-    Ok(hash)
-}
-
-/// rskj's per-block contribution: `difficulty + Σ(included uncle difficulty)`.
-fn cumulative_difficulty(header: &Header, uncles: &[RskUncle]) -> U256 {
-    let mut work = header.difficulty;
-    for uncle in uncles {
-        work = work.saturating_add(uncle.header.difficulty);
-    }
-    work
-}
-
-/// The two RSK reads the GHOST walk needs, so it can run over either a read
-/// snapshot or the writer.
-trait SubtreeReads {
-    fn block_at(&self, hash: &[u8]) -> Result<Option<RskBlock>, Error>;
-    fn children_of(&self, hash: &[u8]) -> Result<Vec<[u8; 32]>, Error>;
-}
-
-impl SubtreeReads for ReadTxn {
-    fn block_at(&self, hash: &[u8]) -> Result<Option<RskBlock>, Error> {
-        self.rsk_block(hash)
-    }
-
-    fn children_of(&self, hash: &[u8]) -> Result<Vec<[u8; 32]>, Error> {
-        self.rsk_children(hash)
-    }
-}
-
-impl SubtreeReads for WriteTxn {
-    fn block_at(&self, hash: &[u8]) -> Result<Option<RskBlock>, Error> {
-        self.rsk_block(hash)
-    }
-
-    fn children_of(&self, hash: &[u8]) -> Result<Vec<[u8; 32]>, Error> {
-        self.rsk_children(hash)
-    }
-}
-
-/// Sum `cumulative_difficulty` over `root`'s whole subtree (GHOST).
-fn subtree_work(txn: &impl SubtreeReads, root: &[u8]) -> Result<U256, Error> {
-    let mut total = U256::ZERO;
-    let mut stack: Vec<Vec<u8>> = vec![root.to_vec()];
-    let mut seen: HashSet<Vec<u8>> = HashSet::new();
-    while let Some(hash) = stack.pop() {
-        if !seen.insert(hash.clone()) {
-            continue;
-        }
-        if let Some(block) = txn.block_at(&hash)? {
-            total = total.saturating_add(block.cumulative_difficulty);
-        }
-        for child in txn.children_of(&hash)? {
-            stack.push(child.to_vec());
-        }
-    }
-    Ok(total)
 }
 
 /// The checkpoint attempt: among the proposed roots, the heaviest whose tree
@@ -266,7 +189,7 @@ fn attempt_checkpoint(
 ) -> Result<Option<EphemeralChainCheckpoint>, Error> {
     let mut best: Option<EphemeralChainCheckpoint> = None;
     for root in txn.rsk_roots()? {
-        let work = subtree_work(txn, &root)?;
+        let work = txn.rsk_subtree_work(&root)?;
         if !checkpoint::clears_threshold(work, btc_tail_work) {
             continue;
         }
@@ -450,9 +373,9 @@ mod tests {
     /// Store an unvalidated entry straight into the tree (bypassing consensus).
     fn put(core: &Core, entry: &RskEntry) -> B256 {
         let txn = core.store.write().unwrap();
-        let hash = store_entry(&txn, entry).unwrap();
+        let hash = txn.rsk_put_entry(entry).unwrap();
         txn.commit().unwrap();
-        hash
+        B256::from(hash)
     }
 
     /// The easiest valid Bitcoin target (regtest's proof-of-work limit).
