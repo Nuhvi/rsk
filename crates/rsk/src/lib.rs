@@ -1,12 +1,8 @@
 //! # rsk — the RSK One node, as a library
 //!
 //! The node's I/O lives here, kept out of the side-effect-free [`rsk_core`]
-//! chain engine so any application can embed it:
-//!
-//! - [`Node`] owns the chain store and syncs Bitcoin headers into it
-//!   ([`Node::sync`]); it is the handle an app holds.
-//! - [`probe::bitcoin`] reaches a Bitcoin peer and pulls one `headers` batch.
-//! - [`rootstock::probe`] reaches a Rootstock peer and reads its tip.
+//! chain engine so any application can embed it: [`Node`] owns the chain store
+//! and syncs Bitcoin headers into it ([`Node::sync`]).
 //!
 //! Nothing here runs on its own: the caller drives every operation and reads
 //! back the result. Progress is reported through [`tracing`], which the host
@@ -18,14 +14,10 @@
 
 pub mod config;
 pub mod node;
-pub mod probe;
-pub mod rootstock;
 
 mod peers;
 mod sync;
 
 pub use config::{Anchor, Config, DEFAULT_DATA_DIR, USER_AGENT};
 pub use node::Node;
-pub use probe::ProbeReport;
-pub use rootstock::{Chain, RskConfig};
 pub use sync::SyncReport;

@@ -5,10 +5,6 @@ headers to disk, and whose stated goal is to download and verify RSK block
 headers **faster than rskj or rustock** — by pulling headers over the RSK P2P
 network with a parallel skeleton walk, anchored to Bitcoin via merge mining.
 
-Start with the docs: [`docs/DESIGN.md`](docs/DESIGN.md) for the architecture and
-security model, [`docs/ROADMAP.md`](docs/ROADMAP.md) for the working plan and
-notes on next steps.
-
 ## Current status
 
 - `rsk-core` — the side-effect-free chain state (redb): the Bitcoin fork tree
@@ -18,8 +14,8 @@ notes on next steps.
   Rootstock header **forest** with GHOST weighting and the ephemeral-chain
   checkpoint rules.
 - `rsk` — the node **as a library**: Bitcoin header sync over P2P (a small peer
-  pool, prefetch overlapped with validation), Bitcoin and Rootstock probes, and
-  checkpoint export. Embeddable in any app.
+  pool, prefetch overlapped with validation) and checkpoint export. Embeddable
+  in any app.
 - `rsk-cli` — a thin command-line wrapper over the `rsk` library.
 - `rsk-consensus` / `rsk-p2p` — vendored from rustock (consensus types + rules;
   RLPx + devp2p + `rsk/*` + UDP discovery).
@@ -32,7 +28,7 @@ ready), follow mode near the tip, and state.
 ```
 crates/
   rsk-core/      — side-effect-free Bitcoin + Rootstock chain state (redb): checkpoint spine, fork tree, RSK header forest, checkpoint rules
-  rsk/           — the RSK One node as a library: Bitcoin header sync, peer pool, Bitcoin/Rootstock probes
+  rsk/           — the RSK One node as a library: Bitcoin header sync, peer pool, checkpoint export
   cli/           — rsk-cli: a thin command-line wrapper over the `rsk` library
   btc-p2p/       — Bitcoin P2P protocol client: framed transport, version/verack handshake, headers
   rsk-consensus/ — vendored rustock consensus: Header, HeaderVerifier, ChainConfig, checkpoint (88 tests)
@@ -45,14 +41,8 @@ crates/
 # sync Bitcoin headers into ./data/rsk-one/chain.redb (validates every header)
 cargo run -p rsk-cli -- sync
 
-# reach a Bitcoin peer and pull one headers batch
-cargo run -p rsk-cli -- probe
-
 # write the store's finalized period boundaries as a checkpoints.txt
 cargo run -p rsk-cli -- export-checkpoints > checkpoints.txt
-
-# read a Rootstock peer's tip
-cargo run -p rsk-cli -- rsk-probe --host bootstrap12.rsk.co:5050
 ```
 
 See `cargo run -p rsk-cli -- <command> --help` for the flags of each command.

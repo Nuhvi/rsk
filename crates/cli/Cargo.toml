@@ -8,7 +8,6 @@ description = "Command line for the RSK One node: a thin wrapper over the `rsk` 
 anyhow = "1.0.104"
 clap = { version = "4", features = ["derive"] }
 rsk = { path = "../rsk" }
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "net", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 

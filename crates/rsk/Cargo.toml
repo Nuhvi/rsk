@@ -5,17 +5,12 @@ edition = "2024"
 description = "The RSK One node as a library: Bitcoin header sync and Rootstock peer access, embeddable in any app"
 
 [dependencies]
-alloy-primitives = { version = "1.5.4", features = ["serde", "rlp"] }
 anyhow = "1.0.104"
 bitcoin = "0.32.8"
 btc-p2p = { path = "../btc-p2p" }
 hex = "0.4.3"
-k256 = { version = "0.13.4", features = ["ecdsa", "ecdh"] }
 rsk-core = { path = "../core" }
-rsk-p2p = { path = "../rsk-p2p" }
-tokio = { version = "1.49.0", features = ["net", "time"] }
 tracing = "0.1.44"
-uuid = { version = "1.20.0", features = ["v4"] }
 
 [lints.clippy]
 unwrap_used = "deny"

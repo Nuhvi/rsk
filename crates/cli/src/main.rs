@@ -4,13 +4,10 @@
 //! a [`Config`] and calls one library entry point. All the I/O lives in the
 //! library, so the node is embeddable in any app.
 //!
-//! `probe` reaches a real Bitcoin P2P peer and pulls one `headers` batch.
 //! `sync` downloads real Bitcoin headers into the store, which PoW-,
 //! continuity-, difficulty- and timestamp-validates every one and finalizes
 //! difficulty periods as it goes. `export-checkpoints` writes the store's
-//! period-boundary headers back out as a `checkpoints.txt`. `rsk-probe`
-//! connects to a Rootstock peer and reads its tip (step 1 of the RSK IBD
-//! design).
+//! period-boundary headers back out as a `checkpoints.txt`.
 //!
 //! Logs go to stderr (tracing); data (e.g. exported checkpoints) goes to
 //! stdout, so `rsk-cli export-checkpoints > file` stays clean.
@@ -21,7 +18,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rsk::{Anchor, Chain, Config, DEFAULT_DATA_DIR, Node, RskConfig};
+use rsk::{Anchor, Config, DEFAULT_DATA_DIR, Node};
 use tracing::info;
 
 #[derive(Parser)]
@@ -37,53 +34,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Contact a real Bitcoin P2P peer and prove headers flow
-    Probe(ProbeArgs),
     /// Download Bitcoin headers over P2P into the store
     Sync(SyncArgs),
     /// Export the store's period-boundary headers as a checkpoints.txt
     #[command(name = "export-checkpoints")]
     ExportCheckpoints(ExportArgs),
-    /// Connect to a Rootstock peer and read its tip (step 1 of RSK IBD)
-    #[command(name = "rsk-probe")]
-    RskProbe(RskProbeArgs),
 }
 
 fn main() -> Result<()> {
     init_tracing();
     match Cli::parse().command {
-        Command::Probe(args) => args.run(),
         Command::Sync(args) => args.run(),
         Command::ExportCheckpoints(args) => args.run(),
-        Command::RskProbe(args) => args.run(),
-    }
-}
-
-#[derive(clap::Args)]
-struct ProbeArgs {
-    /// Peer address to try first (repeatable), e.g. 1.2.3.4:8333
-    #[arg(long, value_name = "IP:PORT")]
-    addr: Vec<SocketAddr>,
-
-    /// DNS seed host to resolve (repeatable; defaults to the mainnet seeds)
-    #[arg(long, value_name = "HOST")]
-    seed: Vec<String>,
-
-    /// Maximum number of candidate peers to try
-    #[arg(long, default_value_t = 8)]
-    limit: usize,
-}
-
-impl ProbeArgs {
-    fn run(self) -> Result<()> {
-        let config = Config {
-            addrs: self.addr,
-            seeds: self.seed,
-            limit: self.limit,
-            ..Config::default()
-        };
-        rsk::probe::bitcoin(&config)?;
-        Ok(())
     }
 }
 
@@ -171,34 +133,6 @@ impl ExportArgs {
                     .context("writing checkpoints to stdout")?;
             }
         }
-        Ok(())
-    }
-}
-
-#[derive(clap::Args)]
-struct RskProbeArgs {
-    /// Rootstock bootnode `host:port` to dial
-    #[arg(long, default_value = "bootstrap01.rsk.co:5050")]
-    host: String,
-
-    /// Network: `mainnet` or `testnet`
-    #[arg(long, default_value = "mainnet")]
-    chain: String,
-}
-
-impl RskProbeArgs {
-    fn run(self) -> Result<()> {
-        let config = RskConfig {
-            host: self.host,
-            chain: Chain::parse(&self.chain)?,
-        };
-        // The CLI is otherwise synchronous; RSK P2P lives on tokio, so drive
-        // just this command on a runtime of its own.
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("building tokio runtime")?;
-        runtime.block_on(rsk::rootstock::probe(&config))?;
         Ok(())
     }
 }

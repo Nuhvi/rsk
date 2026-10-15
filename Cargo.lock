@@ -2022,18 +2022,13 @@ dependencies = [
 name = "rsk"
 version = "0.1.0"
 dependencies = [
- "alloy-primitives",
  "anyhow",
  "bitcoin",
  "btc-p2p",
  "hex",
- "k256",
  "rsk-core",
- "rsk-p2p",
  "tempfile",
- "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -2043,7 +2038,6 @@ dependencies = [
  "anyhow",
  "clap",
  "rsk",
- "tokio",
  "tracing",
  "tracing-subscriber",
 ]
