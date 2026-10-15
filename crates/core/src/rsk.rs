@@ -13,6 +13,7 @@ pub mod finality;
 use std::collections::HashSet;
 
 use alloy_primitives::{B256, U256};
+use bitcoin::Network;
 use rsk_consensus::Header;
 use rsk_consensus::types::block::Block;
 use rsk_consensus::validation::HeaderVerifier;
@@ -24,6 +25,17 @@ use crate::Core;
 use crate::error::Error;
 use crate::store::records::RskBlock;
 use crate::store::{ReadTxn, WriteTxn};
+
+/// The Rootstock consensus config matching a Bitcoin [`Network`]. Used when
+/// [`Core`] is opened.
+pub(crate) fn chain_config(network: Network) -> std::sync::Arc<rsk_consensus::config::ChainConfig> {
+    use rsk_consensus::config::ChainConfig;
+    std::sync::Arc::new(match network {
+        Network::Bitcoin => ChainConfig::mainnet(),
+        Network::Testnet | Network::Testnet4 | Network::Signet => ChainConfig::testnet(),
+        Network::Regtest => ChainConfig::regtest(),
+    })
+}
 
 /// A Rootstock header and the uncle headers it references, each with the wire
 /// bytes its hash is taken over.

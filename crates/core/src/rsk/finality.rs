@@ -31,7 +31,7 @@ use rsk_consensus::Header as RskHeader;
 use rsk_consensus::config::ChainConfig;
 use rsk_consensus::validation::HeaderVerifier;
 
-use crate::btc::Core;
+use crate::Core;
 use crate::error::Error;
 use crate::store::DIFFICULTY_PERIOD;
 

@@ -309,8 +309,8 @@ pub fn compress_coinbase(
     }
 
     let mut state = SHA256_INITIAL_STATE;
-    for chunk in coinbase[..bytes_to_hash].chunks_exact(64) {
-        sha256_compress(&mut state, chunk.try_into().unwrap());
+    for chunk in coinbase[..bytes_to_hash].as_chunks::<64>().0 {
+        sha256_compress(&mut state, chunk);
     }
 
     let mut out = Vec::with_capacity(MIDSTATE_SIZE_TRIMMED + coinbase.len() - bytes_to_hash);
@@ -348,9 +348,8 @@ pub fn sha256_from_midstate(state: [u32; 8], byte_count: u64, tail: &[u8]) -> [u
     }
     padded.extend_from_slice(&total_bits.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
-        let block: &[u8; 64] = chunk.try_into().unwrap();
-        sha256_compress(&mut h, block);
+    for chunk in padded.as_chunks::<64>().0 {
+        sha256_compress(&mut h, chunk);
     }
 
     let mut output = [0u8; 32];
@@ -367,9 +366,8 @@ pub fn sha256_from_midstate(state: [u32; 8], byte_count: u64, tail: &[u8]) -> [u
 pub fn rskip92_merkle_root(coinbase_hash: &[u8; 32], proof_bytes: &[u8]) -> [u8; 32] {
     let mut current = *coinbase_hash;
 
-    for chunk in proof_bytes.chunks_exact(32) {
-        let sibling: [u8; 32] = chunk.try_into().unwrap();
-        current = combine_left_right(&current, &sibling);
+    for chunk in proof_bytes.as_chunks::<32>().0 {
+        current = combine_left_right(&current, chunk);
     }
 
     current

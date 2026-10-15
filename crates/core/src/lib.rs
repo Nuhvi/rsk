@@ -23,12 +23,14 @@
 #![allow(clippy::result_large_err)]
 
 pub mod btc;
+mod core;
 pub mod error;
 pub mod rsk;
 mod store;
 
 pub use btc::validation::MEDIAN_TIME_PAST;
-pub use btc::{ConnectOutcome, Core, FINALITY_MARGIN_BLOCKS, header_work};
+pub use btc::{ConnectOutcome, FINALITY_MARGIN_BLOCKS, header_work};
+pub use core::Core;
 pub use error::Error;
 pub use rsk::{RskConnectOutcome, RskEntry};
 pub use store::DIFFICULTY_PERIOD;

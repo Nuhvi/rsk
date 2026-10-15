@@ -26,15 +26,15 @@
 //!   has no clock, and the first two add no SPV value. See [`crate::btc::validation`]
 //!   for the exact rule set.
 
-use bitcoin::Network;
 use bitcoin::block::BlockHash;
 use bitcoin::block::Header as BitcoinHeader;
 use bitcoin::consensus::Params;
 use bitcoin::hashes::Hash;
 use bitcoin::pow::Work;
 
+use crate::Core;
 use crate::error::Error;
-use crate::store::{DIFFICULTY_PERIOD, ReadTxn, Store, WriteTxn};
+use crate::store::{DIFFICULTY_PERIOD, ReadTxn, WriteTxn};
 
 pub mod checkpoints;
 pub mod validation;
@@ -60,48 +60,7 @@ pub struct ConnectOutcome {
     pub finalized: Option<u64>,
 }
 
-/// The canonical-chain engine: a thin, deterministic layer over a redb-backed
-/// store.
-///
-/// No concurrency, no network, no clock, no hidden I/O — the caller supplies
-/// headers and reads back outcomes.
-pub struct Core {
-    pub(crate) store: Store,
-    network: Network,
-    /// Rootstock consensus parameters the RSK tree validates against.
-    pub(crate) rsk_chain: std::sync::Arc<rsk_consensus::config::ChainConfig>,
-}
-
-/// The Rootstock consensus config matching a Bitcoin [`Network`].
-fn rsk_config(network: Network) -> std::sync::Arc<rsk_consensus::config::ChainConfig> {
-    use rsk_consensus::config::ChainConfig;
-    std::sync::Arc::new(match network {
-        Network::Bitcoin => ChainConfig::mainnet(),
-        Network::Testnet | Network::Testnet4 | Network::Signet => ChainConfig::testnet(),
-        Network::Regtest => ChainConfig::regtest(),
-    })
-}
-
 impl Core {
-    /// Open a file-backed chain store for the given network.
-    pub fn open(path: &std::path::Path, network: Network) -> Result<Self, Error> {
-        Ok(Self {
-            store: Store::open(path)?,
-            network,
-            rsk_chain: rsk_config(network),
-        })
-    }
-
-    /// Open an in-memory chain store (tests, no disk I/O) for the given network.
-    #[cfg(test)]
-    pub fn in_memory(network: Network) -> Result<Self, Error> {
-        Ok(Self {
-            store: Store::in_memory()?,
-            network,
-            rsk_chain: rsk_config(network),
-        })
-    }
-
     /// Plant the trust anchor: the checkpoint spine, one header per difficulty
     /// period, accepted without validating its ancestors. This makes the whole
     /// chain's work computable and creates the root chain. The network is
@@ -1164,7 +1123,7 @@ mod tests {
         let chain = Core {
             store,
             network: Network::Bitcoin,
-            rsk_chain: rsk_config(Network::Bitcoin),
+            rsk_chain: crate::rsk::chain_config(Network::Bitcoin),
         };
         let header = mine_child(&canonical(&chain, 0), EASY_BITS, 1);
         let err = chain.connect_headers(&[header]).unwrap_err();
