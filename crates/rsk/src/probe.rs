@@ -1,4 +1,5 @@
-//! `rsk-cli probe` — contact a real Bitcoin P2P peer and prove headers flow.
+//! Reach a real Bitcoin peer and prove headers flow: resolve candidates,
+//! handshake, and pull one `headers` batch off genesis.
 
 use std::net::SocketAddr;
 
@@ -7,29 +8,32 @@ use bitcoin::Network;
 use bitcoin::block::BlockHash;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::hashes::Hash;
+use btc_p2p::Handshake;
 use btc_p2p::session::Session;
 use tracing::{info, warn};
 
-use crate::USER_AGENT;
+use crate::config::Config;
 use crate::peers;
 
-#[derive(clap::Args)]
-pub struct Args {
-    /// Peer address to try first (repeatable), e.g. 1.2.3.4:8333
-    #[arg(long, value_name = "IP:PORT")]
-    addr: Vec<SocketAddr>,
-
-    /// DNS seed host to resolve (repeatable; defaults to the mainnet seeds)
-    #[arg(long, value_name = "HOST")]
-    seed: Vec<String>,
-
-    /// Maximum number of candidate peers to try
-    #[arg(long, default_value_t = 8)]
-    limit: usize,
+/// What a successful Bitcoin probe found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeReport {
+    /// The peer that answered.
+    pub addr: SocketAddr,
+    /// What the peer advertised in its `version` message.
+    pub handshake: Handshake,
+    /// Headers returned in one batch after genesis.
+    pub headers: usize,
+    /// The first (oldest) header in the batch.
+    pub first: BlockHash,
+    /// The last (newest) header in the batch.
+    pub last: BlockHash,
 }
 
-pub fn run(args: Args) -> Result<()> {
-    let (candidates, failed) = peers::candidates(args.addr, &args.seed);
+/// Try each candidate (explicit addresses, then resolved seeds) until one
+/// answers, and return the first successful probe.
+pub fn bitcoin(config: &Config) -> Result<ProbeReport> {
+    let (candidates, failed) = peers::candidates(config.addrs.clone(), &config.seeds);
     info!(
         "{} candidate peer address(es); {} seed(s) failed to resolve{}",
         candidates.len(),
@@ -44,20 +48,20 @@ pub fn run(args: Args) -> Result<()> {
         bail!("no candidate peers: every DNS seed failed to resolve");
     }
 
-    for addr in candidates.into_iter().take(args.limit) {
+    for addr in candidates.into_iter().take(config.limit) {
         info!("trying {addr} …");
-        match connect_probe(addr) {
-            Ok(()) => return Ok(()),
+        match connect_probe(addr, &config.user_agent) {
+            Ok(report) => return Ok(report),
             Err(e) => warn!("  {addr} failed: {e:#}"),
         }
     }
-    bail!("no peer answered within {} tries", args.limit)
+    bail!("no peer answered within {} tries", config.limit)
 }
 
 /// Connect, handshake, and pull one real `headers` batch off genesis.
-fn connect_probe(addr: SocketAddr) -> Result<()> {
+fn connect_probe(addr: SocketAddr, user_agent: &str) -> Result<ProbeReport> {
     let (mut session, handshake) =
-        Session::connect(addr, USER_AGENT, 0).context("connecting and handshaking")?;
+        Session::connect(addr, user_agent, 0).context("connecting and handshaking")?;
 
     info!("  user agent:   {}", handshake.user_agent);
     info!("  version:      {}", handshake.version);
@@ -80,5 +84,12 @@ fn connect_probe(addr: SocketAddr) -> Result<()> {
     info!("  first:        {first}");
     info!("  last:         {last}");
     info!("probe ok: handshake and header flow work against {addr}");
-    Ok(())
+
+    Ok(ProbeReport {
+        addr,
+        handshake,
+        headers: headers.len(),
+        first,
+        last,
+    })
 }

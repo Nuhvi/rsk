@@ -1,44 +1,34 @@
 //! rsk-cli — run the RSK One node from the command line.
 //!
-//! This is the user-facing way to run things; the crates below it are
-//! libraries (`btc-p2p` protocol client, `rsk-core` chain engine) with no CLI
-//! of their own, so the node stays embeddable.
+//! A thin wrapper over the [`rsk`] library: each command parses arguments into
+//! a [`Config`] and calls one library entry point. All the I/O lives in the
+//! library, so the node is embeddable in any app.
 //!
 //! `probe` reaches a real Bitcoin P2P peer and pulls one `headers` batch.
-//! `sync` downloads real Bitcoin headers into the `rsk-core` store, which
-//! PoW-, continuity-, difficulty- and timestamp-validates every one and
-//! finalizes difficulty periods as it goes. `export-checkpoints` writes the
-//! store's period-boundary headers back out as a `checkpoints.txt`.
-//! `rsk-probe` connects to a Rootstock peer and reads its tip (step 1 of the
-//! RSK IBD design).
+//! `sync` downloads real Bitcoin headers into the store, which PoW-,
+//! continuity-, difficulty- and timestamp-validates every one and finalizes
+//! difficulty periods as it goes. `export-checkpoints` writes the store's
+//! period-boundary headers back out as a `checkpoints.txt`. `rsk-probe`
+//! connects to a Rootstock peer and reads its tip (step 1 of the RSK IBD
+//! design).
 //!
 //! Logs go to stderr (tracing); data (e.g. exported checkpoints) goes to
 //! stdout, so `rsk-cli export-checkpoints > file` stays clean.
 
-mod export;
-mod peers;
-mod probe;
-mod rsk_probe;
-mod sync;
+use std::io::Write;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tracing_subscriber::EnvFilter;
-
-/// Who we are on the wire (BIP 14).
-pub const USER_AGENT: &str = "/rsk-one:0.1.0/";
-
-/// Where the chain store lives by default, relative to the working directory
-/// (the repo gitignores `data/`). Product-scoped rather than bitcoin-scoped
-/// because the same store will later carry RSK chain state. The absolute path
-/// is logged at startup so there is never a question of *where*.
-pub const DEFAULT_DATA_DIR: &str = "data/rsk-one";
+use rsk::{Anchor, Chain, Config, DEFAULT_DATA_DIR, Node, RskConfig};
+use tracing::info;
 
 #[derive(Parser)]
 #[command(
     name = "rsk-cli",
     version,
-    about = "The RSK One node: talk to real Bitcoin peers and sync headers"
+    about = "The RSK One node: talk to real peers and sync headers"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -48,31 +38,176 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Contact a real Bitcoin P2P peer and prove headers flow
-    Probe(probe::Args),
-    /// Download Bitcoin headers over P2P into the rsk-core store
-    Sync(sync::Args),
+    Probe(ProbeArgs),
+    /// Download Bitcoin headers over P2P into the store
+    Sync(SyncArgs),
     /// Export the store's period-boundary headers as a checkpoints.txt
     #[command(name = "export-checkpoints")]
-    ExportCheckpoints(export::Args),
+    ExportCheckpoints(ExportArgs),
     /// Connect to a Rootstock peer and read its tip (step 1 of RSK IBD)
     #[command(name = "rsk-probe")]
-    RskProbe(rsk_probe::Args),
+    RskProbe(RskProbeArgs),
 }
 
 fn main() -> Result<()> {
     init_tracing();
     match Cli::parse().command {
-        Command::Probe(args) => probe::run(args),
-        Command::Sync(args) => sync::run(args),
-        Command::ExportCheckpoints(args) => export::run(args),
-        Command::RskProbe(args) => rsk_probe::run(args),
+        Command::Probe(args) => args.run(),
+        Command::Sync(args) => args.run(),
+        Command::ExportCheckpoints(args) => args.run(),
+        Command::RskProbe(args) => args.run(),
+    }
+}
+
+#[derive(clap::Args)]
+struct ProbeArgs {
+    /// Peer address to try first (repeatable), e.g. 1.2.3.4:8333
+    #[arg(long, value_name = "IP:PORT")]
+    addr: Vec<SocketAddr>,
+
+    /// DNS seed host to resolve (repeatable; defaults to the mainnet seeds)
+    #[arg(long, value_name = "HOST")]
+    seed: Vec<String>,
+
+    /// Maximum number of candidate peers to try
+    #[arg(long, default_value_t = 8)]
+    limit: usize,
+}
+
+impl ProbeArgs {
+    fn run(self) -> Result<()> {
+        let config = Config {
+            addrs: self.addr,
+            seeds: self.seed,
+            limit: self.limit,
+            ..Config::default()
+        };
+        rsk::probe::bitcoin(&config)?;
+        Ok(())
+    }
+}
+
+#[derive(clap::Args)]
+struct SyncArgs {
+    /// Directory for the chain store
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_DATA_DIR)]
+    data_dir: PathBuf,
+
+    /// Trust only the first (spine length − N) checkpoints, validating N
+    /// periods of real headers above the spine
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    cut: u64,
+
+    /// Ignore the embedded checkpoint spine and validate the whole chain from
+    /// block 1
+    #[arg(long)]
+    from_genesis: bool,
+
+    /// Number of peers to keep connected
+    #[arg(long, value_name = "N", default_value_t = 3)]
+    peers: usize,
+
+    /// Peer address to try first (repeatable), e.g. 1.2.3.4:8333
+    #[arg(long, value_name = "IP:PORT")]
+    addr: Vec<SocketAddr>,
+
+    /// DNS seed host to resolve (repeatable; defaults to the mainnet seeds)
+    #[arg(long, value_name = "HOST")]
+    seed: Vec<String>,
+
+    /// Maximum number of peer connections to attempt
+    #[arg(long, value_name = "N", default_value_t = 8)]
+    limit: usize,
+}
+
+impl SyncArgs {
+    fn run(self) -> Result<()> {
+        let anchor = if self.from_genesis {
+            Anchor::Genesis
+        } else {
+            Anchor::Spine { cut: self.cut }
+        };
+        let config = Config {
+            data_dir: self.data_dir,
+            anchor,
+            peers: self.peers,
+            limit: self.limit,
+            addrs: self.addr,
+            seeds: self.seed,
+            ..Config::default()
+        };
+        Node::open(config)?.sync()?;
+        Ok(())
+    }
+}
+
+#[derive(clap::Args)]
+struct ExportArgs {
+    /// Directory of the chain store to read
+    #[arg(long, value_name = "DIR", default_value = DEFAULT_DATA_DIR)]
+    data_dir: PathBuf,
+
+    /// Write to this file instead of stdout
+    #[arg(long, value_name = "FILE")]
+    out: Option<PathBuf>,
+}
+
+impl ExportArgs {
+    fn run(self) -> Result<()> {
+        let config = Config {
+            data_dir: self.data_dir,
+            ..Config::default()
+        };
+        let text = Node::open(config)?.export_checkpoints()?;
+        match self.out {
+            Some(path) => {
+                std::fs::write(&path, &text)
+                    .with_context(|| format!("writing {}", path.display()))?;
+                info!("wrote checkpoints to {}", path.display());
+            }
+            None => {
+                std::io::stdout()
+                    .write_all(text.as_bytes())
+                    .context("writing checkpoints to stdout")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(clap::Args)]
+struct RskProbeArgs {
+    /// Rootstock bootnode `host:port` to dial
+    #[arg(long, default_value = "bootstrap01.rsk.co:5050")]
+    host: String,
+
+    /// Network: `mainnet` or `testnet`
+    #[arg(long, default_value = "mainnet")]
+    chain: String,
+}
+
+impl RskProbeArgs {
+    fn run(self) -> Result<()> {
+        let config = RskConfig {
+            host: self.host,
+            chain: Chain::parse(&self.chain)?,
+        };
+        // The CLI is otherwise synchronous; RSK P2P lives on tokio, so drive
+        // just this command on a runtime of its own.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .context("building tokio runtime")?;
+        runtime.block_on(rsk::rootstock::probe(&config))?;
+        Ok(())
     }
 }
 
 /// Logs to stderr (`RUST_LOG` override, default `info`); stdout is left for
 /// data output.
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)

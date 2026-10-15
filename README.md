@@ -11,95 +11,51 @@ notes on next steps.
 
 ## Current status
 
-- Bitcoin headers sync from **Electrum** servers (PoW + chain continuity
-  validated), starting from a difficulty-period checkpoint.
-- RSK headers + merge-mining data sync from an RSK **JSON-RPC** endpoint
-  (backward/forward walk) into redb.
-- **Milestone 1 done:** `rsk-consensus` (vendored from rustock) provides the full
-  RSK header type + `HeaderVerifier` consensus rules + the cumulative-difficulty
-  checkpoint gate; `rsk-p2p` (vendored from rustock) provides the RLPx / devp2p /
-  `rsk/62` stack, the rsk subprotocol messages and UDP discovery.
+- `rsk-core` — the side-effect-free chain state (redb): the Bitcoin fork tree
+  with a **checkpoint spine** (one header per difficulty period, so whole-chain
+  work is known without holding every block), header validation (PoW,
+  difficulty, median-time-past), automatic period finalization, and the
+  Rootstock header **forest** with GHOST weighting and the ephemeral-chain
+  checkpoint rules.
+- `rsk` — the node **as a library**: Bitcoin header sync over P2P (a small peer
+  pool, prefetch overlapped with validation), Bitcoin and Rootstock probes, and
+  checkpoint export. Embeddable in any app.
+- `rsk-cli` — a thin command-line wrapper over the `rsk` library.
+- `rsk-consensus` / `rsk-p2p` — vendored from rustock (consensus types + rules;
+  RLPx + devp2p + `rsk/*` + UDP discovery).
 
-- **Milestone 2 done:** `rsk-sync` performs a **parallel skeleton header walk**
-  over P2P (port of rustock's `HeaderWalk`), verifying every header with the
-  full `HeaderVerifier` rules, storing raw headers into redb, and gating the
-  peer's difficulty claim against the #9,020,000 checkpoint. It anchors at the
-  checkpoint (or a previously-verified boundary on resume) instead of
-  re-downloading genesis. Verified live on mainnet: 288k headers walked in ~10
-  min (debug build, one peer) and a resume re-synced only the ~130-block delta.
-
-  ```sh
-  cargo run -p rsk-sync --example initial_sync -- --data-dir ./data \
-    --bootnode bootstrap12.rsk.co:5050
-  ```
-
-  (Discovery note: only some RSK bootnodes answer UDP discovery at any given
-  time; try several. `bootstrap12.rsk.co` has been reliable in testing.)
-
-- **Next (M3):** follow mode near the tip (`NewBlockHashes` + status polls),
-  Bitcoin cross-link of embedded BTC headers, and reorg handling.
+Not yet: RSK header sync over P2P (the checkpoint/tree logic in `rsk-core` is
+ready), follow mode near the tip, and state.
 
 ## Project Structure
 
 ```
 crates/
-  rsk-core/      — side-effect-free Bitcoin canonical chain: checkpoint spine, fork tree, finality (redb)
+  rsk-core/      — side-effect-free Bitcoin + Rootstock chain state (redb): checkpoint spine, fork tree, RSK header forest, checkpoint rules
+  rsk/           — the RSK One node as a library: Bitcoin header sync, peer pool, Bitcoin/Rootstock probes
+  cli/           — rsk-cli: a thin command-line wrapper over the `rsk` library
   btc-p2p/       — Bitcoin P2P protocol client: framed transport, version/verack handshake, headers
-  cli/           — rsk-cli: run the node (probe, sync, export-checkpoints)
-  rsk/           — Rust SDK library (header model, merge-mining verification, RPC light-client logic)
-  rsk-store/     — Persistent storage for Bitcoin and RSK headers (redb). Shared between node and client.
-  rsk-node/      — Binary crate (header sync orchestration, Electrum + RSK RPC)
   rsk-consensus/ — vendored rustock consensus: Header, HeaderVerifier, ChainConfig, checkpoint (88 tests)
   rsk-p2p/       — vendored rustock RLPx networking + rsk subprotocol + discovery (80 tests)
-  rsk-sync/      — parallel skeleton header walk into redb + checkpoint gate (rustock HeaderWalk port)
 ```
-
-### `rsk-store` (library, usable by both node and client)
-
-| Type | Description |
-|---|---|
-| `Store` | redb persistence for Bitcoin headers, RSK headers, and merge-mining data |
-| `DifficultyTracker` | Sliding-window cumulative Bitcoin work tracker |
-| `MergeMiningData` | Merge-mining proof components (hex strings) |
-| `header_work()` | Compute work from a Bitcoin header's nBits target |
-| `decode_rsk_header()` | Decode an RSK header from raw RLP bytes |
-| `StoreError` | Error type for storage operations |
-
-The client can use `get_tip_height()` and header range queries to tell the node
-which blocks it already has, so the node only sends what's missing.
-
-### `rsk-node` (binary)
-
-Phase 1: Connects to Electrum servers, syncs Bitcoin headers from a checkpoint
-(default block 900,000), validates PoW and chain continuity.
-
-Phase 2: Syncs RSK headers and merge-mining data from an RSK JSON-RPC endpoint,
-accumulating RSK difficulty until it covers the Bitcoin window work.
-
-Both phases skip already-stored data on restart. The P2P path will replace the
-RPC fetch in Phase 2.
 
 ## Usage
 
 ```bash
-cargo run -p rsk-node -- \
-  --electrum ssl://blockstream.info:993 \
-  --electrum ssl://electrum.blockstream.info:993 \
-  --rsk-rpc-url https://public-node.rsk.co \
-  --data-dir ./data
+# sync Bitcoin headers into ./data/rsk-one/chain.redb (validates every header)
+cargo run -p rsk-cli -- sync
+
+# reach a Bitcoin peer and pull one headers batch
+cargo run -p rsk-cli -- probe
+
+# write the store's finalized period boundaries as a checkpoints.txt
+cargo run -p rsk-cli -- export-checkpoints > checkpoints.txt
+
+# read a Rootstock peer's tip
+cargo run -p rsk-cli -- rsk-probe --host bootstrap12.rsk.co:5050
 ```
 
-### Options
-
-| Flag | Default | Description |
-|---|---|---|
-| `--data-dir` | `data` | Directory for `store.redb` |
-| `--electrum` | *(required)* | Electrum server URL(s), repeatable |
-| `--rsk-rpc-url` | *(required)* | RSK JSON-RPC endpoint |
-| `--btc-checkpoint-height` | `900000` | Skip Bitcoin headers before this block |
-| `--btc-window-size` | `100` | Number of blocks in the difficulty window |
-| `--rsk-safe-block-margin` | `6` | How far below the RSK tip to start (reorg safety) |
-| `--sync-batch-size` | `100` | Block headers per RPC batch |
+See `cargo run -p rsk-cli -- <command> --help` for the flags of each command.
 
 ## Acknowledgment
 

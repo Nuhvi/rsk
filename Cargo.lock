@@ -2019,22 +2019,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsk-cli"
+name = "rsk"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "anyhow",
  "bitcoin",
  "btc-p2p",
- "clap",
  "hex",
  "k256",
  "rsk-core",
  "rsk-p2p",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rsk-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rsk",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

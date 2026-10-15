@@ -1,18 +1,14 @@
-//! Shared peer helpers: candidate discovery, and a small pool of connected
-//! peers kept warm for the sync.
+//! Bitcoin peer discovery and a small pool of connected peers.
 //!
-//! A Bitcoin header sync is sequential in *validation* (each batch links to the
-//! one before it), but the network fetch is overlapped with it: the sync
-//! round-robins across every pooled peer and prefetches the next batch while
-//! the current one is validated. Keeping several peers connected also means the
-//! driver keeps answering their pings, so they stay alive.
+//! A header sync is sequential in *validation* (each batch links to the one
+//! before it), but the network fetch is overlapped with it: the sync round-robins
+//! across every pooled peer and prefetches the next batch while the current one
+//! is validated. Keeping several peers connected also means the driver keeps
+//! answering their pings, so they stay alive.
 //!
-//! TODO(peers): this is deliberately minimal. Real peer management — maintain a
-//! target count with a minimum that never blocks progress, connect in the
-//! background, ping and answer pings on idle peers, drop unresponsive ones,
-//! grow the address table via `getaddr`/`addr` gossip and a persisted peer
-//! cache, and score peers by validity/latency — is described in
-//! `docs/ROADMAP.md` ("Peer management") and not implemented yet.
+//! Deliberately minimal: real peer management (maintain a target count with a
+//! minimum that never blocks progress, ping idle peers, drop unresponsive ones,
+//! grow the address table via `getaddr`/`addr`, score peers) is a later slice.
 
 use std::collections::VecDeque;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -22,11 +18,9 @@ use btc_p2p::seeds;
 use btc_p2p::session::Session;
 use tracing::{info, warn};
 
-use crate::USER_AGENT;
-
 /// Resolve seed hosts on `port`, returning the addresses and the hosts that
 /// failed (which is routine — seeds come and go).
-pub fn resolve(hosts: &[String], port: u16) -> (Vec<SocketAddr>, Vec<String>) {
+pub(crate) fn resolve(hosts: &[String], port: u16) -> (Vec<SocketAddr>, Vec<String>) {
     let mut addrs = Vec::new();
     let mut failed = Vec::new();
     for host in hosts {
@@ -38,10 +32,10 @@ pub fn resolve(hosts: &[String], port: u16) -> (Vec<SocketAddr>, Vec<String>) {
     (addrs, failed)
 }
 
-/// Build the candidate list: explicit `--addr` addresses first, then the
-/// resolved seeds (defaulting to the mainnet seeds when none were given),
-/// deduped while keeping that order.
-pub fn candidates(
+/// Build the candidate list: explicit addresses first, then the resolved seeds
+/// (defaulting to the mainnet seeds when none were given), deduped while
+/// keeping that order.
+pub(crate) fn candidates(
     addrs: Vec<SocketAddr>,
     given_seeds: &[String],
 ) -> (Vec<SocketAddr>, Vec<String>) {
@@ -61,33 +55,35 @@ pub fn candidates(
 }
 
 /// One connected, handshaken peer.
-pub struct Peer {
-    pub addr: SocketAddr,
-    pub handshake: Handshake,
-    pub session: Session<TcpStream>,
+pub(crate) struct Peer {
+    pub(crate) addr: SocketAddr,
+    pub(crate) handshake: Handshake,
+    pub(crate) session: Session<TcpStream>,
 }
 
 /// A small pool of connected peers. It spends a bounded number of connection
 /// attempts (shared across refills) so a bad seed list cannot loop forever.
-pub struct Pool {
+pub(crate) struct Pool {
     peers: Vec<Peer>,
     attempts: usize,
+    user_agent: String,
 }
 
 impl Pool {
-    pub fn new() -> Self {
+    pub(crate) fn new(user_agent: impl Into<String>) -> Self {
         Self {
             peers: Vec::new(),
             attempts: 0,
+            user_agent: user_agent.into(),
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.peers.is_empty()
     }
 
     /// A one-line description of every pooled peer, for logging.
-    pub fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         self.peers
             .iter()
             .map(|p| {
@@ -102,7 +98,7 @@ impl Pool {
 
     /// Connect toward `want` peers, spending at most `max_attempts` total
     /// connections over the pool's life. Returns how many are now connected.
-    pub fn fill(
+    pub(crate) fn fill(
         &mut self,
         candidates: &mut VecDeque<SocketAddr>,
         want: usize,
@@ -114,7 +110,7 @@ impl Pool {
                 break;
             };
             self.attempts += 1;
-            match Session::connect(addr, USER_AGENT, start_height) {
+            match Session::connect(addr, &self.user_agent, start_height) {
                 Ok((session, handshake)) => {
                     info!(
                         "  peer {} @ {} — {} height {}",
@@ -133,7 +129,7 @@ impl Pool {
     }
 
     /// Take every connected peer out; the sync drives them all.
-    pub fn into_peers(self) -> Vec<Peer> {
+    pub(crate) fn into_peers(self) -> Vec<Peer> {
         self.peers
     }
 }
